@@ -1,0 +1,35 @@
+[package]
+name = "deckdrop"
+version = "0.1.0"
+description = "Share games on Steam Deck"
+authors = ["Markwart v. Bonin"]
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "deckdrop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+libp2p = { version = "0.54", features = ["tcp", "mdns", "request-response", "tokio", "macros", "noise", "yamux"] }
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+sha2 = "0.10"
+toml = "0.8"
+dirs = "5.0"
+lazy_static = "1.4"
+tempfile = { version = "3.8", optional = true }
+
+[dev-dependencies]
+tempfile = "3.8"
