@@ -23,6 +23,7 @@ mod tests {
         let test_peer = PeerInfo {
             id: "test-channel".to_string(),
             addr: Some("192.168.1.100".to_string()),
+            player_name: Some("ChannelTest".to_string()),
         };
         
         let _ = sender.send(test_peer.clone());
@@ -43,6 +44,7 @@ mod tests {
         let test_peer = PeerInfo {
             id: "multi-receiver-test".to_string(),
             addr: Some("192.168.1.101".to_string()),
+            player_name: Some("MultiReceiver".to_string()),
         };
         
         // Send one message

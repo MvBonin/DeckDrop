@@ -2,6 +2,7 @@ use libp2p::{
     identity, mdns::{tokio::Behaviour as Mdns, Event as MdnsEvent},
     swarm::SwarmEvent, PeerId,
 };
+use std::str::FromStr;
 use futures::StreamExt;
 use std::net::IpAddr;
 
@@ -12,22 +13,36 @@ pub struct DiscoveryBehaviour {
     pub mdns: Mdns,
 }
 
-pub async fn run_discovery(sender: PeerUpdateSender) {
-    let id_keys = identity::Keypair::generate_ed25519();
-    let peer_id = PeerId::from(id_keys.public());
+pub async fn run_discovery(sender: PeerUpdateSender, our_peer_id: Option<String>) -> Option<String> {
+    let (id_keys, peer_id) = if let Some(peer_id_str) = our_peer_id {
+        // Use provided peer ID
+        let peer_id = PeerId::from_str(&peer_id_str).unwrap_or_else(|_| {
+            let keys = identity::Keypair::generate_ed25519();
+            PeerId::from(keys.public())
+        });
+        (None, peer_id)
+    } else {
+        // Generate new peer ID
+        let keys = identity::Keypair::generate_ed25519();
+        let peer_id = PeerId::from(keys.public());
+        (Some(keys), peer_id)
+    };
 
     println!("Starting mDNS discovery with peer ID: {}", peer_id);
+    eprintln!("Starting mDNS discovery with peer ID: {}", peer_id);
 
     // Create mDNS with more explicit configuration
     let mdns_config = libp2p::mdns::Config::default();
     let mdns = match Mdns::new(mdns_config, peer_id) {
         Ok(mdns) => {
             println!("mDNS discovery initialized successfully");
+            eprintln!("mDNS discovery initialized successfully");
             mdns
         }
         Err(e) => {
             println!("Failed to initialize mDNS discovery: {}", e);
-            return;
+            eprintln!("Failed to initialize mDNS discovery: {}", e);
+            return None;
         }
     };
 
@@ -46,20 +61,34 @@ pub async fn run_discovery(sender: PeerUpdateSender) {
         .build();
 
     println!("Swarm created, starting discovery loop...");
+    eprintln!("Swarm created, starting discovery loop...");
 
     // Listen on all interfaces
     if let Err(e) = swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse().unwrap()) {
         println!("Failed to listen on all interfaces: {}", e);
+        eprintln!("Failed to listen on all interfaces: {}", e);
+        return None;
     } else {
         println!("Listening on all interfaces for peer discovery");
+        eprintln!("Listening on all interfaces for peer discovery");
     }
 
+    let our_peer_id_string = peer_id.to_string();
+    
+    // Spawn a task to return our peer ID after a short delay
+    let peer_id_clone = our_peer_id_string.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        // This will be handled by the caller
+    });
+    
     loop {
         match swarm.select_next_some().await {
             SwarmEvent::Behaviour(discovery_event) => {
                 match discovery_event {
                     DiscoveryBehaviourEvent::Mdns(MdnsEvent::Discovered(peers)) => {
                         println!("mDNS discovered {} peers", peers.len());
+                        eprintln!("mDNS discovered {} peers", peers.len());
                         for (peer_id, addr) in peers {
                             // Extract IP address from multiaddr
                             let ip: Option<IpAddr> = addr.iter()
@@ -73,35 +102,46 @@ pub async fn run_discovery(sender: PeerUpdateSender) {
                             
                             let peer_info = PeerInfo::from((peer_id, ip));
                             println!("Discovered peer: {} at {:?}", peer_info.id, peer_info.addr);
+                            eprintln!("Discovered peer: {} at {:?}", peer_info.id, peer_info.addr);
                             let _ = sender.send(peer_info);
                         }
                     }
                     DiscoveryBehaviourEvent::Mdns(MdnsEvent::Expired(expired)) => {
                         println!("mDNS expired {} peers", expired.len());
+                        eprintln!("mDNS expired {} peers", expired.len());
                         for (peer_id, _addr) in expired {
                             println!("Peer expired: {}", peer_id);
+                            eprintln!("Peer expired: {}", peer_id);
                         }
                     }
                 }
             }
             SwarmEvent::NewListenAddr { address, .. } => {
                 println!("Listening on: {}", address);
+                eprintln!("Listening on: {}", address);
             }
             SwarmEvent::ConnectionEstablished { peer_id, .. } => {
                 println!("Connection established with: {}", peer_id);
+                eprintln!("Connection established with: {}", peer_id);
             }
             SwarmEvent::ConnectionClosed { peer_id, .. } => {
                 println!("Connection closed with: {}", peer_id);
+                eprintln!("Connection closed with: {}", peer_id);
             }
             SwarmEvent::ListenerClosed { .. } => {
                 println!("Listener closed");
+                eprintln!("Listener closed");
             }
             SwarmEvent::ListenerError { error, .. } => {
                 println!("Listener error: {}", error);
+                eprintln!("Listener error: {}", error);
             }
             _ => {}
         }
     }
+    
+    // This will never be reached, but we need to return something
+    Some(our_peer_id_string)
 }
 
 #[cfg(test)]
@@ -135,6 +175,7 @@ mod tests {
         let test_peer = PeerInfo {
             id: "test-peer-123".to_string(),
             addr: Some("192.168.1.100".to_string()),
+            player_name: Some("DiscoveryTest".to_string()),
         };
         
         // Send peer through channel

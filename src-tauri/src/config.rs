@@ -1,7 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::collections::HashMap;
+use std::path::PathBuf;
 use tokio::sync::RwLock;
 use std::sync::Arc;
 
@@ -279,7 +278,7 @@ pub async fn update_theme(theme: String) -> Result<(), String> {
 
 #[tauri::command]
 pub async fn save_initial_config(player_name: String, games_folder: String) -> Result<(), String> {
-    let config_manager = ConfigManager::create_initial_config(player_name, games_folder)
+    let _config_manager = ConfigManager::create_initial_config(player_name, games_folder)
         .map_err(|e| format!("Failed to create initial config manager: {}", e))?;
     
     // Wait a bit for the async save to complete

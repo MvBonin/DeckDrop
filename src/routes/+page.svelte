@@ -32,6 +32,7 @@
   interface PeerInfo {
     id: string;
     addr: string | null;
+    player_name?: string | null;
   }
 
   let peers: PeerInfo[] = [];
@@ -83,6 +84,7 @@
       loading = true;
       error = "";
       peers = await invoke("get_discovered_peers");
+      console.log(`Fetched ${peers.length} peers:`, peers);
     } catch (err) {
       error = `Failed to fetch peers: ${err}`;
       console.error("Error fetching peers:", err);
