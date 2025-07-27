@@ -1,6 +1,40 @@
 <script lang="ts">
   import { createEventDispatcher } from 'svelte';
   import { invoke } from "@tauri-apps/api/core";
+  import { 
+    Gamepad2, 
+    ChevronRight, 
+    ChevronLeft, 
+    User, 
+    FolderOpen, 
+    Palette, 
+    Check, 
+    AlertCircle,
+    Sun,
+    Moon,
+    Cake,
+    Zap,
+    Gem,
+    Building2,
+    Monitor,
+    Bot,
+    Heart,
+    Circle,
+    Sprout,
+    TreePine,
+    Waves,
+    Radio,
+    Palette as PaletteIcon,
+    Sparkles,
+    Crown,
+    Skull,
+    Printer,
+    Leaf,
+    Coffee,
+    Snowflake,
+    Mountain,
+    Sunset
+  } from 'lucide-svelte';
 
   const dispatch = createEventDispatcher();
 
@@ -13,29 +47,29 @@
   let showSteps = false;
 
   const themes = [
-    { value: "light", label: "Light", icon: "☀️", description: "Clean and bright" },
-    { value: "dark", label: "Dark", icon: "🌙", description: "Easy on the eyes" },
-    { value: "cupcake", label: "Cupcake", icon: "🧁", description: "Sweet and playful" },
-    { value: "bumblebee", label: "Bumblebee", icon: "🐝", description: "Warm and friendly" },
-    { value: "emerald", label: "Emerald", icon: "💎", description: "Elegant and green" },
-    { value: "synthwave", label: "Synthwave", icon: "🌆", description: "Retro futuristic" },
-    { value: "cyberpunk", label: "Cyberpunk", icon: "🤖", description: "Neon and bold" },
-    { value: "valentine", label: "Valentine", icon: "💝", description: "Romantic pink" },
-    { value: "halloween", label: "Halloween", icon: "🎃", description: "Spooky orange" },
-    { value: "garden", label: "Garden", icon: "🌱", description: "Natural and fresh" },
-    { value: "forest", label: "Forest", icon: "🌲", description: "Deep and calming" },
-    { value: "aqua", label: "Aqua", icon: "🌊", description: "Ocean blue" },
-    { value: "lofi", label: "Lo-Fi", icon: "📻", description: "Vintage vibes" },
-    { value: "pastel", label: "Pastel", icon: "🎨", description: "Soft and gentle" },
-    { value: "fantasy", label: "Fantasy", icon: "🧚", description: "Magical and dreamy" },
-    { value: "luxury", label: "Luxury", icon: "💎", description: "Premium and elegant" },
-    { value: "dracula", label: "Dracula", icon: "🧛", description: "Dark and mysterious" },
-    { value: "cmyk", label: "CMYK", icon: "🖨️", description: "Print-inspired" },
-    { value: "autumn", label: "Autumn", icon: "🍂", description: "Warm and cozy" },
-    { value: "coffee", label: "Coffee", icon: "☕", description: "Rich and warm" },
-    { value: "winter", label: "Winter", icon: "❄️", description: "Cool and crisp" },
-    { value: "nord", label: "Nord", icon: "🏔️", description: "Arctic blue" },
-    { value: "sunset", label: "Sunset", icon: "🌅", description: "Golden hour" }
+    { value: "light", label: "Light", icon: Sun, description: "Clean and bright" },
+    { value: "dark", label: "Dark", icon: Moon, description: "Easy on the eyes" },
+    { value: "cupcake", label: "Cupcake", icon: Cake, description: "Sweet and playful" },
+    { value: "bumblebee", label: "Bumblebee", icon: Zap, description: "Warm and friendly" },
+    { value: "emerald", label: "Emerald", icon: Gem, description: "Elegant and green" },
+    { value: "synthwave", label: "Synthwave", icon: Building2, description: "Retro futuristic" },
+    { value: "cyberpunk", label: "Cyberpunk", icon: Bot, description: "Neon and bold" },
+    { value: "valentine", label: "Valentine", icon: Heart, description: "Romantic pink" },
+    { value: "halloween", label: "Halloween", icon: Skull, description: "Spooky orange" },
+    { value: "garden", label: "Garden", icon: Sprout, description: "Natural and fresh" },
+    { value: "forest", label: "Forest", icon: TreePine, description: "Deep and calming" },
+    { value: "aqua", label: "Aqua", icon: Waves, description: "Ocean blue" },
+    { value: "lofi", label: "Lo-Fi", icon: Radio, description: "Vintage vibes" },
+    { value: "pastel", label: "Pastel", icon: PaletteIcon, description: "Soft and gentle" },
+    { value: "fantasy", label: "Fantasy", icon: Sparkles, description: "Magical and dreamy" },
+    { value: "luxury", label: "Luxury", icon: Crown, description: "Premium and elegant" },
+    { value: "dracula", label: "Dracula", icon: Skull, description: "Dark and mysterious" },
+    { value: "cmyk", label: "CMYK", icon: Printer, description: "Print-inspired" },
+    { value: "autumn", label: "Autumn", icon: Leaf, description: "Warm and cozy" },
+    { value: "coffee", label: "Coffee", icon: Coffee, description: "Rich and warm" },
+    { value: "winter", label: "Winter", icon: Snowflake, description: "Cool and crisp" },
+    { value: "nord", label: "Nord", icon: Mountain, description: "Arctic blue" },
+    { value: "sunset", label: "Sunset", icon: Sunset, description: "Golden hour" }
   ];
 
   function setTheme(theme: string) {
@@ -110,7 +144,7 @@
     <!-- Initial Welcome Screen -->
     <div class="text-center min-h-screen flex flex-col justify-center">
       <div class="w-24 h-24 bg-gradient-to-br from-primary to-secondary rounded-full flex items-center justify-center mx-auto mb-8 shadow-lg">
-        <span class="text-4xl">🎮</span>
+        <Gamepad2 class="w-12 h-12 text-primary-content" />
       </div>
       <h1 class="text-5xl font-bold bg-gradient-to-r from-primary to-secondary bg-clip-text text-transparent mb-6">
         Welcome to DeckDrop
@@ -126,9 +160,7 @@
       </div>
       <button class="btn btn-primary btn-lg px-8" on:click={startSetup}>
         Start Now
-        <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"></path>
-        </svg>
+        <ChevronRight class="w-5 h-5" />
       </button>
     </div>
   {:else}
@@ -154,9 +186,7 @@
     <!-- Error Alert -->
     {#if error}
       <div class="alert alert-error mb-6 shadow-lg">
-        <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path>
-        </svg>
+        <AlertCircle class="w-6 h-6" />
         <span class="text-error-content">{error}</span>
       </div>
     {/if}
@@ -168,9 +198,7 @@
         <div class="card-body">
           <h2 class="card-title text-2xl text-base-content mb-6">
             <div class="w-12 h-12 bg-gradient-to-br from-primary to-secondary rounded-lg flex items-center justify-center mr-4">
-              <svg class="w-6 h-6 text-primary-content" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z"></path>
-              </svg>
+              <User class="w-6 h-6 text-primary-content" />
             </div>
             Choose Your Name
           </h2>
@@ -201,9 +229,7 @@
           <div class="card-actions justify-end mt-8">
             <button class="btn btn-primary btn-lg" on:click={nextStep} disabled={!playerName.trim()}>
               Next
-              <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"></path>
-              </svg>
+              <ChevronRight class="w-5 h-5" />
             </button>
           </div>
         </div>
@@ -216,9 +242,7 @@
         <div class="card-body">
           <h2 class="card-title text-2xl text-base-content mb-6">
             <div class="w-12 h-12 bg-gradient-to-br from-primary to-secondary rounded-lg flex items-center justify-center mr-4">
-              <svg class="w-6 h-6 text-primary-content" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2H5a2 2 0 00-2-2z"></path>
-              </svg>
+              <FolderOpen class="w-6 h-6 text-primary-content" />
             </div>
             Select Games Folder
           </h2>
@@ -242,9 +266,7 @@
                   readonly
                 />
                 <button class="btn btn-square btn-lg" on:click={selectGamesFolder}>
-                  <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2H5a2 2 0 00-2-2z"></path>
-                  </svg>
+                  <FolderOpen class="w-6 h-6" />
                 </button>
               </div>
               <label class="label">
@@ -255,16 +277,12 @@
           
           <div class="card-actions justify-end mt-8">
             <button class="btn btn-ghost btn-lg" on:click={prevStep}>
-              <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"></path>
-              </svg>
+              <ChevronLeft class="w-5 h-5" />
               Back
             </button>
             <button class="btn btn-primary btn-lg" on:click={nextStep} disabled={!gamesFolder.trim()}>
               Next
-              <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"></path>
-              </svg>
+              <ChevronRight class="w-5 h-5" />
             </button>
           </div>
         </div>
@@ -277,9 +295,7 @@
         <div class="card-body">
           <h2 class="card-title text-2xl text-base-content mb-6">
             <div class="w-12 h-12 bg-gradient-to-br from-primary to-secondary rounded-lg flex items-center justify-center mr-4">
-              <svg class="w-6 h-6 text-primary-content" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 21a4 4 0 01-4-4V5a2 2 0 012-2h4a2 2 0 012 2v12a4 4 0 01-4 4zM21 5a2 2 0 00-2-2h-4a2 2 0 00-2 2v12a4 4 0 004 4h4a2 2 0 002-2V5z"></path>
-              </svg>
+              <Palette class="w-6 h-6 text-primary-content" />
             </div>
             Choose Your Theme
           </h2>
@@ -297,7 +313,7 @@
                 >
                   <div class="card-body p-4">
                     <div class="flex items-center gap-3">
-                      <span class="text-2xl">{theme.icon}</span>
+                      <svelte:component this={theme.icon} class="w-6 h-6" />
                       <div class="flex-1">
                         <h3 class="font-semibold text-base-content">{theme.label}</h3>
                         <p class="text-sm text-base-content/60">{theme.description}</p>
@@ -314,16 +330,12 @@
           
           <div class="card-actions justify-end mt-8">
             <button class="btn btn-ghost btn-lg" on:click={prevStep}>
-              <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"></path>
-              </svg>
+              <ChevronLeft class="w-5 h-5" />
               Back
             </button>
             <button class="btn btn-primary btn-lg" on:click={nextStep}>
               Next
-              <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"></path>
-              </svg>
+              <ChevronRight class="w-5 h-5" />
             </button>
           </div>
         </div>
@@ -336,9 +348,7 @@
         <div class="card-body">
           <h2 class="card-title text-2xl text-base-content mb-6">
             <div class="w-12 h-12 bg-gradient-to-br from-primary to-secondary rounded-lg flex items-center justify-center mr-4">
-              <svg class="w-6 h-6 text-primary-content" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"></path>
-              </svg>
+              <Check class="w-6 h-6 text-primary-content" />
             </div>
             Save Configuration
           </h2>
@@ -369,9 +379,7 @@
           
           <div class="card-actions justify-end mt-8">
             <button class="btn btn-ghost btn-lg" on:click={prevStep}>
-              <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"></path>
-              </svg>
+              <ChevronLeft class="w-5 h-5" />
               Back
             </button>
             <button 

@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { RefreshCw, AlertCircle, Users, Search } from 'lucide-svelte';
+  
   export let peers: any[] = [];
   export let loading: boolean = false;
   export let error: string = '';
@@ -30,9 +32,7 @@
           disabled={loading} 
           class="btn btn-primary btn-sm"
         >
-          <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path>
-          </svg>
+          <RefreshCw class="w-4 h-4" />
           Refresh
         </button>
       </div>
@@ -43,9 +43,7 @@
 <!-- Error Alert -->
 {#if error}
   <div class="alert alert-error mb-6">
-    <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path>
-    </svg>
+    <AlertCircle class="w-6 h-6" />
     <span class="text-error-content">{error}</span>
   </div>
 {/if}
@@ -54,15 +52,13 @@
 <div class="card bg-base-100 shadow-xl">
   <div class="card-body">
     <h2 class="card-title text-base-content">
-      <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z"></path>
-      </svg>
+      <Users class="w-6 h-6" />
       Discovered Peers
     </h2>
     
     {#if peers.length === 0 && !loading}
       <div class="text-center py-12">
-        <div class="text-6xl mb-4">🔍</div>
+        <Search class="w-16 h-16 mx-auto mb-4 text-base-content/40" />
         <h3 class="text-lg font-semibold mb-2 text-base-content">No peers discovered yet</h3>
         <p class="text-sm text-base-content/70">Make sure other DeckDrop instances are running on the same network</p>
       </div>

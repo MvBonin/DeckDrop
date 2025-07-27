@@ -1,6 +1,31 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
   import { onMount } from "svelte";
+  import { 
+    Palette, 
+    Sun, 
+    Moon, 
+    Cake, 
+    Zap, 
+    Gem, 
+    Building2, 
+    Monitor, 
+    Bot, 
+    Heart, 
+    Skull, 
+    Sprout, 
+    TreePine, 
+    Waves, 
+    Radio, 
+    Sparkles, 
+    Crown, 
+    Printer, 
+    Leaf, 
+    Coffee, 
+    Snowflake, 
+    Mountain, 
+    Sunset 
+  } from 'lucide-svelte';
   import WelcomeSetup from "../components/WelcomeSetup.svelte";
   import NetworkDiscovery from "../components/NetworkDiscovery.svelte";
 
@@ -16,41 +41,30 @@
   let isFirstTime = true;
 
   const themes = [
-    { value: "light", label: "Light", icon: "☀️" },
-    { value: "dark", label: "Dark", icon: "🌙" },
-    { value: "cupcake", label: "Cupcake", icon: "🧁" },
-    { value: "bumblebee", label: "Bumblebee", icon: "🐝" },
-    { value: "emerald", label: "Emerald", icon: "💎" },
-    { value: "corporate", label: "Corporate", icon: "🏢" },
-    { value: "synthwave", label: "Synthwave", icon: "🌆" },
-    { value: "retro", label: "Retro", icon: "📺" },
-    { value: "cyberpunk", label: "Cyberpunk", icon: "🤖" },
-    { value: "valentine", label: "Valentine", icon: "💝" },
-    { value: "halloween", label: "Halloween", icon: "🎃" },
-    { value: "garden", label: "Garden", icon: "🌱" },
-    { value: "forest", label: "Forest", icon: "🌲" },
-    { value: "aqua", label: "Aqua", icon: "🌊" },
-    { value: "lofi", label: "Lo-Fi", icon: "📻" },
-    { value: "pastel", label: "Pastel", icon: "🎨" },
-    { value: "fantasy", label: "Fantasy", icon: "🧚" },
-    { value: "wireframe", label: "Wireframe", icon: "📐" },
-    { value: "black", label: "Black", icon: "⚫" },
-    { value: "luxury", label: "Luxury", icon: "💎" },
-    { value: "dracula", label: "Dracula", icon: "🧛" },
-    { value: "cmyk", label: "CMYK", icon: "🖨️" },
-    { value: "autumn", label: "Autumn", icon: "🍂" },
-    { value: "business", label: "Business", icon: "💼" },
-    { value: "acid", label: "Acid", icon: "⚗️" },
-    { value: "lemonade", label: "Lemonade", icon: "🍋" },
-    { value: "night", label: "Night", icon: "🌃" },
-    { value: "coffee", label: "Coffee", icon: "☕" },
-    { value: "winter", label: "Winter", icon: "❄️" },
-    { value: "dim", label: "Dim", icon: "🌆" },
-    { value: "nord", label: "Nord", icon: "🏔️" },
-    { value: "sunset", label: "Sunset", icon: "🌅" },
-    { value: "caramellatte", label: "Caramel Latte", icon: "🥤" },
-    { value: "abyss", label: "Abyss", icon: "🌌" },
-    { value: "silk", label: "Silk", icon: "🧵" }
+    { value: "light", label: "Light", icon: Sun },
+    { value: "dark", label: "Dark", icon: Moon },
+    { value: "cupcake", label: "Cupcake", icon: Cake },
+    { value: "bumblebee", label: "Bumblebee", icon: Zap },
+    { value: "emerald", label: "Emerald", icon: Gem },
+    { value: "corporate", label: "Corporate", icon: Building2 },
+    { value: "synthwave", label: "Synthwave", icon: Monitor },
+    { value: "cyberpunk", label: "Cyberpunk", icon: Bot },
+    { value: "valentine", label: "Valentine", icon: Heart },
+    { value: "halloween", label: "Halloween", icon: Skull },
+    { value: "garden", label: "Garden", icon: Sprout },
+    { value: "forest", label: "Forest", icon: TreePine },
+    { value: "aqua", label: "Aqua", icon: Waves },
+    { value: "lofi", label: "Lo-Fi", icon: Radio },
+    { value: "pastel", label: "Pastel", icon: Palette },
+    { value: "fantasy", label: "Fantasy", icon: Sparkles },
+    { value: "luxury", label: "Luxury", icon: Crown },
+    { value: "dracula", label: "Dracula", icon: Skull },
+    { value: "cmyk", label: "CMYK", icon: Printer },
+    { value: "autumn", label: "Autumn", icon: Leaf },
+    { value: "coffee", label: "Coffee", icon: Coffee },
+    { value: "winter", label: "Winter", icon: Snowflake },
+    { value: "nord", label: "Nord", icon: Mountain },
+    { value: "sunset", label: "Sunset", icon: Sunset }
   ];
 
   function setTheme(theme: string) {
@@ -148,9 +162,7 @@
         <!-- Theme Switcher -->
         <div class="dropdown dropdown-end">
           <div tabindex="0" role="button" class="btn btn-ghost btn-circle">
-            <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 21a4 4 0 01-4-4V5a2 2 0 012-2h4a2 2 0 012 2v12a4 4 0 01-4 4zM21 5a2 2 0 00-2-2h-4a2 2 0 00-2 2v12a4 4 0 004 4h4a2 2 0 002-2V5z"></path>
-            </svg>
+            <Palette class="w-5 h-5" />
           </div>
           <ul class="dropdown-content z-[1] menu p-2 shadow-lg bg-base-100 rounded-box w-52 max-h-96 overflow-y-auto">
             {#each themes as theme}
@@ -159,7 +171,7 @@
                   class="flex items-center gap-2 {currentTheme === theme.value ? 'active' : ''}"
                   on:click={() => setTheme(theme.value)}
                 >
-                  <span class="text-lg">{theme.icon}</span>
+                  <svelte:component this={theme.icon} class="w-5 h-5" />
                   <span class="text-base-content">{theme.label}</span>
                   {#if currentTheme === theme.value}
                     <span class="ml-auto text-base-content">✓</span>
