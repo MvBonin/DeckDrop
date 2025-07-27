@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>com.github.mvbonin.deckdrop</id>
+  <name>DeckDrop</name>
+  <summary>Share games on Steam Deck</summary>
+  <description>
+    <p>
+      DeckDrop is a peer-to-peer tool for the Steam Deck (and Linux) that lets you share open-source and free games across devices in the same local network (LAN). It's optimized for the Steam Deck but fully compatible with any Linux system.
+    </p>
+    <p>
+      Features:
+    </p>
+    <ul>
+      <li>Share unpacked games (no zip files needed)</li>
+      <li>Automatic peer discovery using libp2p and mDNS</li>
+      <li>Chunk-based file transfer (Torrent-style but LAN-only)</li>
+      <li>Early seeding: upload what you've downloaded</li>
+      <li>Add games as Non-Steam shortcuts</li>
+    </ul>
+  </description>
+  <launchable type="desktop-id">com.github.mvbonin.deckdrop.desktop</launchable>
+  <url type="homepage">https://github.com/mvbonin/deckdrop</url>
+  <url type="bugtracker">https://github.com/mvbonin/deckdrop/issues</url>
+  <developer_name>Markwart v. Bonin</developer_name>
+  <content_rating type="oars-1.1" />
+  <project_license>MIT</project_license>
+  <categories>
+    <category>Game</category>
+    <category>Network</category>
+    <category>Utility</category>
+  </categories>
+  <releases>
+    <release version="0.1.0" date="2025-07-27" />
+  </releases>
+</component> 

@@ -87,19 +87,25 @@
    bun run tauri build
    ```
 
-   This creates platform-specific executables in `src-tauri/target/release/`
+   This creates a DEB package in `src-tauri/target/release/bundle/deb/`
 
-3. **Build for specific platform**:
+3. **Build Flatpak for Steam Deck**:
 
    ```bash
-   # Linux
-   bun run tauri build --target x86_64-unknown-linux-gnu
+   ./build-flatpak.sh
+   ```
 
-   # Windows
-   bun run tauri build --target x86_64-pc-windows-msvc
+   This creates a Flatpak package that can be installed on Steam Deck and other Linux systems.
 
-   # macOS
-   bun run tauri build --target x86_64-apple-darwin
+4. **Install Flatpak on Steam Deck**:
+
+   ```bash
+   # Copy the flatpak-repo to your Steam Deck
+   # Then install:
+   flatpak install --user flatpak-repo com.github.mvbonin.deckdrop
+   
+   # Run the app:
+   flatpak run com.github.mvbonin.deckdrop
    ```
 
 ### Available Scripts

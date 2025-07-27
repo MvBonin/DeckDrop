@@ -1,0 +1,57 @@
+id: com.github.mvbonin.deckdrop
+runtime: org.gnome.Platform
+runtime-version: '48'
+sdk: org.gnome.Sdk
+
+command: deckdrop
+finish-args:
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --device=dri
+  - --share=ipc
+  - --talk-name=org.kde.StatusNotifierWatcher
+  - --filesystem=xdg-run/tray-icon:create
+  - --env=WEBKIT_DISABLE_COMPOSITING_MODE=1
+  - --filesystem=home:ro
+  - --filesystem=xdg-download:ro
+  - --filesystem=xdg-documents:ro
+  - --filesystem=xdg-config:create
+  - --filesystem=xdg-data:create
+  - --filesystem=xdg-cache:create
+  - --share=network
+  # Network discovery permissions
+  - --system-talk-name=org.freedesktop.NetworkManager
+  - --system-talk-name=org.freedesktop.Avahi
+  - --talk-name=org.freedesktop.Avahi
+  - --talk-name=org.freedesktop.Avahi.Server
+  # Additional network permissions for libp2p
+  - --share=network
+
+modules:
+  - name: binary
+    buildsystem: simple
+    sources:
+      - type: file
+        path: src-tauri/target/release/bundle/deb/deckdrop_0.1.0_amd64.deb
+    build-commands:
+      - set -e
+      # Extract the deb package
+      - mkdir deb-extract
+      - ar -x *.deb --output deb-extract
+      - tar -C deb-extract -xf deb-extract/data.tar.gz
+      # Copy binary
+      - 'install -Dm755 deb-extract/usr/bin/deckdrop /app/bin/deckdrop'
+      # If you bundle files with additional resources, you should copy them:
+      - mkdir -p /app/lib/deckdrop
+      - cp -r deb-extract/usr/lib/deckdrop/. /app/lib/deckdrop 2>/dev/null || true
+      - find /app/lib/deckdrop -type f -exec chmod 644 {} \; 2>/dev/null || true
+      # Copy desktop file + ensure the right icon is set
+      - sed -i 's/^Icon=.*/Icon=com.github.mvbonin.deckdrop/' deb-extract/usr/share/applications/deckdrop.desktop
+      - install -Dm644 deb-extract/usr/share/applications/deckdrop.desktop /app/share/applications/com.github.mvbonin.deckdrop.desktop
+      - install -Dm644 deb-extract/usr/share/applications/deckdrop.desktop /app/share/applications/deckdrop.desktop
+      # Copy icons (with fallbacks)
+      - install -Dm644 deb-extract/usr/share/icons/hicolor/128x128/apps/deckdrop.png /app/share/icons/hicolor/128x128/apps/com.github.mvbonin.deckdrop.png 2>/dev/null || true
+      - install -Dm644 deb-extract/usr/share/icons/hicolor/32x32/apps/deckdrop.png /app/share/icons/hicolor/32x32/apps/com.github.mvbonin.deckdrop.png 2>/dev/null || true
+      - install -Dm644 deb-extract/usr/share/icons/hicolor/128x128@2x/apps/deckdrop.png /app/share/icons/hicolor/256x256@2/apps/com.github.mvbonin.deckdrop.png 2>/dev/null || true
+      # Copy metainfo (optional)
+      # - install -Dm644 flatpak.metainfo.xml /app/share/metainfo/com.github.mvbonin.deckdrop.metainfo.xml 

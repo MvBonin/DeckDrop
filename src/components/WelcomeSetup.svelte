@@ -168,17 +168,45 @@
     <!-- Progress Steps -->
     <div class="steps steps-horizontal w-full mb-8">
       <ul class="steps steps-horizontal w-full mb-8">
-        <li data-content="👤" class="step {currentStep >= 1 ? 'step-info' : ''}" on:click={() => currentStep = 1}>
-          Name
+        <li data-content="👤" class="step {currentStep >= 1 ? 'step-info' : ''}">
+          <button 
+            type="button"
+            class="w-full h-full flex items-center justify-center"
+            on:click={() => currentStep = 1}
+            on:keydown={(e) => e.key === 'Enter' && (currentStep = 1)}
+          >
+            Name
+          </button>
         </li>
-        <li data-content="📁" class="step {currentStep >= 2 ? 'step-info' : ''}" on:click={() => currentStep = 2}>
-          Folder
+        <li data-content="📁" class="step {currentStep >= 2 ? 'step-info' : ''}">
+          <button 
+            type="button"
+            class="w-full h-full flex items-center justify-center"
+            on:click={() => currentStep = 2}
+            on:keydown={(e) => e.key === 'Enter' && (currentStep = 2)}
+          >
+            Folder
+          </button>
         </li>
-        <li data-content="🎨" class="step {currentStep >= 3 ? 'step-info' : ''}" on:click={() => currentStep = 3}>
-          Theme
+        <li data-content="🎨" class="step {currentStep >= 3 ? 'step-info' : ''}">
+          <button 
+            type="button"
+            class="w-full h-full flex items-center justify-center"
+            on:click={() => currentStep = 3}
+            on:keydown={(e) => e.key === 'Enter' && (currentStep = 3)}
+          >
+            Theme
+          </button>
         </li>
-        <li data-content="✓" class="step {currentStep >= 4 ? 'step-info' : ''}" on:click={() => currentStep = 4}>
-          Complete
+        <li data-content="✓" class="step {currentStep >= 4 ? 'step-info' : ''}">
+          <button 
+            type="button"
+            class="w-full h-full flex items-center justify-center"
+            on:click={() => currentStep = 4}
+            on:keydown={(e) => e.key === 'Enter' && (currentStep = 4)}
+          >
+            Complete
+          </button>
         </li>
       </ul>
     </div>
@@ -210,17 +238,18 @@
             </p>
             
             <div class="form-control">
-              <label class="label">
+              <label class="label" for="player-name">
                 <span class="label-text text-base-content font-medium">Your Name</span>
               </label>
               <input 
+                id="player-name"
                 type="text" 
                 placeholder="e.g. SteamDeck_User" 
                 class="input input-bordered input-lg w-full focus:input-primary" 
                 bind:value={playerName}
                 maxlength="32"
               />
-              <label class="label">
+              <label class="label" for="player-name">
                 <span class="label-text-alt text-base-content/60">Maximum 32 characters</span>
               </label>
             </div>
@@ -254,11 +283,12 @@
             </p>
             
             <div class="form-control">
-              <label class="label">
+              <label class="label" for="games-folder">
                 <span class="label-text text-base-content font-medium">Games Folder</span>
               </label>
               <div class="input-group">
                 <input 
+                  id="games-folder"
                   type="text" 
                   placeholder="~/Games/DeckDrop" 
                   class="input input-bordered input-lg flex-1 focus:input-primary" 
@@ -269,7 +299,7 @@
                   <FolderOpen class="w-6 h-6" />
                 </button>
               </div>
-              <label class="label">
+              <label class="label" for="games-folder">
                 <span class="label-text-alt text-base-content/60">Default: ~/Games/DeckDrop</span>
               </label>
             </div>

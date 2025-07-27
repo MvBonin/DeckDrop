@@ -26,8 +26,8 @@ export default defineConfig(async () => ({
         }
       : undefined,
     watch: {
-      // 3. tell vite to ignore watching `src-tauri`
-      ignored: ["**/src-tauri/**"],
+      // 3. tell vite to ignore watching `src-tauri`, `flatpak`, and `.flatpak-builder` to avoid symbolic link loops
+      ignored: ["**/src-tauri/**", "**/flatpak/**", "**/.flatpak-builder/**"],
     },
   },
 }));

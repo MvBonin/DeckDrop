@@ -47,24 +47,24 @@ pub fn run() {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_greet_function() {
-        let result = greet("World");
+    #[tokio::test]
+    async fn test_greet_function() {
+        let result = greet("World").await.unwrap();
         assert_eq!(result, "Hello, World! You've been greeted from Rust!");
         
-        let result = greet("Alice");
+        let result = greet("Alice").await.unwrap();
         assert_eq!(result, "Hello, Alice! You've been greeted from Rust!");
     }
 
-    #[test]
-    fn test_greet_empty_string() {
-        let result = greet("");
+    #[tokio::test]
+    async fn test_greet_empty_string() {
+        let result = greet("").await.unwrap();
         assert_eq!(result, "Hello, ! You've been greeted from Rust!");
     }
 
-    #[test]
-    fn test_greet_special_characters() {
-        let result = greet("Test@123!");
+    #[tokio::test]
+    async fn test_greet_special_characters() {
+        let result = greet("Test@123!").await.unwrap();
         assert_eq!(result, "Hello, Test@123!! You've been greeted from Rust!");
     }
 }

@@ -116,6 +116,8 @@ impl ConfigManager {
         let config_dir = Self::get_config_dir()?;
         let config_path = config_dir.join("deckdrop.toml");
         
+        println!("Creating initial config at: {:?}", config_path);
+        
         // Create default config with provided values
         let mut config = DeckDropConfig::default();
         config.player_name = player_name;
@@ -129,8 +131,9 @@ impl ConfigManager {
         // Save the config immediately - use async version
         let config_manager_clone = config_manager.clone();
         tokio::spawn(async move {
-            if let Err(e) = config_manager_clone.save_config().await {
-                eprintln!("Failed to save initial config: {}", e);
+            match config_manager_clone.save_config().await {
+                Ok(_) => println!("Initial config saved successfully"),
+                Err(e) => eprintln!("Failed to save initial config: {}", e),
             }
         });
         
@@ -178,30 +181,46 @@ impl ConfigManager {
         let config = self.config.read().await;
         let content = toml::to_string_pretty(&*config)?;
         
+        println!("Saving config to: {:?}", self.config_path);
+        
         // Ensure config directory exists
         if let Some(parent) = self.config_path.parent() {
+            println!("Creating parent directory: {:?}", parent);
             fs::create_dir_all(parent)?;
         }
         
         fs::write(&self.config_path, content)?;
+        println!("Config saved successfully");
         Ok(())
     }
 
     pub fn get_config_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
-        let home_dir = dirs::home_dir()
-            .ok_or("Could not determine home directory")?;
+        // Use XDG base directories for system-agnostic config location
+        // This works properly with Flatpak and other sandboxed environments
+        let config_dir = dirs::config_dir()
+            .or_else(|| dirs::home_dir().map(|home| home.join(".config")))
+            .ok_or("Could not determine config directory")?;
         
-        Ok(home_dir.join(".config").join("deckdrop"))
+        let deckdrop_config_dir = config_dir.join("deckdrop");
+        println!("Config directory: {:?}", deckdrop_config_dir);
+        
+        Ok(deckdrop_config_dir)
     }
 
     pub fn get_metadata_dir(&self) -> PathBuf {
-        let config_dir = Self::get_config_dir().unwrap_or_else(|_| PathBuf::from("."));
-        config_dir.join("metadata")
+        // Use XDG data directory for metadata storage
+        let data_dir = dirs::data_dir()
+            .or_else(|| dirs::home_dir().map(|home| home.join(".local").join("share")))
+            .unwrap_or_else(|| PathBuf::from("."));
+        data_dir.join("deckdrop").join("metadata")
     }
 
     pub fn get_cache_dir(&self) -> PathBuf {
-        let config_dir = Self::get_config_dir().unwrap_or_else(|_| PathBuf::from("."));
-        config_dir.join("cache")
+        // Use XDG cache directory for cache storage
+        let cache_dir = dirs::cache_dir()
+            .or_else(|| dirs::home_dir().map(|home| home.join(".cache")))
+            .unwrap_or_else(|| PathBuf::from("."));
+        cache_dir.join("deckdrop")
     }
 }
 
