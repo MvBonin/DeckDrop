@@ -127,6 +127,7 @@
   });
 </script>
 
+<!-- Template starts here -->
 <div class="min-h-screen bg-gradient-to-br from-base-200 to-base-300">
   <!-- Modern Navbar -->
   {#if !isFirstTime}
@@ -151,7 +152,7 @@
               <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 21a4 4 0 01-4-4V5a2 2 0 012-2h4a2 2 0 012 2v12a4 4 0 01-4 4zM21 5a2 2 0 00-2-2h-4a2 2 0 00-2 2v12a4 4 0 004 4h4a2 2 0 002-2V5z"></path>
             </svg>
           </div>
-          <ul tabindex="0" class="dropdown-content z-[1] menu p-2 shadow-lg bg-base-100 rounded-box w-52 max-h-96 overflow-y-auto">
+          <ul class="dropdown-content z-[1] menu p-2 shadow-lg bg-base-100 rounded-box w-52 max-h-96 overflow-y-auto">
             {#each themes as theme}
               <li>
                 <button 

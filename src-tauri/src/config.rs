@@ -77,6 +77,7 @@ impl Default for MetadataConfig {
     }
 }
 
+#[derive(Clone)]
 pub struct ConfigManager {
     config: Arc<RwLock<DeckDropConfig>>,
     config_path: PathBuf,
@@ -125,10 +126,13 @@ impl ConfigManager {
             config_path,
         };
         
-        // Save the config immediately
-        tokio::runtime::Runtime::new()?.block_on(async {
-            config_manager.save_config().await
-        })?;
+        // Save the config immediately - use async version
+        let config_manager_clone = config_manager.clone();
+        tokio::spawn(async move {
+            if let Err(e) = config_manager_clone.save_config().await {
+                eprintln!("Failed to save initial config: {}", e);
+            }
+        });
         
         Ok(config_manager)
     }
@@ -258,6 +262,9 @@ pub async fn update_theme(theme: String) -> Result<(), String> {
 pub async fn save_initial_config(player_name: String, games_folder: String) -> Result<(), String> {
     let config_manager = ConfigManager::create_initial_config(player_name, games_folder)
         .map_err(|e| format!("Failed to create initial config manager: {}", e))?;
+    
+    // Wait a bit for the async save to complete
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
     
     Ok(())
 }
