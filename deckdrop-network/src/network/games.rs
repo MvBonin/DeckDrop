@@ -184,3 +184,335 @@ impl From<libp2p::request_response::Event<GamesListRequest, GamesListResponse>> 
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::io::Cursor;
+
+    #[test]
+    fn test_games_list_request_serialization() {
+        // Test: GamesListRequest sollte serialisiert werden können
+        let request = GamesListRequest;
+        let json = serde_json::to_string(&request).unwrap();
+        
+        // Deserialisiere zurück
+        let deserialized: GamesListRequest = serde_json::from_str(&json).unwrap();
+        // GamesListRequest ist ein Unit-Struct, also können wir nur prüfen, dass es funktioniert
+        let _ = deserialized;
+    }
+
+    #[test]
+    fn test_games_list_response_serialization() {
+        // Test: GamesListResponse sollte korrekt serialisiert/deserialisiert werden
+        let response = GamesListResponse {
+            games: vec![
+                NetworkGameInfo {
+                    game_id: "game-1".to_string(),
+                    name: "Test Game 1".to_string(),
+                    version: "1.0".to_string(),
+                    start_file: "game1.exe".to_string(),
+                    start_args: Some("--fullscreen".to_string()),
+                    description: Some("Ein Test-Spiel".to_string()),
+                    creator_peer_id: Some("peer-1".to_string()),
+                },
+                NetworkGameInfo {
+                    game_id: "game-2".to_string(),
+                    name: "Test Game 2".to_string(),
+                    version: "2.0".to_string(),
+                    start_file: "game2.exe".to_string(),
+                    start_args: None,
+                    description: None,
+                    creator_peer_id: None,
+                },
+            ],
+        };
+        
+        let json = serde_json::to_string(&response).unwrap();
+        let deserialized: GamesListResponse = serde_json::from_str(&json).unwrap();
+        
+        assert_eq!(deserialized.games.len(), 2);
+        assert_eq!(deserialized.games[0].game_id, "game-1");
+        assert_eq!(deserialized.games[0].name, "Test Game 1");
+        assert_eq!(deserialized.games[1].game_id, "game-2");
+        assert_eq!(deserialized.games[1].name, "Test Game 2");
+    }
+
+    #[test]
+    fn test_network_game_info_serialization() {
+        // Test: NetworkGameInfo sollte korrekt serialisiert werden
+        let game_info = NetworkGameInfo {
+            game_id: "test-game-id".to_string(),
+            name: "My Game".to_string(),
+            version: "1.5.0".to_string(),
+            start_file: "start.sh".to_string(),
+            start_args: Some("--debug".to_string()),
+            description: Some("Ein cooles Spiel".to_string()),
+            creator_peer_id: Some("creator-peer-123".to_string()),
+        };
+        
+        let json = serde_json::to_string(&game_info).unwrap();
+        assert!(json.contains("test-game-id"));
+        assert!(json.contains("My Game"));
+        assert!(json.contains("1.5.0"));
+        
+        let deserialized: NetworkGameInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.game_id, game_info.game_id);
+        assert_eq!(deserialized.name, game_info.name);
+        assert_eq!(deserialized.version, game_info.version);
+        assert_eq!(deserialized.start_file, game_info.start_file);
+        assert_eq!(deserialized.start_args, game_info.start_args);
+        assert_eq!(deserialized.description, game_info.description);
+        assert_eq!(deserialized.creator_peer_id, game_info.creator_peer_id);
+    }
+
+    #[test]
+    fn test_network_game_info_with_optional_fields() {
+        // Test: NetworkGameInfo mit optionalen Feldern
+        let game_info = NetworkGameInfo {
+            game_id: "minimal-game".to_string(),
+            name: "Minimal Game".to_string(),
+            version: "1.0".to_string(),
+            start_file: "game.exe".to_string(),
+            start_args: None,
+            description: None,
+            creator_peer_id: None,
+        };
+        
+        let json = serde_json::to_string(&game_info).unwrap();
+        let deserialized: NetworkGameInfo = serde_json::from_str(&json).unwrap();
+        
+        assert_eq!(deserialized.game_id, game_info.game_id);
+        assert_eq!(deserialized.start_args, None);
+        assert_eq!(deserialized.description, None);
+        assert_eq!(deserialized.creator_peer_id, None);
+    }
+
+    #[tokio::test]
+    async fn test_codec_write_read_request() {
+        // Test: Codec sollte Request korrekt schreiben und lesen
+        let mut codec = GamesListCodec;
+        let protocol = String::from("/deckdrop/games-list/1.0.0");
+        let request = GamesListRequest;
+        
+        // Schreibe Request
+        let mut buffer = Vec::new();
+        let mut cursor = Cursor::new(&mut buffer);
+        codec.write_request(&protocol, &mut cursor, request).await.unwrap();
+        
+        // Lese Request zurück
+        let mut read_cursor = Cursor::new(&buffer);
+        let read_request = codec.read_request(&protocol, &mut read_cursor).await.unwrap();
+        
+        // GamesListRequest ist ein Unit-Struct, also können wir nur prüfen, dass es funktioniert
+        let _ = read_request;
+    }
+
+    #[tokio::test]
+    async fn test_codec_write_read_response() {
+        // Test: Codec sollte Response korrekt schreiben und lesen
+        let mut codec = GamesListCodec;
+        let protocol = String::from("/deckdrop/games-list/1.0.0");
+        let response = GamesListResponse {
+            games: vec![
+                NetworkGameInfo {
+                    game_id: "test-id".to_string(),
+                    name: "Test Game".to_string(),
+                    version: "1.0".to_string(),
+                    start_file: "test.exe".to_string(),
+                    start_args: None,
+                    description: None,
+                    creator_peer_id: None,
+                },
+            ],
+        };
+        
+        // Schreibe Response
+        let mut buffer = Vec::new();
+        let mut cursor = Cursor::new(&mut buffer);
+        codec.write_response(&protocol, &mut cursor, response.clone()).await.unwrap();
+        
+        // Lese Response zurück
+        let mut read_cursor = Cursor::new(&buffer);
+        let read_response = codec.read_response(&protocol, &mut read_cursor).await.unwrap();
+        
+        assert_eq!(read_response.games.len(), 1);
+        assert_eq!(read_response.games[0].game_id, response.games[0].game_id);
+        assert_eq!(read_response.games[0].name, response.games[0].name);
+    }
+
+    #[tokio::test]
+    async fn test_codec_write_read_response_empty() {
+        // Test: Codec sollte leere Response korrekt handhaben
+        let mut codec = GamesListCodec;
+        let protocol = String::from("/deckdrop/games-list/1.0.0");
+        let response = GamesListResponse {
+            games: Vec::new(),
+        };
+        
+        let mut buffer = Vec::new();
+        let mut cursor = Cursor::new(&mut buffer);
+        codec.write_response(&protocol, &mut cursor, response.clone()).await.unwrap();
+        
+        let mut read_cursor = Cursor::new(&buffer);
+        let read_response = codec.read_response(&protocol, &mut read_cursor).await.unwrap();
+        
+        assert_eq!(read_response.games.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_codec_write_read_response_multiple_games() {
+        // Test: Codec sollte mehrere Spiele korrekt handhaben
+        let mut codec = GamesListCodec;
+        let protocol = String::from("/deckdrop/games-list/1.0.0");
+        let response = GamesListResponse {
+            games: vec![
+                NetworkGameInfo {
+                    game_id: "game-1".to_string(),
+                    name: "Game 1".to_string(),
+                    version: "1.0".to_string(),
+                    start_file: "game1.exe".to_string(),
+                    start_args: None,
+                    description: None,
+                    creator_peer_id: None,
+                },
+                NetworkGameInfo {
+                    game_id: "game-2".to_string(),
+                    name: "Game 2".to_string(),
+                    version: "2.0".to_string(),
+                    start_file: "game2.exe".to_string(),
+                    start_args: Some("--fullscreen".to_string()),
+                    description: Some("Beschreibung".to_string()),
+                    creator_peer_id: Some("peer-123".to_string()),
+                },
+                NetworkGameInfo {
+                    game_id: "game-3".to_string(),
+                    name: "Game 3".to_string(),
+                    version: "3.0".to_string(),
+                    start_file: "game3.sh".to_string(),
+                    start_args: None,
+                    description: None,
+                    creator_peer_id: None,
+                },
+            ],
+        };
+        
+        let mut buffer = Vec::new();
+        let mut cursor = Cursor::new(&mut buffer);
+        codec.write_response(&protocol, &mut cursor, response.clone()).await.unwrap();
+        
+        let mut read_cursor = Cursor::new(&buffer);
+        let read_response = codec.read_response(&protocol, &mut read_cursor).await.unwrap();
+        
+        assert_eq!(read_response.games.len(), 3);
+        assert_eq!(read_response.games[0].game_id, "game-1");
+        assert_eq!(read_response.games[1].game_id, "game-2");
+        assert_eq!(read_response.games[1].start_args, Some("--fullscreen".to_string()));
+        assert_eq!(read_response.games[2].game_id, "game-3");
+    }
+
+    #[tokio::test]
+    async fn test_codec_error_handling_invalid_json() {
+        // Test: Codec sollte Fehler bei ungültigem JSON korrekt behandeln
+        let mut codec = GamesListCodec;
+        let protocol = String::from("/deckdrop/games-list/1.0.0");
+        
+        // Erstelle ungültige Daten (falsche Länge)
+        let mut buffer = vec![0u8; 4];
+        buffer[0] = 0xFF; // Sehr große Länge
+        buffer[1] = 0xFF;
+        buffer[2] = 0xFF;
+        buffer[3] = 0xFF;
+        
+        let mut cursor = Cursor::new(&buffer);
+        let result = codec.read_response(&protocol, &mut cursor).await;
+        
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_create_games_list_behaviour() {
+        // Test: create_games_list_behaviour sollte ein Behaviour erstellen
+        let behaviour = create_games_list_behaviour();
+        
+        // Prüfe, dass das Behaviour erstellt wurde (keine Panic)
+        let _ = behaviour;
+    }
+
+    #[test]
+    fn test_network_game_info_game_id_comparison() {
+        // Test: game_id sollte zum Vergleich verwendet werden können
+        let game1 = NetworkGameInfo {
+            game_id: "same-id".to_string(),
+            name: "Game 1".to_string(),
+            version: "1.0".to_string(),
+            start_file: "game1.exe".to_string(),
+            start_args: None,
+            description: None,
+            creator_peer_id: None,
+        };
+        
+        let game2 = NetworkGameInfo {
+            game_id: "same-id".to_string(), // Gleiche ID
+            name: "Game 2".to_string(), // Aber anderer Name
+            version: "2.0".to_string(),
+            start_file: "game2.exe".to_string(),
+            start_args: None,
+            description: None,
+            creator_peer_id: None,
+        };
+        
+        let game3 = NetworkGameInfo {
+            game_id: "different-id".to_string(), // Andere ID
+            name: "Game 1".to_string(), // Aber gleicher Name
+            version: "1.0".to_string(),
+            start_file: "game1.exe".to_string(),
+            start_args: None,
+            description: None,
+            creator_peer_id: None,
+        };
+        
+        // Spiele mit gleicher game_id sollten als gleich erkannt werden
+        assert_eq!(game1.game_id, game2.game_id);
+        assert_ne!(game1.game_id, game3.game_id);
+    }
+
+    #[test]
+    fn test_games_list_response_empty() {
+        // Test: Leere GamesListResponse
+        let response = GamesListResponse {
+            games: Vec::new(),
+        };
+        
+        assert_eq!(response.games.len(), 0);
+        
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("games"));
+        
+        let deserialized: GamesListResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.games.len(), 0);
+    }
+
+    #[test]
+    fn test_network_game_info_all_fields() {
+        // Test: NetworkGameInfo mit allen Feldern
+        let game_info = NetworkGameInfo {
+            game_id: "complete-game".to_string(),
+            name: "Complete Game".to_string(),
+            version: "1.2.3".to_string(),
+            start_file: "start.bat".to_string(),
+            start_args: Some("--windowed --debug".to_string()),
+            description: Some("Ein vollständiges Spiel mit allen Feldern".to_string()),
+            creator_peer_id: Some("creator-456".to_string()),
+        };
+        
+        let json = serde_json::to_string(&game_info).unwrap();
+        assert!(json.contains("complete-game"));
+        assert!(json.contains("Complete Game"));
+        assert!(json.contains("1.2.3"));
+        assert!(json.contains("start.bat"));
+        assert!(json.contains("--windowed --debug"));
+        assert!(json.contains("Ein vollständiges Spiel"));
+        assert!(json.contains("creator-456"));
+    }
+}
+
