@@ -59,8 +59,12 @@ impl Config {
             fs::create_dir_all(parent)?;
         }
         
+        // Normalisiere den Pfad für die Speicherung (konvertiere zu ~ wenn im Home-Verzeichnis)
+        let mut config_to_save = self.clone();
+        config_to_save.games_path = Self::normalize_path_for_save(&config_to_save.games_path);
+        
         // Speichere die Konfiguration
-        let json = serde_json::to_string_pretty(self)?;
+        let json = serde_json::to_string_pretty(&config_to_save)?;
         fs::write(&config_path, json)?;
         
         Ok(())
@@ -78,6 +82,19 @@ impl Config {
         if path_str.starts_with("~/") {
             if let Some(home) = directories::BaseDirs::new() {
                 return home.home_dir().join(&path_str[2..]);
+            }
+        }
+        path.to_path_buf()
+    }
+
+    /// Normalisiert einen Pfad für die Speicherung (konvertiert zu ~ wenn im Home-Verzeichnis)
+    fn normalize_path_for_save(path: &Path) -> PathBuf {
+        if let Some(home) = directories::BaseDirs::new() {
+            if let Ok(relative) = path.strip_prefix(home.home_dir()) {
+                if relative.as_os_str().is_empty() {
+                    return PathBuf::from("~");
+                }
+                return PathBuf::from("~").join(relative);
             }
         }
         path.to_path_buf()

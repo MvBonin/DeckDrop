@@ -7,6 +7,13 @@ pub struct PeerInfo {
     pub id: String,
     pub addr: Option<String>,
     pub player_name: Option<String>,
+    pub games_count: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HandshakeMessage {
+    pub player_name: String,
+    pub games_count: u32,
 }
 
 impl From<(PeerId, Option<IpAddr>)> for PeerInfo {
@@ -14,7 +21,8 @@ impl From<(PeerId, Option<IpAddr>)> for PeerInfo {
         Self {
             id: id.to_string(),
             addr: addr.map(|ip| ip.to_string()),
-            player_name: None, // Will be populated later
+            player_name: None, // Will be populated via handshake
+            games_count: None, // Will be populated via handshake
         }
     }
 }
@@ -29,6 +37,7 @@ mod tests {
             id: "test-peer-123".to_string(),
             addr: Some("192.168.1.100:8080".to_string()),
             player_name: Some("TestPlayer".to_string()),
+            games_count: Some(10),
         };
         
         assert_eq!(peer.id, "test-peer-123");
@@ -42,6 +51,7 @@ mod tests {
             id: "test-peer-456".to_string(),
             addr: None,
             player_name: None,
+            games_count: None,
         };
         
         assert_eq!(peer.id, "test-peer-456");
@@ -55,6 +65,7 @@ mod tests {
             id: "test-peer-789".to_string(),
             addr: Some("10.0.0.1:9000".to_string()),
             player_name: Some("SerialPlayer".to_string()),
+            games_count: Some(5),
         };
         
         let serialized = serde_json::to_string(&peer).unwrap();
@@ -63,6 +74,7 @@ mod tests {
         assert_eq!(peer.id, deserialized.id);
         assert_eq!(peer.addr, deserialized.addr);
         assert_eq!(peer.player_name, deserialized.player_name);
+        assert_eq!(peer.games_count, deserialized.games_count);
     }
 
     #[test]
@@ -75,6 +87,7 @@ mod tests {
         assert_eq!(peer_info.id, peer_id.to_string());
         assert_eq!(peer_info.addr, Some("192.168.1.100".to_string()));
         assert_eq!(peer_info.player_name, None);
+        assert_eq!(peer_info.games_count, None);
     }
 
     #[test]
@@ -87,6 +100,7 @@ mod tests {
         assert_eq!(peer_info.id, peer_id.to_string());
         assert_eq!(peer_info.addr, Some("2001:db8::1".to_string()));
         assert_eq!(peer_info.player_name, None);
+        assert_eq!(peer_info.games_count, None);
     }
 
     #[test]
@@ -98,6 +112,7 @@ mod tests {
         assert_eq!(peer_info.id, peer_id.to_string());
         assert_eq!(peer_info.addr, None);
         assert_eq!(peer_info.player_name, None);
+        assert_eq!(peer_info.games_count, None);
     }
 
     #[test]
@@ -106,6 +121,7 @@ mod tests {
             id: "minimal-peer".to_string(),
             addr: None,
             player_name: None,
+            games_count: None,
         };
         
         let serialized = serde_json::to_string(&peer).unwrap();
@@ -114,6 +130,7 @@ mod tests {
         assert_eq!(peer.id, deserialized.id);
         assert_eq!(peer.addr, deserialized.addr);
         assert_eq!(peer.player_name, deserialized.player_name);
+        assert_eq!(peer.games_count, deserialized.games_count);
     }
 
     #[test]
@@ -123,6 +140,7 @@ mod tests {
             id: "partial-peer".to_string(),
             addr: Some("192.168.1.50".to_string()),
             player_name: None,
+            games_count: None,
         };
         
         let serialized = serde_json::to_string(&peer).unwrap();
@@ -131,6 +149,7 @@ mod tests {
         assert_eq!(peer.id, deserialized.id);
         assert_eq!(peer.addr, deserialized.addr);
         assert_eq!(peer.player_name, deserialized.player_name);
+        assert_eq!(peer.games_count, deserialized.games_count);
     }
 
     #[test]
@@ -139,6 +158,7 @@ mod tests {
             id: "clone-test".to_string(),
             addr: Some("192.168.1.200".to_string()),
             player_name: Some("ClonePlayer".to_string()),
+            games_count: Some(20),
         };
         
         let cloned = peer.clone();
@@ -146,6 +166,7 @@ mod tests {
         assert_eq!(peer.id, cloned.id);
         assert_eq!(peer.addr, cloned.addr);
         assert_eq!(peer.player_name, cloned.player_name);
+        assert_eq!(peer.games_count, cloned.games_count);
     }
 
     #[test]
@@ -154,6 +175,7 @@ mod tests {
             id: "debug-test".to_string(),
             addr: Some("192.168.1.201".to_string()),
             player_name: Some("DebugPlayer".to_string()),
+            games_count: Some(15),
         };
         
         // Should not panic when formatting
@@ -167,11 +189,13 @@ mod tests {
             id: "".to_string(),
             addr: Some("".to_string()),
             player_name: Some("".to_string()),
+            games_count: Some(0),
         };
         
         assert_eq!(peer.id, "");
         assert_eq!(peer.addr, Some("".to_string()));
         assert_eq!(peer.player_name, Some("".to_string()));
+        assert_eq!(peer.games_count, Some(0));
     }
 
     #[test]
@@ -184,11 +208,13 @@ mod tests {
             id: long_id.clone(),
             addr: Some(long_addr.clone()),
             player_name: Some(long_name.clone()),
+            games_count: Some(100),
         };
         
         assert_eq!(peer.id, long_id);
         assert_eq!(peer.addr, Some(long_addr));
         assert_eq!(peer.player_name, Some(long_name));
+        assert_eq!(peer.games_count, Some(100));
     }
 
     #[test]
@@ -197,6 +223,7 @@ mod tests {
             id: "roundtrip-test".to_string(),
             addr: Some("10.20.30.40".to_string()),
             player_name: Some("RoundTripPlayer".to_string()),
+            games_count: Some(25),
         };
         
         // Serialize

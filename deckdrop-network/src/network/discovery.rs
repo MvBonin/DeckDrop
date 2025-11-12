@@ -1,16 +1,22 @@
 use libp2p::{
     identity, mdns::{tokio::Behaviour as Mdns, Event as MdnsEvent},
+    identify::{Behaviour as Identify, Config as IdentifyConfig},
     swarm::SwarmEvent, PeerId,
 };
 use std::str::FromStr;
 use futures::StreamExt;
 use std::net::IpAddr;
+use std::collections::HashMap;
+use std::time::Duration;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
-use crate::network::{peer::PeerInfo, channel::PeerUpdateSender};
+use crate::network::{peer::{PeerInfo, HandshakeMessage}, channel::PeerUpdateSender};
 
 #[derive(libp2p::swarm::NetworkBehaviour)]
 pub struct DiscoveryBehaviour {
     pub mdns: Mdns,
+    pub identify: Identify,
 }
 
 // Event type for GTK integration
@@ -21,42 +27,58 @@ pub enum DiscoveryEvent {
 }
 
 // Wrapper function for GTK integration
-pub async fn start_discovery(event_tx: tokio::sync::mpsc::Sender<DiscoveryEvent>) -> tokio::task::JoinHandle<()> {
+pub async fn start_discovery(event_tx: tokio::sync::mpsc::Sender<DiscoveryEvent>, player_name: Option<String>, games_count: Option<u32>) -> tokio::task::JoinHandle<()> {
     let (sender, mut receiver) = crate::network::channel::new_peer_channel();
+    let event_tx_for_lost = event_tx.clone();
+    let player_name_clone = player_name.clone();
+    let games_count_clone = games_count;
     
-    // Spawn task to convert PeerInfo to DiscoveryEvent
+    // Spawn task to convert PeerInfo to DiscoveryEvent and exchange player names
     let event_tx_clone = event_tx.clone();
     tokio::spawn(async move {
         while let Ok(peer_info) = receiver.recv().await {
+            // Spielername und Spiele-Anzahl werden später über TCP-Verbindung geholt
+            // Für jetzt senden wir den PeerInfo ohne diese Daten
             let _ = event_tx_clone.send(DiscoveryEvent::PeerFound(peer_info)).await;
         }
     });
     
-    // Start discovery in background
+    // Start discovery in background with access to event_tx for PeerLost events
     tokio::spawn(async move {
-        let _ = run_discovery(sender, None).await;
+        let _ = run_discovery(sender, None, event_tx_for_lost, player_name_clone, games_count_clone).await;
     })
 }
 
-pub async fn run_discovery(sender: PeerUpdateSender, our_peer_id: Option<String>) {
-    let (_id_keys, peer_id) = if let Some(peer_id_str) = our_peer_id {
-        // Use provided peer ID
-        let peer_id = PeerId::from_str(&peer_id_str).unwrap_or_else(|_| {
+pub async fn run_discovery(sender: PeerUpdateSender, our_peer_id: Option<String>, event_tx: tokio::sync::mpsc::Sender<DiscoveryEvent>, our_player_name: Option<String>, our_games_count: Option<u32>) {
+    // Map to track peer info by peer ID for handshake updates
+    let peer_info_map: Arc<tokio::sync::Mutex<HashMap<String, PeerInfo>>> = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let peer_info_map_clone = peer_info_map.clone();
+    let sender_clone = sender.clone();
+    let event_tx_clone = event_tx.clone();
+    
+    // Handshake wird jetzt über identify Protokoll gehandhabt
+    // Channel nicht mehr benötigt, aber behalten für Kompatibilität
+    let (_handshake_tx, mut handshake_rx) = tokio::sync::mpsc::unbounded_channel::<(PeerId, Option<String>, Option<u32>)>();
+    // Generate or use provided identity
+    let id_keys = if let Some(peer_id_str) = our_peer_id {
+        // Try to parse provided peer ID, but we still need keys for the swarm
+        let _peer_id = PeerId::from_str(&peer_id_str).unwrap_or_else(|_| {
             let keys = identity::Keypair::generate_ed25519();
             PeerId::from(keys.public())
         });
-        (None, peer_id)
+        // For now, generate new keys since we can't reconstruct keys from peer ID
+        identity::Keypair::generate_ed25519()
     } else {
-        // Generate new peer ID
-        let keys = identity::Keypair::generate_ed25519();
-        let peer_id = PeerId::from(keys.public());
-        (Some(keys), peer_id)
+        // Generate new identity
+        identity::Keypair::generate_ed25519()
     };
+    
+    let peer_id = PeerId::from(id_keys.public());
 
     println!("Starting mDNS discovery with peer ID: {}", peer_id);
     eprintln!("Starting mDNS discovery with peer ID: {}", peer_id);
 
-    // Create mDNS with more explicit configuration
+    // Create mDNS with the same peer ID
     let mdns_config = libp2p::mdns::Config::default();
     let mdns = match Mdns::new(mdns_config, peer_id) {
         Ok(mdns) => {
@@ -71,8 +93,31 @@ pub async fn run_discovery(sender: PeerUpdateSender, our_peer_id: Option<String>
         }
     };
 
-    let behaviour = DiscoveryBehaviour { mdns };
-    let mut swarm = libp2p::SwarmBuilder::with_new_identity()
+    // Create identify behaviour with custom protocol name and agent version
+    // Agent version kann Metadaten enthalten (z.B. JSON mit player_name und games_count)
+    let agent_version = if our_player_name.is_some() || our_games_count.is_some() {
+        let metadata = serde_json::json!({
+            "player_name": our_player_name.as_ref().unwrap_or(&"Unknown".to_string()),
+            "games_count": our_games_count.unwrap_or(0)
+        });
+        // Verwende to_string() für kompakte JSON-Darstellung (ohne Leerzeichen)
+        let json_str = serde_json::to_string(&metadata).unwrap_or_else(|_| "{}".to_string());
+        format!("deckdrop/{}", json_str)
+    } else {
+        "deckdrop/1.0.0".to_string()
+    };
+    
+    println!("Setting agent_version to: {}", agent_version);
+    eprintln!("Setting agent_version to: {}", agent_version);
+    
+    let identify_config = IdentifyConfig::new("/deckdrop/1.0.0".to_string(), id_keys.public())
+        .with_agent_version(agent_version);
+    let identify = Identify::new(identify_config);
+    
+    let behaviour = DiscoveryBehaviour { mdns, identify };
+    
+    // Use the same identity for the swarm
+    let mut swarm = libp2p::SwarmBuilder::with_existing_identity(id_keys)
         .with_tokio()
         .with_tcp(
             libp2p::tcp::Config::default(),
@@ -88,21 +133,138 @@ pub async fn run_discovery(sender: PeerUpdateSender, our_peer_id: Option<String>
     println!("Swarm created, starting discovery loop...");
     eprintln!("Swarm created, starting discovery loop...");
 
-    // Listen on all interfaces
+    // Listen on all interfaces (IPv4 and IPv6, including localhost)
     if let Err(e) = swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse().unwrap()) {
-        println!("Failed to listen on all interfaces: {}", e);
-        eprintln!("Failed to listen on all interfaces: {}", e);
-        return;
+        println!("Failed to listen on IPv4: {}", e);
+        eprintln!("Failed to listen on IPv4: {}", e);
     } else {
-        println!("Listening on all interfaces for peer discovery");
-        eprintln!("Listening on all interfaces for peer discovery");
+        println!("Listening on IPv4 for peer discovery");
+        eprintln!("Listening on IPv4 for peer discovery");
+    }
+    
+    // Also listen on IPv6
+    if let Err(e) = swarm.listen_on("/ip6/::/tcp/0".parse().unwrap()) {
+        println!("Failed to listen on IPv6: {}", e);
+        eprintln!("Failed to listen on IPv6: {}", e);
+    } else {
+        println!("Listening on IPv6 for peer discovery");
+        eprintln!("Listening on IPv6 for peer discovery");
+    }
+    
+    // Also listen on localhost explicitly
+    if let Err(e) = swarm.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap()) {
+        println!("Failed to listen on localhost: {}", e);
+        eprintln!("Failed to listen on localhost: {}", e);
+    } else {
+        println!("Listening on localhost for peer discovery");
+        eprintln!("Listening on localhost for peer discovery");
     }
     
     
     loop {
-        match swarm.select_next_some().await {
+        tokio::select! {
+            // Handle Swarm Events
+            event = swarm.select_next_some() => {
+                match event {
             SwarmEvent::Behaviour(discovery_event) => {
                 match discovery_event {
+                    DiscoveryBehaviourEvent::Identify(event) => {
+                        use libp2p::identify::Event;
+                        match event {
+                            Event::Received { peer_id, info, connection_id: _ } => {
+                                println!("Received identify info from {}: protocol={}, agent={}", 
+                                    peer_id, info.protocol_version, info.agent_version);
+                                eprintln!("Received identify info from {}: protocol={}, agent={}", 
+                                    peer_id, info.protocol_version, info.agent_version);
+                                
+                                // Extract player name and games count from agent_version
+                                // Format: "deckdrop/{\"player_name\":\"...\",\"games_count\":...}"
+                                let mut player_name = None;
+                                let mut games_count = None;
+                                
+                                println!("Received agent_version: {}", info.agent_version);
+                                eprintln!("Received agent_version: {}", info.agent_version);
+                                
+                                if info.agent_version.starts_with("deckdrop/") {
+                                    let json_str = &info.agent_version[9..]; // Skip "deckdrop/"
+                                    println!("Parsing JSON from agent_version: {}", json_str);
+                                    eprintln!("Parsing JSON from agent_version: {}", json_str);
+                                    
+                                    if let Ok(metadata) = serde_json::from_str::<serde_json::Value>(json_str) {
+                                        println!("Parsed metadata: {:?}", metadata);
+                                        eprintln!("Parsed metadata: {:?}", metadata);
+                                        
+                                        if let Some(name) = metadata.get("player_name").and_then(|v| v.as_str()) {
+                                            player_name = Some(name.to_string());
+                                            println!("Extracted player_name: {}", name);
+                                        }
+                                        if let Some(count) = metadata.get("games_count").and_then(|v| v.as_u64()) {
+                                            games_count = Some(count as u32);
+                                            println!("Extracted games_count: {}", count);
+                                        }
+                                    } else {
+                                        eprintln!("Failed to parse JSON from agent_version: {}", json_str);
+                                    }
+                                } else {
+                                    eprintln!("Agent version does not start with 'deckdrop/': {}", info.agent_version);
+                                }
+                                
+                                // Aktualisiere PeerInfo mit identify-Daten
+                                let peer_id_str = peer_id.to_string();
+                                let mut map = peer_info_map_clone.lock().await;
+                                if let Some(mut peer_info) = map.get_mut(&peer_id_str) {
+                                    let mut updated = false;
+                                    
+                                    if let Some(name) = player_name {
+                                        if peer_info.player_name.as_ref() != Some(&name) {
+                                            peer_info.player_name = Some(name);
+                                            updated = true;
+                                        }
+                                    }
+                                    if let Some(count) = games_count {
+                                        if peer_info.games_count != Some(count) {
+                                            peer_info.games_count = Some(count);
+                                            updated = true;
+                                        }
+                                    }
+                                    
+                                    if updated {
+                                        println!("Updated peer info for {}: name={:?}, games={:?}", 
+                                            peer_id_str, peer_info.player_name, peer_info.games_count);
+                                        
+                                        // Sende aktualisiertes PeerInfo (wichtig: auch wenn Peer bereits bekannt ist!)
+                                        let _ = sender_clone.send(peer_info.clone());
+                                        let _ = event_tx_clone.send(DiscoveryEvent::PeerFound(peer_info.clone())).await;
+                                    }
+                                } else {
+                                    // Peer noch nicht in Map - erstelle neuen Eintrag
+                                    let new_peer_info = PeerInfo {
+                                        id: peer_id_str.clone(),
+                                        addr: None,
+                                        player_name,
+                                        games_count,
+                                    };
+                                    
+                                    // Versuche Adresse aus der Map zu holen (falls bereits vorhanden)
+                                    // Für jetzt: Erstelle neuen Eintrag
+                                    map.insert(peer_id_str.clone(), new_peer_info.clone());
+                                    
+                                    println!("Created new peer info from identify for {}: name={:?}, games={:?}", 
+                                        peer_id_str, new_peer_info.player_name, new_peer_info.games_count);
+                                    
+                                    let _ = sender_clone.send(new_peer_info.clone());
+                                    let _ = event_tx_clone.send(DiscoveryEvent::PeerFound(new_peer_info)).await;
+                                }
+                            }
+                            Event::Sent { peer_id, .. } => {
+                                println!("Sent identify info to {}", peer_id);
+                            }
+                            Event::Error { peer_id, error, connection_id: _ } => {
+                                eprintln!("Identify error with {}: {}", peer_id, error);
+                            }
+                            _ => {}
+                        }
+                    }
                     DiscoveryBehaviourEvent::Mdns(MdnsEvent::Discovered(peers)) => {
                         println!("mDNS discovered {} peers", peers.len());
                         eprintln!("mDNS discovered {} peers", peers.len());
@@ -117,9 +279,29 @@ pub async fn run_discovery(sender: PeerUpdateSender, our_peer_id: Option<String>
                                     }
                                 });
                             
-                            let peer_info = PeerInfo::from((peer_id, ip));
+                            let peer_info = PeerInfo::from((peer_id.clone(), ip));
+                            
+                            // Speichere PeerInfo für späteren Handshake-Update
+                            {
+                                let mut map = peer_info_map_clone.lock().await;
+                                map.insert(peer_id.to_string(), peer_info.clone());
+                            }
+                            
                             println!("Discovered peer: {} at {:?}", peer_info.id, peer_info.addr);
                             eprintln!("Discovered peer: {} at {:?}", peer_info.id, peer_info.addr);
+                            
+                            // WICHTIG: Baue Verbindung auf, damit identify funktionieren kann!
+                            // libp2p sollte das automatisch tun, aber wir stellen sicher, dass wir dialen
+                            println!("Attempting to dial peer {} at {}", peer_id, addr);
+                            eprintln!("Attempting to dial peer {} at {}", peer_id, addr);
+                            // Versuche Verbindung aufzubauen
+                            let addr_clone = addr.clone();
+                            if let Err(e) = swarm.dial(addr_clone) {
+                                eprintln!("Failed to dial {}: {}", addr, e);
+                            } else {
+                                println!("Dial initiated for {}", peer_id);
+                            }
+                            
                             let _ = sender.send(peer_info);
                         }
                     }
@@ -129,6 +311,8 @@ pub async fn run_discovery(sender: PeerUpdateSender, our_peer_id: Option<String>
                         for (peer_id, _addr) in expired {
                             println!("Peer expired: {}", peer_id);
                             eprintln!("Peer expired: {}", peer_id);
+                            // Send PeerLost event
+                            let _ = event_tx.send(DiscoveryEvent::PeerLost(peer_id.to_string())).await;
                         }
                     }
                 }
@@ -140,6 +324,20 @@ pub async fn run_discovery(sender: PeerUpdateSender, our_peer_id: Option<String>
             SwarmEvent::ConnectionEstablished { peer_id, .. } => {
                 println!("Connection established with: {}", peer_id);
                 eprintln!("Connection established with: {}", peer_id);
+                
+                // Identify Protokoll wird automatisch die Metadaten senden/empfangen
+                // Kein manueller Handshake mehr nötig
+                // Identify sollte automatisch ausgelöst werden, wenn die Verbindung etabliert ist
+            }
+            SwarmEvent::ConnectionClosed { peer_id, .. } => {
+                println!("Connection closed with: {}", peer_id);
+                eprintln!("Connection closed with: {}", peer_id);
+            }
+            SwarmEvent::Dialing { peer_id, .. } => {
+                // Versuche Verbindung aufzubauen
+            }
+            SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
+                eprintln!("Outgoing connection error to {}: {}", peer_id.map(|p| p.to_string()).unwrap_or_else(|| "unknown".to_string()), error);
             }
             SwarmEvent::ConnectionClosed { peer_id, .. } => {
                 println!("Connection closed with: {}", peer_id);
@@ -154,6 +352,14 @@ pub async fn run_discovery(sender: PeerUpdateSender, our_peer_id: Option<String>
                 eprintln!("Listener error: {}", error);
             }
             _ => {}
+                }
+            }
+            // Handshake wird jetzt über identify Protokoll gehandhabt
+            // Der handshake_rx Channel wird nicht mehr benötigt, aber wir behalten ihn für Kompatibilität
+            Some((_peer_id, _player_name, _games_count)) = handshake_rx.recv() => {
+                // Identify Protokoll übernimmt den Handshake automatisch
+                // Diese Stelle wird nicht mehr erreicht, da identify automatisch läuft
+            }
         }
     }
 }
@@ -190,6 +396,7 @@ mod tests {
             id: "test-peer-123".to_string(),
             addr: Some("192.168.1.100".to_string()),
             player_name: Some("DiscoveryTest".to_string()),
+            games_count: Some(10),
         };
         
         // Send peer through channel
@@ -211,12 +418,14 @@ mod tests {
             id: "peer-1".to_string(),
             addr: Some("192.168.1.101".to_string()),
             player_name: None,
+            games_count: None,
         };
         
         let peer2 = PeerInfo {
             id: "peer-2".to_string(),
             addr: Some("192.168.1.102".to_string()),
             player_name: None,
+            games_count: None,
         };
         
         // Send to different channels
@@ -245,6 +454,312 @@ mod tests {
         assert!(timeout_result.is_err());
     }
 
+    #[test]
+    fn test_agent_version_encoding_with_metadata() {
+        // Test: Metadaten werden korrekt in agent_version kodiert
+        let player_name = Some("TestPlayer".to_string());
+        let games_count = Some(42u32);
+        
+        let metadata = serde_json::json!({
+            "player_name": player_name.as_ref().unwrap_or(&"Unknown".to_string()),
+            "games_count": games_count.unwrap_or(0)
+        });
+        let json_str = serde_json::to_string(&metadata).unwrap();
+        let agent_version = format!("deckdrop/{}", json_str);
+        
+        assert!(agent_version.starts_with("deckdrop/"));
+        assert!(agent_version.contains("TestPlayer"));
+        assert!(agent_version.contains("42"));
+    }
+
+    #[test]
+    fn test_agent_version_encoding_without_metadata() {
+        // Test: Ohne Metadaten wird Standard-Version verwendet
+        let player_name: Option<String> = None;
+        let games_count: Option<u32> = None;
+        
+        let agent_version = if player_name.is_some() || games_count.is_some() {
+            let metadata = serde_json::json!({
+                "player_name": player_name.as_ref().unwrap_or(&"Unknown".to_string()),
+                "games_count": games_count.unwrap_or(0)
+            });
+            let json_str = serde_json::to_string(&metadata).unwrap();
+            format!("deckdrop/{}", json_str)
+        } else {
+            "deckdrop/1.0.0".to_string()
+        };
+        
+        assert_eq!(agent_version, "deckdrop/1.0.0");
+    }
+
+    #[test]
+    fn test_agent_version_decoding() {
+        // Test: Metadaten werden korrekt aus agent_version extrahiert
+        let agent_version = "deckdrop/{\"player_name\":\"TestPlayer\",\"games_count\":42}";
+        
+        assert!(agent_version.starts_with("deckdrop/"));
+        let json_str = &agent_version[9..]; // Skip "deckdrop/"
+        
+        let metadata: serde_json::Value = serde_json::from_str(json_str).unwrap();
+        
+        let player_name = metadata.get("player_name").and_then(|v| v.as_str());
+        let games_count = metadata.get("games_count").and_then(|v| v.as_u64());
+        
+        assert_eq!(player_name, Some("TestPlayer"));
+        assert_eq!(games_count, Some(42));
+    }
+
+    #[test]
+    fn test_agent_version_decoding_invalid_json() {
+        // Test: Ungültiges JSON wird korrekt behandelt
+        let agent_version = "deckdrop/{invalid json}";
+        
+        assert!(agent_version.starts_with("deckdrop/"));
+        let json_str = &agent_version[9..];
+        
+        let result: Result<serde_json::Value, _> = serde_json::from_str(json_str);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_agent_version_decoding_wrong_prefix() {
+        // Test: Agent version ohne "deckdrop/" Prefix wird ignoriert
+        let agent_version = "other/{\"player_name\":\"Test\"}";
+        
+        assert!(!agent_version.starts_with("deckdrop/"));
+    }
+
+    #[tokio::test]
+    async fn test_peer_info_update_with_identify_metadata() {
+        // Test: PeerInfo wird korrekt mit identify-Metadaten aktualisiert
+        let mut peer_info = PeerInfo {
+            id: "test-peer-123".to_string(),
+            addr: Some("192.168.1.100".to_string()),
+            player_name: None,
+            games_count: None,
+        };
+        
+        // Simuliere identify-Update
+        let player_name = Some("TestPlayer".to_string());
+        let games_count = Some(42u32);
+        
+        if let Some(name) = player_name {
+            if peer_info.player_name.as_ref() != Some(&name) {
+                peer_info.player_name = Some(name);
+            }
+        }
+        if let Some(count) = games_count {
+            if peer_info.games_count != Some(count) {
+                peer_info.games_count = Some(count);
+            }
+        }
+        
+        assert_eq!(peer_info.player_name, Some("TestPlayer".to_string()));
+        assert_eq!(peer_info.games_count, Some(42));
+    }
+
+    #[tokio::test]
+    async fn test_peer_info_update_detection() {
+        // Test: Erkennt, ob sich Metadaten geändert haben
+        let existing_peer = PeerInfo {
+            id: "test-peer-123".to_string(),
+            addr: Some("192.168.1.100".to_string()),
+            player_name: Some("OldName".to_string()),
+            games_count: Some(10),
+        };
+        
+        let new_peer = PeerInfo {
+            id: "test-peer-123".to_string(),
+            addr: Some("192.168.1.100".to_string()),
+            player_name: Some("NewName".to_string()),
+            games_count: Some(20),
+        };
+        
+        let needs_update = existing_peer.player_name != new_peer.player_name 
+            || existing_peer.games_count != new_peer.games_count;
+        
+        assert!(needs_update);
+    }
+
+    #[tokio::test]
+    async fn test_peer_info_update_no_change() {
+        // Test: Kein Update wenn Metadaten gleich sind
+        let existing_peer = PeerInfo {
+            id: "test-peer-123".to_string(),
+            addr: Some("192.168.1.100".to_string()),
+            player_name: Some("TestPlayer".to_string()),
+            games_count: Some(42),
+        };
+        
+        let new_peer = PeerInfo {
+            id: "test-peer-123".to_string(),
+            addr: Some("192.168.1.100".to_string()),
+            player_name: Some("TestPlayer".to_string()),
+            games_count: Some(42),
+        };
+        
+        let needs_update = existing_peer.player_name != new_peer.player_name 
+            || existing_peer.games_count != new_peer.games_count;
+        
+        assert!(!needs_update);
+    }
+
+    #[test]
+    fn test_agent_version_roundtrip() {
+        // Test: Encode -> Decode sollte identische Daten ergeben
+        let original_player_name = "TestPlayer";
+        let original_games_count = 42u32;
+        
+        // Encode
+        let metadata = serde_json::json!({
+            "player_name": original_player_name,
+            "games_count": original_games_count
+        });
+        let json_str = serde_json::to_string(&metadata).unwrap();
+        let agent_version = format!("deckdrop/{}", json_str);
+        
+        // Decode
+        let json_str = &agent_version[9..];
+        let metadata: serde_json::Value = serde_json::from_str(json_str).unwrap();
+        
+        let decoded_player_name = metadata.get("player_name").and_then(|v| v.as_str());
+        let decoded_games_count = metadata.get("games_count").and_then(|v| v.as_u64());
+        
+        assert_eq!(decoded_player_name, Some(original_player_name));
+        assert_eq!(decoded_games_count, Some(original_games_count as u64));
+    }
+
+    #[test]
+    fn test_agent_version_with_special_characters() {
+        // Test: Metadaten mit Sonderzeichen werden korrekt kodiert/dekodiert
+        let player_name = "Player with \"quotes\" and\nnewlines";
+        let games_count = 100u32;
+        
+        let metadata = serde_json::json!({
+            "player_name": player_name,
+            "games_count": games_count
+        });
+        let json_str = serde_json::to_string(&metadata).unwrap();
+        let agent_version = format!("deckdrop/{}", json_str);
+        
+        // Decode
+        let json_str = &agent_version[9..];
+        let metadata: serde_json::Value = serde_json::from_str(json_str).unwrap();
+        
+        let decoded_player_name = metadata.get("player_name").and_then(|v| v.as_str());
+        assert_eq!(decoded_player_name, Some(player_name));
+    }
+
+    #[test]
+    fn test_agent_version_partial_metadata() {
+        // Test: Nur player_name oder nur games_count
+        // Nur player_name
+        let metadata1 = serde_json::json!({
+            "player_name": "TestPlayer",
+            "games_count": 0
+        });
+        let json_str1 = serde_json::to_string(&metadata1).unwrap();
+        let agent_version1 = format!("deckdrop/{}", json_str1);
+        
+        let json_str1 = &agent_version1[9..];
+        let metadata1: serde_json::Value = serde_json::from_str(json_str1).unwrap();
+        assert_eq!(metadata1.get("player_name").and_then(|v| v.as_str()), Some("TestPlayer"));
+        assert_eq!(metadata1.get("games_count").and_then(|v| v.as_u64()), Some(0));
+        
+        // Nur games_count (player_name = "Unknown")
+        let metadata2 = serde_json::json!({
+            "player_name": "Unknown",
+            "games_count": 100
+        });
+        let json_str2 = serde_json::to_string(&metadata2).unwrap();
+        let agent_version2 = format!("deckdrop/{}", json_str2);
+        
+        let json_str2 = &agent_version2[9..];
+        let metadata2: serde_json::Value = serde_json::from_str(json_str2).unwrap();
+        assert_eq!(metadata2.get("player_name").and_then(|v| v.as_str()), Some("Unknown"));
+        assert_eq!(metadata2.get("games_count").and_then(|v| v.as_u64()), Some(100));
+    }
+
+    #[tokio::test]
+    async fn test_two_peers_discovery_with_metadata() {
+        // Test: Zwei Peers finden sich gegenseitig und tauschen Metadaten aus
+        use tokio::sync::mpsc;
+        
+        // Peer 1: "Alice" mit 5 Spielen
+        let (event_tx1, mut event_rx1) = mpsc::channel::<DiscoveryEvent>(100);
+        let player_name1 = Some("Alice".to_string());
+        let games_count1 = Some(5u32);
+        
+        // Peer 2: "Bob" mit 10 Spielen
+        let (event_tx2, mut event_rx2) = mpsc::channel::<DiscoveryEvent>(100);
+        let player_name2 = Some("Bob".to_string());
+        let games_count2 = Some(10u32);
+        
+        // Starte beide Discovery-Instanzen
+        let _handle1 = start_discovery(event_tx1, player_name1.clone(), games_count1).await;
+        let _handle2 = start_discovery(event_tx2, player_name2.clone(), games_count2).await;
+        
+        // Warte kurz, damit die Swarms initialisiert werden
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        
+        // Sammle Events von beiden Peers
+        let mut peer1_found_bob = false;
+        let mut peer2_found_alice = false;
+        let mut bob_metadata_correct = false;
+        let mut alice_metadata_correct = false;
+        
+        // Warte auf Events (mit Timeout)
+        let timeout = Duration::from_secs(10);
+        let start = std::time::Instant::now();
+        
+        while start.elapsed() < timeout {
+            tokio::select! {
+                // Events von Peer 1 (sollte Bob finden)
+                event = event_rx1.recv() => {
+                    if let Some(DiscoveryEvent::PeerFound(peer)) = event {
+                        println!("Peer 1 (Alice) found peer: {} (name: {:?}, games: {:?})", 
+                            peer.id, peer.player_name, peer.games_count);
+                        
+                        // Prüfe ob es Bob ist (hat Bob's Metadaten)
+                        if peer.player_name == player_name2 && peer.games_count == games_count2 {
+                            peer1_found_bob = true;
+                            bob_metadata_correct = true;
+                            println!("✓ Peer 1 correctly identified Bob with metadata");
+                        }
+                    }
+                }
+                // Events von Peer 2 (sollte Alice finden)
+                event = event_rx2.recv() => {
+                    if let Some(DiscoveryEvent::PeerFound(peer)) = event {
+                        println!("Peer 2 (Bob) found peer: {} (name: {:?}, games: {:?})", 
+                            peer.id, peer.player_name, peer.games_count);
+                        
+                        // Prüfe ob es Alice ist (hat Alice's Metadaten)
+                        if peer.player_name == player_name1 && peer.games_count == games_count1 {
+                            peer2_found_alice = true;
+                            alice_metadata_correct = true;
+                            println!("✓ Peer 2 correctly identified Alice with metadata");
+                        }
+                    }
+                }
+                _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                    // Check if we have both
+                    if peer1_found_bob && peer2_found_alice {
+                        break;
+                    }
+                }
+            }
+        }
+        
+        // Assertions
+        assert!(peer1_found_bob, "Peer 1 (Alice) should have found Peer 2 (Bob)");
+        assert!(peer2_found_alice, "Peer 2 (Bob) should have found Peer 1 (Alice)");
+        assert!(bob_metadata_correct, "Bob's metadata (name: {:?}, games: {:?}) should be correct", 
+            player_name2, games_count2);
+        assert!(alice_metadata_correct, "Alice's metadata (name: {:?}, games: {:?}) should be correct", 
+            player_name1, games_count1);
+    }
+
     #[tokio::test]
     async fn test_peer_store_integration() {
         let peer_store = Arc::new(Mutex::new(HashMap::new()));
@@ -254,6 +769,7 @@ mod tests {
             id: "test-peer-store".to_string(),
             addr: Some("192.168.1.103".to_string()),
             player_name: None,
+            games_count: None,
         };
         
         // Send peer
@@ -280,6 +796,7 @@ mod tests {
                 id: "concurrent-peer-1".to_string(),
                 addr: Some("192.168.1.201".to_string()),
                 player_name: None,
+                games_count: None,
             };
             let _ = sender1.send(peer);
             sleep(Duration::from_millis(50)).await;
@@ -290,6 +807,7 @@ mod tests {
                 id: "concurrent-peer-2".to_string(),
                 addr: Some("192.168.1.202".to_string()),
                 player_name: None,
+                games_count: None,
             };
             let _ = sender2.send(peer);
             sleep(Duration::from_millis(50)).await;
@@ -314,13 +832,17 @@ mod tests {
         let (sender1, mut receiver1) = crate::network::channel::new_peer_channel();
         let (_sender2, _receiver2) = crate::network::channel::new_peer_channel();
         
+        // Create event channels for PeerLost events
+        let (event_tx1, _event_rx1) = tokio::sync::mpsc::channel::<DiscoveryEvent>(32);
+        let (event_tx2, _event_rx2) = tokio::sync::mpsc::channel::<DiscoveryEvent>(32);
+        
         // Start two discovery instances in separate tasks
         let handle1 = tokio::spawn(async move {
-            run_discovery(sender1, None).await;
+            run_discovery(sender1, None, event_tx1, None, None).await;
         });
         
         let handle2 = tokio::spawn(async move {
-            run_discovery(_sender2, None).await;
+            run_discovery(_sender2, None, event_tx2, None, None).await;
         });
         
         // Wait a bit for discovery to start
@@ -432,7 +954,11 @@ mod tests {
         let mdns = Mdns::new(mdns_config, peer_id);
         assert!(mdns.is_ok());
         
-        let _behaviour = DiscoveryBehaviour { mdns: mdns.unwrap() };
+        // Create identify behaviour for test
+        let id_keys = identity::Keypair::generate_ed25519();
+        let identify_config = IdentifyConfig::new("/deckdrop/1.0.0".to_string(), id_keys.public());
+        let identify = Identify::new(identify_config);
+        let _behaviour = DiscoveryBehaviour { mdns: mdns.unwrap(), identify };
         // Verify behaviour was created
         assert!(true); // If we get here, creation succeeded
     }
@@ -445,6 +971,7 @@ mod tests {
             id: "test-event".to_string(),
             addr: Some("192.168.1.100".to_string()),
             player_name: None,
+            games_count: None,
         };
         
         // Test PeerFound variant
@@ -471,7 +998,7 @@ mod tests {
         let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<DiscoveryEvent>(32);
         
         // Start discovery
-        let handle = start_discovery(event_tx).await;
+        let handle = start_discovery(event_tx, Some("TestPlayer".to_string()), Some(10)).await;
         
         // Verify handle was returned
         assert!(!handle.is_finished());
@@ -513,6 +1040,7 @@ mod tests {
                 id: format!("update-peer-{}", i),
                 addr: Some(format!("192.168.1.{}", 100 + i)),
                 player_name: None,
+                games_count: None,
             };
             let _ = sender.send(peer);
         }

@@ -7,7 +7,6 @@ pub struct SettingsWindow {
     window: ApplicationWindow,
     player_name_entry: Entry,
     games_path_entry: Entry,
-    config: Config,
 }
 
 impl SettingsWindow {
@@ -82,7 +81,6 @@ impl SettingsWindow {
             window,
             player_name_entry,
             games_path_entry,
-            config: config.clone(),
         };
 
         // Event-Handler
@@ -112,13 +110,6 @@ impl SettingsWindow {
         }
     }
 
-    fn browse_for_path(&self) {
-        // Diese Methode wird nicht direkt verwendet, sondern über clone_for_events
-    }
-
-    fn save_and_close(&self) {
-        // Diese Methode wird nicht direkt verwendet, sondern über clone_for_events
-    }
 
     pub fn show(&self) {
         self.window.present();
@@ -154,7 +145,7 @@ impl SettingsWindowClone {
             dialog.close();
         });
 
-        dialog.set_transient_for(&window_clone);
+        dialog.set_transient_for(Some(&window_clone));
         dialog.show();
     }
 
