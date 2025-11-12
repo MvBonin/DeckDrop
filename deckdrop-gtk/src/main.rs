@@ -229,10 +229,19 @@ fn build_ui(app: &Application) {
         // Network Discovery Task
         rt.spawn(async move {
             let _handle = start_discovery(event_tx.clone(), Some(player_name.clone()), games_count, keypair).await;
+            println!("Discovery gestartet, warte auf Events...");
+            eprintln!("Discovery gestartet, warte auf Events...");
 
             while let Some(event) = event_rx.recv().await {
+                println!("Event empfangen im Tokio Thread: {:?}", event);
+                eprintln!("Event empfangen im Tokio Thread: {:?}", event);
                 // Events in den GTK Thread schicken
-                let _ = glib_tx_clone.send(event).await;
+                if let Err(e) = glib_tx_clone.send(event).await {
+                    eprintln!("Fehler beim Senden des Events an GTK Thread: {}", e);
+                } else {
+                    println!("Event erfolgreich an GTK Thread gesendet");
+                    eprintln!("Event erfolgreich an GTK Thread gesendet");
+                }
             }
         });
         
@@ -255,10 +264,22 @@ fn build_ui(app: &Application) {
     let status_label_weak = status_label.downgrade();
     
     main_context.spawn_local_with_priority(glib::Priority::default(), async move {
+        println!("GTK Event-Handler gestartet, warte auf Events...");
+        eprintln!("GTK Event-Handler gestartet, warte auf Events...");
+        
         while let Ok(event) = glib_rx.recv().await {
+            println!("Event empfangen im GTK Thread: {:?}", event);
+            eprintln!("Event empfangen im GTK Thread: {:?}", event);
+            
             // Upgrade weak references
-            let Some(peers_list) = peers_list_weak.upgrade() else { break };
-            let Some(status_label) = status_label_weak.upgrade() else { break };
+            let Some(peers_list) = peers_list_weak.upgrade() else { 
+                eprintln!("peers_list weak reference ist nicht mehr verfügbar");
+                break;
+            };
+            let Some(status_label) = status_label_weak.upgrade() else { 
+                eprintln!("status_label weak reference ist nicht mehr verfügbar");
+                break;
+            };
             
             match event {
                 DiscoveryEvent::PeerFound(peer) => {

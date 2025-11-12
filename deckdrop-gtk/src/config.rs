@@ -109,6 +109,8 @@ impl Config {
     
     /// Lädt die Keypair aus der Datei oder generiert eine neue
     /// Gibt die Peer-ID als String zurück
+    /// WICHTIG: Diese Funktion generiert IMMER eine neue Keypair, wenn keine existiert
+    /// oder wenn die Datei nicht gelesen werden kann
     fn load_or_generate_peer_id() -> Option<String> {
         use libp2p::identity;
         use libp2p::PeerId;
@@ -123,10 +125,13 @@ impl Config {
                         Ok(keypair) => {
                             let peer_id = PeerId::from(keypair.public());
                             println!("Geladene Peer-ID: {}", peer_id);
+                            eprintln!("Geladene Peer-ID: {}", peer_id);
                             return Some(peer_id.to_string());
                         }
                         Err(e) => {
                             eprintln!("Fehler beim Laden der Keypair: {}", e);
+                            // Datei ist korrupt, lösche sie und generiere neue
+                            let _ = fs::remove_file(&keypair_path);
                         }
                     }
                 }
@@ -137,6 +142,8 @@ impl Config {
         }
         
         // Generiere neue Keypair
+        println!("Generiere neue Keypair...");
+        eprintln!("Generiere neue Keypair...");
         let keypair = identity::Keypair::generate_ed25519();
         let peer_id = PeerId::from(keypair.public());
         let peer_id_str = peer_id.to_string();
@@ -154,6 +161,7 @@ impl Config {
                     eprintln!("Fehler beim Speichern der Keypair: {}", e);
                 } else {
                     println!("Neue Peer-ID generiert und gespeichert: {}", peer_id);
+                    eprintln!("Neue Peer-ID generiert und gespeichert: {}", peer_id);
                 }
             }
             Err(e) => {
