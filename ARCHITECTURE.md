@@ -13,8 +13,11 @@ DeckDrop is a LAN-only peer-to-peer game sharing tool built for the Steam Deck (
 | **PeerInfo**         | Peer identification and metadata         |
 | **Swarm**            | libp2p network swarm management          |
 | **serde + JSON**     | Peer data serialization                  |
+| **serde + TOML**     | Game metadata serialization              |
 | **gtk-rs**           | GUI                                      |
 | **tokio**            | Async runtime for concurrent operations  |
+| **GameInfo**         | Game metadata and configuration          |
+| **GameChecker**      | Validates and loads game configurations  |
 
 ## 🌐 Network Architecture
 
@@ -188,6 +191,41 @@ pub fn new_peer_channel() -> (PeerUpdateSender, PeerUpdateReceiver) {
 pub struct PeerInfo {
     pub id: String,           // libp2p PeerId as string
     pub addr: Option<String>, // IP address if available
+    pub player_name: Option<String>, // Optional player name
+    pub games_count: Option<u32>,    // Number of games available
+}
+```
+
+### Game Management System (`game.rs`)
+
+```rust
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GameInfo {
+    pub name: String,                    // Game name
+    pub version: String,                 // Game version (default: "1.0")
+    pub start_file: String,              // Relative path to game executable
+    pub start_args: Option<String>,      // Optional startup arguments
+    pub description: Option<String>,     // Optional game description
+    pub creator_peer_id: Option<String>, // Peer ID of game creator
+}
+
+impl GameInfo {
+    pub fn load_from_path(game_path: &Path) -> Result<Self, Error>;
+    pub fn save_to_path(&self, game_path: &Path) -> Result<(), Error>;
+}
+
+pub fn check_game_config_exists(game_path: &Path) -> bool;
+pub fn load_games_from_directory(games_dir: &Path) -> Vec<(PathBuf, GameInfo)>;
+```
+
+### Configuration System (`config.rs`)
+
+```rust
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Config {
+    pub player_name: String,      // Player's display name
+    pub download_path: PathBuf,   // Path where games are stored
+    pub peer_id: Option<String>,  // Persistent peer ID
 }
 ```
 
@@ -198,6 +236,8 @@ pub struct PeerInfo {
 - **Peer ID Generation**: Cryptographically secure ed25519 keys
 - **Network Isolation**: LAN-only by design
 - **No Central Authority**: Fully decentralized
+- **Persistent Peer IDs**: Keypair stored securely in config directory
+- **Creator Attribution**: Game metadata includes creator's peer ID
 
 ### Planned Features
 
@@ -205,6 +245,7 @@ pub struct PeerInfo {
 - **GPG Signatures**: Game metadata verification
 - **Pre-shared Keys**: Optional peer authentication
 - **Chunk Verification**: Hash validation per chunk
+- **Game Signature Verification**: Verify game authenticity before download
 
 ## 🚀 Performance Characteristics
 
@@ -222,22 +263,142 @@ pub struct PeerInfo {
 - **Memory**: Efficient broadcast channels
 - **Concurrency**: Thread-safe operations
 
-## 🔜 Future Enhancements
+## 📦 Game Management Architecture
 
-### Network Improvements
+### Game Configuration Format
+
+Each game is stored in its own directory with a `deckdrop.toml` metadata file:
+
+```toml
+name = "My Game"
+version = "1.0"
+start_file = "game.exe"
+start_args = "--fullscreen"
+description = "A great open-source game"
+creator_peer_id = "12D3KooW..."
+```
+
+### Game Discovery Flow
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    Game Management                          │
+├─────────────────────────────────────────────────────────────┤
+│                                                              │
+│  User Action: "Spiel hinzufügen"                            │
+│        │                                                      │
+│        ▼                                                      │
+│  ┌─────────────────┐                                        │
+│  │ Select Directory│                                        │
+│  └────────┬────────┘                                        │
+│           │                                                  │
+│           ▼                                                  │
+│  ┌──────────────────────┐                                   │
+│  │ Check for            │                                   │
+│  │ deckdrop.toml        │                                   │
+│  └──────┬───────────────┘                                   │
+│         │                                                    │
+│    ┌────┴────┐                                              │
+│    │         │                                              │
+│    ▼         ▼                                              │
+│  Valid    No TOML                                           │
+│  TOML     Found                                             │
+│    │         │                                              │
+│    │         ▼                                              │
+│    │    ┌──────────────┐                                    │
+│    │    │ Show Dialog  │                                    │
+│    │    │ for Game Info│                                    │
+│    │    └──────┬───────┘                                    │
+│    │           │                                            │
+│    │           ▼                                            │
+│    │    ┌──────────────┐                                    │
+│    │    │ Create TOML  │                                    │
+│    │    │ with Peer ID │                                    │
+│    │    └──────┬───────┘                                    │
+│    │           │                                            │
+│    └───────────┼──────────────┐                             │
+│                │              │                             │
+│                ▼              ▼                             │
+│         ┌──────────────┐  ┌──────────────┐                  │
+│         │ Add to List  │  │ Add to List  │                  │
+│         └──────────────┘  └──────────────┘                  │
+│                                                              │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Game Storage Structure
+
+```
+download_path/
+├── game1/
+│   ├── deckdrop.toml
+│   ├── game.exe
+│   └── assets/
+├── game2/
+│   ├── deckdrop.toml
+│   └── ...
+└── ...
+```
+
+## ✅ Implementation Status
+
+### ✅ Completed Features
+
+#### Network Layer (deckdrop-network)
+
+- ✅ **Peer Discovery**: mDNS-based automatic peer discovery
+- ✅ **Peer Identification**: Persistent peer IDs using ed25519 keys
+- ✅ **Peer Metadata**: Player name and game count broadcasting
+- ✅ **Event System**: Real-time peer discovery events (PeerFound, PeerLost)
+- ✅ **Channel Communication**: Broadcast channels for peer updates
+
+#### GUI Layer (deckdrop-gtk)
+
+- ✅ **Main Window**: Multi-tab interface (Meine Spiele, Spiele im Netzwerk, Peers, Einstellungen)
+- ✅ **Peer Discovery UI**: Real-time peer list with metadata display
+- ✅ **Game Management**:
+  - ✅ Game list display
+  - ✅ Add game dialog
+  - ✅ Automatic game detection from existing `deckdrop.toml`
+  - ✅ Game metadata editing (name, version, start file, args, description)
+- ✅ **Configuration Management**:
+  - ✅ Player name configuration
+  - ✅ Download path configuration
+  - ✅ Persistent peer ID storage
+- ✅ **Game Checker**: Validates and loads game configurations
+- ✅ **TOML Serialization**: Game metadata stored as `deckdrop.toml`
+
+#### Game Metadata
+
+- ✅ **GameInfo Structure**: Complete game metadata model
+- ✅ **Creator Tracking**: Peer ID of game creator stored in TOML
+- ✅ **Automatic Detection**: Games with valid TOML are automatically added
+- ✅ **Directory Scanning**: Loads all games from download path
+
+### 🚧 Partially Implemented
+
+- ⚠️ **Network Games Tab**: UI placeholder exists, no backend implementation
+- ⚠️ **Game Sharing**: Discovery works, but game transfer not yet implemented
+
+### 🔜 Future Enhancements
+
+#### Network Improvements
 
 - **DHT Support**: Distributed hash table for larger networks
 - **Bandwidth Optimization**: Dynamic chunk sizing
 - **Connection Pooling**: Efficient resource management
+- **Game Transfer Protocol**: Chunk-based file transfer between peers
 
-### Application Features
+#### Application Features
 
 - **Decky Plugin**: Steam Deck integration
 - **Resume Transfers**: Interrupted download recovery
 - **Priority Queues**: Important file prioritization
 - **Compression**: Bandwidth optimization
+- **Game Launching**: Execute games from the UI
+- **Game Updates**: Version management and update notifications
 
-### Monitoring & Debugging
+#### Monitoring & Debugging
 
 - **Network Metrics**: Real-time performance monitoring
 - **Peer Analytics**: Discovery and connection statistics
