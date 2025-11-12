@@ -5,7 +5,8 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub player_name: String,
-    pub games_path: PathBuf,
+    #[serde(rename = "games_path", alias = "download_path")]
+    pub download_path: PathBuf,
     #[serde(default)]
     pub peer_id: Option<String>,
 }
@@ -14,7 +15,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             player_name: "Player".to_string(),
-            games_path: PathBuf::from("~/Games"),
+            download_path: PathBuf::from("~/Games"),
             peer_id: None,
         }
     }
@@ -33,7 +34,7 @@ impl Config {
                         match serde_json::from_str::<Config>(&content) {
                             Ok(mut config) => {
                                 // Expandiere ~ im Pfad
-                                config.games_path = Self::expand_path(&config.games_path);
+                                config.download_path = Self::expand_path(&config.download_path);
                                 config
                             }
                             Err(e) => {
@@ -220,7 +221,7 @@ impl Config {
         
         // Normalisiere den Pfad für die Speicherung (konvertiere zu ~ wenn im Home-Verzeichnis)
         let mut config_to_save = self.clone();
-        config_to_save.games_path = Self::normalize_path_for_save(&config_to_save.games_path);
+        config_to_save.download_path = Self::normalize_path_for_save(&config_to_save.download_path);
         
         // Speichere die Konfiguration
         let json = serde_json::to_string_pretty(&config_to_save)?;

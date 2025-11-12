@@ -3,12 +3,14 @@ use gtk4::prelude::*;
 use gtk4::{ApplicationWindow, Button, Entry, FileChooserDialog, FileChooserAction, 
            ResponseType, Label, Box as GtkBox, Orientation, Align};
 
+#[allow(dead_code)]
 pub struct SettingsWindow {
     window: ApplicationWindow,
     player_name_entry: Entry,
-    games_path_entry: Entry,
+    download_path_entry: Entry,
 }
 
+#[allow(dead_code)]
 impl SettingsWindow {
     pub fn new(parent: Option<&ApplicationWindow>) -> Self {
         let window = {
@@ -43,17 +45,17 @@ impl SettingsWindow {
         player_name_entry.set_hexpand(true);
         main_box.append(&player_name_entry);
 
-        // Spiele-Pfad
-        let path_label = Label::new(Some("Spiele-Pfad:"));
+        // Download-Pfad
+        let path_label = Label::new(Some("Download-Pfad:"));
         path_label.set_halign(Align::Start);
         main_box.append(&path_label);
 
         let path_box = GtkBox::new(Orientation::Horizontal, 8);
         
-        let games_path_entry = Entry::new();
-        games_path_entry.set_text(&config.games_path.to_string_lossy());
-        games_path_entry.set_hexpand(true);
-        path_box.append(&games_path_entry);
+        let download_path_entry = Entry::new();
+        download_path_entry.set_text(&config.download_path.to_string_lossy());
+        download_path_entry.set_hexpand(true);
+        path_box.append(&download_path_entry);
 
         let browse_button = Button::with_label("Durchsuchen...");
         browse_button.set_halign(Align::End);
@@ -80,7 +82,7 @@ impl SettingsWindow {
         let settings = Self {
             window,
             player_name_entry,
-            games_path_entry,
+            download_path_entry,
         };
 
         // Event-Handler
@@ -105,7 +107,7 @@ impl SettingsWindow {
     fn clone_for_events(&self) -> SettingsWindowClone {
         SettingsWindowClone {
             player_name_entry: self.player_name_entry.clone(),
-            games_path_entry: self.games_path_entry.clone(),
+            download_path_entry: self.download_path_entry.clone(),
             window: self.window.clone(),
         }
     }
@@ -117,21 +119,23 @@ impl SettingsWindow {
 }
 
 // Helper-Struktur für Event-Handler
+#[allow(dead_code)]
 #[derive(Clone)]
 struct SettingsWindowClone {
     player_name_entry: Entry,
-    games_path_entry: Entry,
+    download_path_entry: Entry,
     window: ApplicationWindow,
 }
 
+#[allow(dead_code)]
 impl SettingsWindowClone {
     fn browse_for_path(&self) {
         let dialog = FileChooserDialog::builder()
-            .title("Spiele-Pfad auswählen")
+            .title("Download-Pfad auswählen")
             .action(FileChooserAction::SelectFolder)
             .build();
 
-        let entry_clone = self.games_path_entry.clone();
+        let entry_clone = self.download_path_entry.clone();
         let window_clone = self.window.clone();
 
         dialog.connect_response(move |dialog, response| {
@@ -151,15 +155,15 @@ impl SettingsWindowClone {
 
     fn save_and_close(&self) {
         let player_name = self.player_name_entry.text().to_string();
-        let games_path_str = self.games_path_entry.text().to_string();
-        let games_path = std::path::PathBuf::from(games_path_str);
+        let download_path_str = self.download_path_entry.text().to_string();
+        let download_path = std::path::PathBuf::from(download_path_str);
         
         // Lade aktuelle Config, um peer_id zu behalten
         let current_config = Config::load();
 
         let config = Config {
             player_name,
-            games_path,
+            download_path,
             peer_id: current_config.peer_id,
         };
 
