@@ -362,6 +362,19 @@ pub async fn run_discovery(sender: PeerUpdateSender, our_peer_id: Option<String>
                                 for (peer_id, _addr) in expired {
                                     println!("Peer expired: {}", peer_id);
                                     eprintln!("Peer expired: {}", peer_id);
+                                    
+                                    // Entferne auch aus peer_info_map
+                                    let peer_id_str = peer_id.to_string();
+                                    let was_in_map = {
+                                        let mut map = peer_info_map_clone.lock().await;
+                                        map.remove(&peer_id_str).is_some()
+                                    };
+                                    
+                                    if was_in_map {
+                                        println!("Peer {} aus Map entfernt (mDNS expired)", peer_id_str);
+                                        eprintln!("Peer {} aus Map entfernt (mDNS expired)", peer_id_str);
+                                    }
+                                    
                                     // Send PeerLost event
                                     let _ = event_tx.send(DiscoveryEvent::PeerLost(peer_id.to_string())).await;
                                 }
@@ -390,10 +403,51 @@ pub async fn run_discovery(sender: PeerUpdateSender, our_peer_id: Option<String>
                 println!("Connection closed with: {} (cause: {:?})", peer_id, cause);
                 eprintln!("Connection closed with: {} (cause: {:?})", peer_id, cause);
                 
-                // Wir verlassen uns hauptsächlich auf mDNS Expired Events für Peer-Removal
-                // ConnectionClosed Events können bei Reconnects auftreten, daher
-                // reagieren wir hier nicht sofort, sondern warten auf mDNS Expired
-                // Das verhindert, dass Peers zu früh entfernt werden
+                // Prüfe ob Peer noch in der peer_info_map ist
+                let peer_id_str = peer_id.to_string();
+                let peer_exists = {
+                    let map = peer_info_map_clone.lock().await;
+                    map.contains_key(&peer_id_str)
+                };
+                
+                if peer_exists {
+                    // Prüfe, ob noch andere Verbindungen zu diesem Peer bestehen
+                    // libp2p kann mehrere Verbindungen zu einem Peer haben
+                    let has_connections = swarm.connected_peers().any(|p| p == &peer_id);
+                    
+                    if !has_connections {
+                        // Keine Verbindungen mehr - warte kurz, um Reconnects zu ermöglichen
+                        let event_tx_delayed = event_tx_clone.clone();
+                        let peer_id_delayed = peer_id_str.clone();
+                        let peer_info_map_delayed = peer_info_map_clone.clone();
+                        
+                        tokio::spawn(async move {
+                            // Warte 3 Sekunden, um Reconnects zu ermöglichen
+                            tokio::time::sleep(Duration::from_secs(3)).await;
+                            
+                            // Prüfe nochmal, ob Peer noch in der Map ist
+                            let still_exists = {
+                                let map = peer_info_map_delayed.lock().await;
+                                map.contains_key(&peer_id_delayed)
+                            };
+                            
+                            if still_exists {
+                                // Peer existiert noch, aber keine Verbindung mehr
+                                // Entferne aus Map und sende PeerLost Event
+                                let was_removed = {
+                                    let mut map = peer_info_map_delayed.lock().await;
+                                    map.remove(&peer_id_delayed).is_some()
+                                };
+                                
+                                if was_removed {
+                                    println!("Peer {} entfernt nach ConnectionClosed (keine Verbindung mehr)", peer_id_delayed);
+                                    eprintln!("Peer {} entfernt nach ConnectionClosed (keine Verbindung mehr)", peer_id_delayed);
+                                    let _ = event_tx_delayed.send(DiscoveryEvent::PeerLost(peer_id_delayed)).await;
+                                }
+                            }
+                        });
+                    }
+                }
             }
             SwarmEvent::Dialing { peer_id, .. } => {
                 // Versuche Verbindung aufzubauen
