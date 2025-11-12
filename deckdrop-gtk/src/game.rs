@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 /// Struktur für Spiel-Informationen
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GameInfo {
+    #[serde(default = "generate_game_id")]
+    pub game_id: String,
     pub name: String,
     pub version: String,
     pub start_file: String,
@@ -16,9 +18,31 @@ pub struct GameInfo {
     pub creator_peer_id: Option<String>,
 }
 
+/// Generiert eine eindeutige Spiel-ID
+pub fn generate_game_id() -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    
+    let mut hasher = DefaultHasher::new();
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    
+    // Verwende auch den Speicherort des Hashers als zusätzliche Zufälligkeit
+    let addr = &hasher as *const _ as usize;
+    
+    timestamp.hash(&mut hasher);
+    addr.hash(&mut hasher);
+    
+    format!("{:x}", hasher.finish())
+}
+
 impl Default for GameInfo {
     fn default() -> Self {
         Self {
+            game_id: generate_game_id(),
             name: String::new(),
             version: "1.0".to_string(),
             start_file: String::new(),
@@ -39,7 +63,14 @@ impl GameInfo {
         }
         
         let content = fs::read_to_string(&toml_path)?;
-        let game_info: GameInfo = toml::from_str(&content)?;
+        let mut game_info: GameInfo = toml::from_str(&content)?;
+        
+        // Stelle sicher, dass eine game_id vorhanden ist (für alte Spiele ohne ID)
+        if game_info.game_id.is_empty() {
+            game_info.game_id = generate_game_id();
+            // Speichere die aktualisierte TOML mit der neuen ID
+            let _ = game_info.save_to_path(game_path);
+        }
         
         Ok(game_info)
     }

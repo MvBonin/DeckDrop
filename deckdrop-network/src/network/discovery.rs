@@ -9,14 +9,14 @@ use std::net::IpAddr;
 use std::collections::HashMap;
 use std::time::Duration;
 use std::sync::Arc;
-use tokio::sync::Mutex;
 
-use crate::network::{peer::{PeerInfo, HandshakeMessage}, channel::PeerUpdateSender};
+use crate::network::{peer::PeerInfo, channel::PeerUpdateSender, games::{GamesListBehaviour, GamesListRequest, GamesListResponse, NetworkGameInfo, create_games_list_behaviour}};
 
 #[derive(libp2p::swarm::NetworkBehaviour)]
 pub struct DiscoveryBehaviour {
     pub mdns: Mdns,
     pub identify: Identify,
+    pub games_list: GamesListBehaviour,
 }
 
 // Event type for GTK integration
@@ -24,6 +24,10 @@ pub struct DiscoveryBehaviour {
 pub enum DiscoveryEvent {
     PeerFound(PeerInfo),
     PeerLost(String),
+    GamesListReceived {
+        peer_id: String,
+        games: Vec<NetworkGameInfo>,
+    },
 }
 
 // Wrapper function for GTK integration
@@ -136,7 +140,9 @@ pub async fn run_discovery(sender: PeerUpdateSender, our_peer_id: Option<String>
         .with_agent_version(agent_version);
     let identify = Identify::new(identify_config);
     
-    let behaviour = DiscoveryBehaviour { mdns, identify };
+    let games_list = create_games_list_behaviour();
+    
+    let behaviour = DiscoveryBehaviour { mdns, identify, games_list };
     
     // Use the same identity for the swarm
     let mut swarm = libp2p::SwarmBuilder::with_existing_identity(id_keys)
@@ -305,6 +311,41 @@ pub async fn run_discovery(sender: PeerUpdateSender, our_peer_id: Option<String>
                             _ => {}
                         }
                     }
+                    DiscoveryBehaviourEvent::GamesList(games_event) => {
+                        println!("GamesList Event empfangen: {:?}", games_event);
+                        eprintln!("GamesList Event empfangen: {:?}", games_event);
+                        match games_event {
+                            libp2p::request_response::Event::Message { message, peer, .. } => {
+                                match message {
+                                    libp2p::request_response::Message::Request { request: _, channel, .. } => {
+                                        // Ein Peer fragt nach unserer Spiele-Liste
+                                        // Wir müssen die Spiele laden und zurücksenden
+                                        // Für jetzt senden wir eine leere Liste
+                                        // TODO: Lade tatsächliche Spiele aus dem Download-Pfad
+                                        let response = GamesListResponse { games: Vec::new() };
+                                        let _ = swarm.behaviour_mut().games_list.send_response(channel, response);
+                                    }
+                                    libp2p::request_response::Message::Response { response, .. } => {
+                                        // Wir haben eine Spiele-Liste von einem Peer erhalten
+                                        let peer_id_str = peer.to_string();
+                                        let _ = event_tx_clone.send(DiscoveryEvent::GamesListReceived {
+                                            peer_id: peer_id_str,
+                                            games: response.games,
+                                        }).await;
+                                    }
+                                }
+                            }
+                            libp2p::request_response::Event::OutboundFailure { peer, error, .. } => {
+                                eprintln!("GamesList OutboundFailure für {}: {:?}", peer, error);
+                            }
+                            libp2p::request_response::Event::InboundFailure { peer, error, .. } => {
+                                eprintln!("GamesList InboundFailure für {}: {:?}", peer, error);
+                            }
+                            libp2p::request_response::Event::ResponseSent { .. } => {
+                                // Response wurde gesendet - ignorieren
+                            }
+                        }
+                    }
                     DiscoveryBehaviourEvent::Mdns(mdns_event) => {
                         println!("mDNS Event empfangen: {:?}", mdns_event);
                         eprintln!("mDNS Event empfangen: {:?}", mdns_event);
@@ -398,6 +439,11 @@ pub async fn run_discovery(sender: PeerUpdateSender, our_peer_id: Option<String>
                 // Identify Protokoll wird automatisch die Metadaten senden/empfangen
                 // Kein manueller Handshake mehr nötig
                 // Identify sollte automatisch ausgelöst werden, wenn die Verbindung etabliert ist
+                
+                // Frage automatisch nach der Spiele-Liste des Peers
+                let request = GamesListRequest;
+                let _request_id = swarm.behaviour_mut().games_list.send_request(&peer_id, request);
+                println!("GamesList-Request gesendet an {}", peer_id);
             }
             SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
                 println!("Connection closed with: {} (cause: {:?})", peer_id, cause);
@@ -1076,7 +1122,8 @@ mod tests {
         let id_keys = identity::Keypair::generate_ed25519();
         let identify_config = IdentifyConfig::new("/deckdrop/1.0.0".to_string(), id_keys.public());
         let identify = Identify::new(identify_config);
-        let _behaviour = DiscoveryBehaviour { mdns: mdns.unwrap(), identify };
+        let games_list = create_games_list_behaviour();
+        let _behaviour = DiscoveryBehaviour { mdns: mdns.unwrap(), identify, games_list };
         // Verify behaviour was created
         assert!(true); // If we get here, creation succeeded
     }
@@ -1106,6 +1153,19 @@ mod tests {
         match event {
             DiscoveryEvent::PeerLost(id) => {
                 assert_eq!(id, "test-id");
+            }
+            _ => panic!("Wrong event variant"),
+        }
+        
+        // Test GamesListReceived variant
+        let event = DiscoveryEvent::GamesListReceived {
+            peer_id: "test-peer".to_string(),
+            games: Vec::new(),
+        };
+        match event {
+            DiscoveryEvent::GamesListReceived { peer_id, games } => {
+                assert_eq!(peer_id, "test-peer");
+                assert_eq!(games.len(), 0);
             }
             _ => panic!("Wrong event variant"),
         }
@@ -1283,6 +1343,9 @@ mod tests {
                             println!("Peer 1 still receiving PeerFound for: {} (name: {:?})", 
                                 peer.id, peer.player_name);
                         }
+                        Some(DiscoveryEvent::GamesListReceived { .. }) => {
+                            // Ignoriere GamesListReceived Events in diesem Test
+                        }
                         None => break,
                     }
                 }
@@ -1311,7 +1374,6 @@ mod tests {
     async fn test_peer_lost_on_mdns_expired() {
         // Test: PeerLost Event wird gesendet, wenn mDNS Peer als expired meldet
         use tokio::sync::mpsc;
-        use tokio::time::{sleep, Duration};
         
         // Dieser Test ist schwieriger zu implementieren, da wir mDNS Expired Events
         // nicht direkt auslösen können. Stattdessen testen wir, dass die Event-Struktur

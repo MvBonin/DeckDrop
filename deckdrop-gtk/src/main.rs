@@ -160,7 +160,18 @@ fn build_ui(app: &Application) {
     stack.add_titled(&my_games_box, Some("my-games"), "Meine Spiele");
     
     // Tab 2: Spiele im Netzwerk
-    let network_games_box = create_network_games_tab();
+    let network_games_list = ListBox::new();
+    network_games_list.set_selection_mode(gtk4::SelectionMode::None);
+    let network_games_scrolled = ScrolledWindow::new();
+    network_games_scrolled.set_child(Some(&network_games_list));
+    network_games_scrolled.set_hexpand(true);
+    network_games_scrolled.set_vexpand(true);
+    let network_games_box = GtkBox::new(Orientation::Vertical, 12);
+    network_games_box.set_margin_start(20);
+    network_games_box.set_margin_end(20);
+    network_games_box.set_margin_top(20);
+    network_games_box.set_margin_bottom(20);
+    network_games_box.append(&network_games_scrolled);
     stack.add_titled(&network_games_box, Some("network-games"), "Spiele im Netzwerk");
     
     // Tab 3: Gefundene Peers
@@ -265,6 +276,12 @@ fn build_ui(app: &Application) {
     // Clone weak references for the async closure
     let peers_list_weak = peers_list.downgrade();
     let status_label_weak = status_label.downgrade();
+    let network_games_list_weak = network_games_list.downgrade();
+    
+    // Speichere Netzwerk-Spiele nach game_id gruppiert
+    use deckdrop_network::network::games::NetworkGameInfo;
+    let network_games: Rc<RefCell<HashMap<String, Vec<(String, NetworkGameInfo)>>>> = Rc::new(RefCell::new(HashMap::new()));
+    let network_games_clone = network_games.clone();
     
     main_context.spawn_local_with_priority(glib::Priority::default(), async move {
         println!("GTK Event-Handler gestartet, warte auf Events...");
@@ -319,9 +336,36 @@ fn build_ui(app: &Application) {
                     if was_removed {
                         println!("Peer verloren: {} (Gesamt: {})", peer_id, known_peers_clone.borrow().len());
                         update_peers_list(&peers_list, &known_peers_clone);
+                        
+                        // Entferne auch die Spiele dieses Peers
+                        let mut games = network_games_clone.borrow_mut();
+                        games.retain(|_, peer_games| {
+                            peer_games.retain(|(p_id, _)| p_id != &peer_id);
+                            !peer_games.is_empty()
+                        });
+                        
+                        if let Some(network_games_list) = network_games_list_weak.upgrade() {
+                            update_network_games_list(&network_games_list, &network_games_clone);
+                        }
                     }
                     let peer_count = known_peers_clone.borrow().len();
                     status_label.set_text(&format!("Status: Online • Peers: {}", peer_count));
+                }
+                DiscoveryEvent::GamesListReceived { peer_id, games } => {
+                    println!("Spiele-Liste erhalten von {}: {} Spiele", peer_id, games.len());
+                    
+                    // Aktualisiere die Netzwerk-Spiele-Liste
+                    let mut network_games_map = network_games_clone.borrow_mut();
+                    for game in games {
+                        network_games_map
+                            .entry(game.game_id.clone())
+                            .or_insert_with(Vec::new)
+                            .push((peer_id.clone(), game));
+                    }
+                    
+                    if let Some(network_games_list) = network_games_list_weak.upgrade() {
+                        update_network_games_list(&network_games_list, &network_games_clone);
+                    }
                 }
             }
         }
@@ -561,6 +605,7 @@ fn show_add_game_dialog(parent: &ApplicationWindow, download_path: &std::path::P
         
         // Erstelle GameInfo mit Peer-ID
         let game_info = GameInfo {
+            game_id: crate::game::generate_game_id(), // Generiere neue game_id
             name: name.clone(),
             version: if version.is_empty() { "1.0".to_string() } else { version },
             start_file,
@@ -679,21 +724,79 @@ fn update_games_list(games_list: &ListBox, download_path: &std::path::PathBuf) {
     }
 }
 
-fn create_network_games_tab() -> GtkBox {
-    let box_ = GtkBox::new(Orientation::Vertical, 12);
-    box_.set_margin_start(20);
-    box_.set_margin_end(20);
-    box_.set_margin_top(20);
-    box_.set_margin_bottom(20);
+fn update_network_games_list(games_list: &ListBox, network_games: &Rc<RefCell<HashMap<String, Vec<(String, deckdrop_network::network::games::NetworkGameInfo)>>>>) {
+    // Entferne alle vorhandenen Zeilen
+    while let Some(row) = games_list.row_at_index(0) {
+        games_list.remove(&row);
+    }
     
-    let info_label = Label::new(Some("Hier werden Spiele angezeigt, die im Netzwerk verfügbar sind.\n\nNoch nicht implementiert."));
-    info_label.set_halign(gtk4::Align::Start);
-    info_label.set_valign(gtk4::Align::Start);
-    info_label.set_hexpand(true);
-    info_label.set_vexpand(true);
-    box_.append(&info_label);
+    let games_map = network_games.borrow();
     
-    box_
+    if games_map.is_empty() {
+        let row = ListBoxRow::new();
+        let label = Label::new(Some("Keine Spiele im Netzwerk gefunden. Warte auf Peers..."));
+        label.set_halign(gtk4::Align::Center);
+        label.add_css_class("dim-label");
+        row.set_child(Some(&label));
+        games_list.append(&row);
+        return;
+    }
+    
+    // Zeige alle Spiele, gruppiert nach game_id
+    for (_game_id, peer_games) in games_map.iter() {
+        // Nimm das erste Spiel als Referenz (alle sollten die gleichen Metadaten haben)
+        if let Some((_, game_info)) = peer_games.first() {
+            let row = ListBoxRow::new();
+            let row_box = GtkBox::new(Orientation::Vertical, 6);
+            row_box.set_margin_start(12);
+            row_box.set_margin_end(12);
+            row_box.set_margin_top(12);
+            row_box.set_margin_bottom(12);
+            
+            // Name
+            let name_label = Label::new(Some(&game_info.name));
+            name_label.set_halign(gtk4::Align::Start);
+            name_label.set_xalign(0.0);
+            name_label.add_css_class("title-4");
+            row_box.append(&name_label);
+            
+            // Version
+            let version_label = Label::new(Some(&format!("Version: {}", game_info.version)));
+            version_label.set_halign(gtk4::Align::Start);
+            version_label.set_xalign(0.0);
+            row_box.append(&version_label);
+            
+            // Anzahl Peers, die dieses Spiel haben
+            if peer_games.len() > 1 {
+                let peers_label = Label::new(Some(&format!("Verfügbar bei {} Peers", peer_games.len())));
+                peers_label.set_halign(gtk4::Align::Start);
+                peers_label.set_xalign(0.0);
+                peers_label.add_css_class("dim-label");
+                row_box.append(&peers_label);
+            }
+            
+            // Beschreibung (falls vorhanden)
+            if let Some(ref description) = game_info.description {
+                let description_label = Label::new(Some(description));
+                description_label.set_halign(gtk4::Align::Start);
+                description_label.set_xalign(0.0);
+                description_label.set_wrap(true);
+                description_label.set_max_width_chars(60);
+                description_label.add_css_class("dim-label");
+                row_box.append(&description_label);
+            }
+            
+            // Start-Datei
+            let start_file_label = Label::new(Some(&format!("Start-Datei: {}", game_info.start_file)));
+            start_file_label.set_halign(gtk4::Align::Start);
+            start_file_label.set_xalign(0.0);
+            start_file_label.add_css_class("dim-label");
+            row_box.append(&start_file_label);
+            
+            row.set_child(Some(&row_box));
+            games_list.append(&row);
+        }
+    }
 }
 
 fn create_settings_tab(config: &Config) -> GtkBox {
