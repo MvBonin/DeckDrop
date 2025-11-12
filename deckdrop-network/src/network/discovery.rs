@@ -27,7 +27,7 @@ pub enum DiscoveryEvent {
 }
 
 // Wrapper function for GTK integration
-pub async fn start_discovery(event_tx: tokio::sync::mpsc::Sender<DiscoveryEvent>, player_name: Option<String>, games_count: Option<u32>) -> tokio::task::JoinHandle<()> {
+pub async fn start_discovery(event_tx: tokio::sync::mpsc::Sender<DiscoveryEvent>, player_name: Option<String>, games_count: Option<u32>, keypair: Option<libp2p::identity::Keypair>) -> tokio::task::JoinHandle<()> {
     let (sender, mut receiver) = crate::network::channel::new_peer_channel();
     let event_tx_for_lost = event_tx.clone();
     let player_name_clone = player_name.clone();
@@ -45,11 +45,11 @@ pub async fn start_discovery(event_tx: tokio::sync::mpsc::Sender<DiscoveryEvent>
     
     // Start discovery in background with access to event_tx for PeerLost events
     tokio::spawn(async move {
-        let _ = run_discovery(sender, None, event_tx_for_lost, player_name_clone, games_count_clone).await;
+        let _ = run_discovery(sender, None, event_tx_for_lost, player_name_clone, games_count_clone, keypair).await;
     })
 }
 
-pub async fn run_discovery(sender: PeerUpdateSender, our_peer_id: Option<String>, event_tx: tokio::sync::mpsc::Sender<DiscoveryEvent>, our_player_name: Option<String>, our_games_count: Option<u32>) {
+pub async fn run_discovery(sender: PeerUpdateSender, our_peer_id: Option<String>, event_tx: tokio::sync::mpsc::Sender<DiscoveryEvent>, our_player_name: Option<String>, our_games_count: Option<u32>, keypair: Option<libp2p::identity::Keypair>) {
     // Map to track peer info by peer ID for handshake updates
     let peer_info_map: Arc<tokio::sync::Mutex<HashMap<String, PeerInfo>>> = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     let peer_info_map_clone = peer_info_map.clone();
@@ -60,7 +60,10 @@ pub async fn run_discovery(sender: PeerUpdateSender, our_peer_id: Option<String>
     // Channel nicht mehr benötigt, aber behalten für Kompatibilität
     let (_handshake_tx, mut handshake_rx) = tokio::sync::mpsc::unbounded_channel::<(PeerId, Option<String>, Option<u32>)>();
     // Generate or use provided identity
-    let id_keys = if let Some(peer_id_str) = our_peer_id {
+    let id_keys = if let Some(keys) = keypair {
+        // Verwende bereitgestellte Keypair
+        keys
+    } else if let Some(peer_id_str) = our_peer_id {
         // Try to parse provided peer ID, but we still need keys for the swarm
         let _peer_id = PeerId::from_str(&peer_id_str).unwrap_or_else(|_| {
             let keys = identity::Keypair::generate_ed25519();
@@ -696,8 +699,8 @@ mod tests {
         let games_count2 = Some(10u32);
         
         // Starte beide Discovery-Instanzen
-        let _handle1 = start_discovery(event_tx1, player_name1.clone(), games_count1).await;
-        let _handle2 = start_discovery(event_tx2, player_name2.clone(), games_count2).await;
+        let _handle1 = start_discovery(event_tx1, player_name1.clone(), games_count1, None).await;
+        let _handle2 = start_discovery(event_tx2, player_name2.clone(), games_count2, None).await;
         
         // Warte kurz, damit die Swarms initialisiert werden
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -838,11 +841,11 @@ mod tests {
         
         // Start two discovery instances in separate tasks
         let handle1 = tokio::spawn(async move {
-            run_discovery(sender1, None, event_tx1, None, None).await;
+            run_discovery(sender1, None, event_tx1, None, None, None).await;
         });
         
         let handle2 = tokio::spawn(async move {
-            run_discovery(_sender2, None, event_tx2, None, None).await;
+            run_discovery(_sender2, None, event_tx2, None, None, None).await;
         });
         
         // Wait a bit for discovery to start
@@ -998,7 +1001,7 @@ mod tests {
         let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<DiscoveryEvent>(32);
         
         // Start discovery
-        let handle = start_discovery(event_tx, Some("TestPlayer".to_string()), Some(10)).await;
+        let handle = start_discovery(event_tx, Some("TestPlayer".to_string()), Some(10), None).await;
         
         // Verify handle was returned
         assert!(!handle.is_finished());

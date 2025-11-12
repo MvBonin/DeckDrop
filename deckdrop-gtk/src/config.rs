@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 pub struct Config {
     pub player_name: String,
     pub games_path: PathBuf,
+    #[serde(default)]
+    pub peer_id: Option<String>,
 }
 
 impl Default for Config {
@@ -13,40 +15,189 @@ impl Default for Config {
         Self {
             player_name: "Player".to_string(),
             games_path: PathBuf::from("~/Games"),
+            peer_id: None,
         }
     }
 }
 
 impl Config {
     /// Lädt die Konfiguration aus der Datei oder gibt Standardwerte zurück
+    /// Generiert KEINE Peer-ID automatisch - das muss explizit über generate_and_save_peer_id() gemacht werden
     pub fn load() -> Self {
         let config_path = Self::config_path();
         
-        if let Some(path) = config_path {
+        let mut config = if let Some(path) = config_path {
             if path.exists() {
                 match fs::read_to_string(&path) {
                     Ok(content) => {
                         match serde_json::from_str::<Config>(&content) {
-                            Ok(config) => {
+                            Ok(mut config) => {
                                 // Expandiere ~ im Pfad
-                                let mut config = config;
                                 config.games_path = Self::expand_path(&config.games_path);
-                                return config;
+                                config
                             }
                             Err(e) => {
                                 eprintln!("Fehler beim Parsen der Konfiguration: {}", e);
+                                Self::default()
                             }
                         }
                     }
                     Err(e) => {
                         eprintln!("Fehler beim Lesen der Konfiguration: {}", e);
+                        Self::default()
                     }
+                }
+            } else {
+                Self::default()
+            }
+        } else {
+            Self::default()
+        };
+        
+        // Lade Peer-ID aus Keypair-Datei, falls vorhanden
+        if config.peer_id.is_none() {
+            if let Some(peer_id) = Self::load_peer_id_from_keypair() {
+                config.peer_id = Some(peer_id);
+            }
+        }
+        
+        config
+    }
+    
+    /// Prüft, ob bereits eine Peer-ID existiert (ohne eine zu generieren)
+    pub fn has_peer_id() -> bool {
+        Self::keypair_path()
+            .map(|path| path.exists())
+            .unwrap_or(false)
+    }
+    
+    /// Generiert eine neue Peer-ID und speichert sie
+    pub fn generate_and_save_peer_id(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(peer_id) = Self::load_or_generate_peer_id() {
+            self.peer_id = Some(peer_id.clone());
+            self.save()?;
+            Ok(())
+        } else {
+            Err("Konnte Peer-ID nicht generieren".into())
+        }
+    }
+    
+    /// Lädt die Peer-ID aus der Keypair-Datei (ohne eine neue zu generieren)
+    fn load_peer_id_from_keypair() -> Option<String> {
+        use libp2p::identity;
+        use libp2p::PeerId;
+        
+        let keypair_path = Self::keypair_path()?;
+        
+        if !keypair_path.exists() {
+            return None;
+        }
+        
+        match fs::read(&keypair_path) {
+            Ok(bytes) => {
+                match identity::Keypair::from_protobuf_encoding(&bytes) {
+                    Ok(keypair) => {
+                        let peer_id = PeerId::from(keypair.public());
+                        Some(peer_id.to_string())
+                    }
+                    Err(_) => None,
+                }
+            }
+            Err(_) => None,
+        }
+    }
+    
+    /// Lädt die Keypair aus der Datei oder generiert eine neue
+    /// Gibt die Peer-ID als String zurück
+    fn load_or_generate_peer_id() -> Option<String> {
+        use libp2p::identity;
+        use libp2p::PeerId;
+        
+        let keypair_path = Self::keypair_path()?;
+        
+        // Versuche Keypair zu laden
+        if keypair_path.exists() {
+            match fs::read(&keypair_path) {
+                Ok(bytes) => {
+                    match identity::Keypair::from_protobuf_encoding(&bytes) {
+                        Ok(keypair) => {
+                            let peer_id = PeerId::from(keypair.public());
+                            println!("Geladene Peer-ID: {}", peer_id);
+                            return Some(peer_id.to_string());
+                        }
+                        Err(e) => {
+                            eprintln!("Fehler beim Laden der Keypair: {}", e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Fehler beim Lesen der Keypair-Datei: {}", e);
                 }
             }
         }
         
-        // Fallback zu Standardwerten
-        Self::default()
+        // Generiere neue Keypair
+        let keypair = identity::Keypair::generate_ed25519();
+        let peer_id = PeerId::from(keypair.public());
+        let peer_id_str = peer_id.to_string();
+        
+        // Speichere Keypair
+        match keypair.to_protobuf_encoding() {
+            Ok(bytes) => {
+                if let Some(parent) = keypair_path.parent() {
+                    if let Err(e) = fs::create_dir_all(parent) {
+                        eprintln!("Fehler beim Erstellen des Verzeichnisses: {}", e);
+                        return Some(peer_id_str);
+                    }
+                }
+                if let Err(e) = fs::write(&keypair_path, bytes) {
+                    eprintln!("Fehler beim Speichern der Keypair: {}", e);
+                } else {
+                    println!("Neue Peer-ID generiert und gespeichert: {}", peer_id);
+                }
+            }
+            Err(e) => {
+                eprintln!("Fehler beim Serialisieren der Keypair: {}", e);
+            }
+        }
+        
+        Some(peer_id_str)
+    }
+    
+    /// Lädt die Keypair aus der Datei
+    pub fn load_keypair() -> Option<libp2p::identity::Keypair> {
+        use libp2p::identity;
+        
+        let keypair_path = Self::keypair_path()?;
+        
+        if !keypair_path.exists() {
+            return None;
+        }
+        
+        match fs::read(&keypair_path) {
+            Ok(bytes) => {
+                match identity::Keypair::from_protobuf_encoding(&bytes) {
+                    Ok(keypair) => {
+                        println!("Keypair erfolgreich geladen");
+                        Some(keypair)
+                    }
+                    Err(e) => {
+                        eprintln!("Fehler beim Laden der Keypair: {}", e);
+                        None
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("Fehler beim Lesen der Keypair-Datei: {}", e);
+                None
+            }
+        }
+    }
+    
+    /// Gibt den Pfad zur Keypair-Datei zurück
+    pub fn keypair_path() -> Option<PathBuf> {
+        directories::ProjectDirs::from("com", "deckdrop", "deckdrop")
+            .map(|dirs| dirs.config_dir().join("peer_id.key"))
     }
 
     /// Speichert die Konfiguration in eine Datei

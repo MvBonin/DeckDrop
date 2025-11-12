@@ -153,10 +153,14 @@ impl SettingsWindowClone {
         let player_name = self.player_name_entry.text().to_string();
         let games_path_str = self.games_path_entry.text().to_string();
         let games_path = std::path::PathBuf::from(games_path_str);
+        
+        // Lade aktuelle Config, um peer_id zu behalten
+        let current_config = Config::load();
 
         let config = Config {
             player_name,
             games_path,
+            peer_id: current_config.peer_id,
         };
 
         if let Err(e) = config.save() {

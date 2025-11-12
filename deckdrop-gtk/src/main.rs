@@ -4,26 +4,131 @@ mod settings;
 use deckdrop_network::network::discovery::{start_discovery, DiscoveryEvent};
 use deckdrop_network::network::peer::PeerInfo;
 use gtk4::prelude::*;
-use gtk4::{Application, ApplicationWindow, Label, Button, Box as GtkBox, Orientation, Separator, Stack, StackSwitcher, ScrolledWindow, ListBox, ListBoxRow, Entry as GtkEntry};
+use gtk4::{Application, ApplicationWindow, Label, Button, Box as GtkBox, Orientation, Separator, Stack, StackSwitcher, ScrolledWindow, ListBox, ListBoxRow, Entry as GtkEntry, MessageDialog, MessageType, ButtonsType};
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::cell::RefCell;
 use std::thread;
+use std::env;
 use crate::config::Config;
 
 fn main() {
+    // Prüfe Command-Line-Argumente VOR GTK-Initialisierung
+    let args: Vec<String> = env::args().collect();
+    let random_id = args.iter().any(|arg| arg == "--random-id");
+    
+    // Entferne --random-id aus den Argumenten, damit GTK es nicht als unbekannte Option sieht
+    let gtk_args: Vec<String> = args.into_iter()
+        .filter(|arg| arg != "--random-id")
+        .collect();
+    
     // GTK Anwendung
     let app = Application::builder()
         .application_id("com.deckdrop.gtk")
         .build();
 
-    app.connect_activate(|app| {
-        build_ui(app);
+    app.connect_activate(move |app| {
+        // Wenn --random-id gesetzt ist, generiere eine neue Peer-ID
+        if random_id {
+            println!("--random-id Flag gesetzt: Generiere neue Peer-ID...");
+            let mut config = Config::load();
+            // Lösche alte Keypair-Datei, falls vorhanden
+            if let Some(keypair_path) = Config::keypair_path() {
+                if keypair_path.exists() {
+                    if let Err(e) = std::fs::remove_file(&keypair_path) {
+                        eprintln!("Warnung: Konnte alte Keypair-Datei nicht löschen: {}", e);
+                    } else {
+                        println!("Alte Peer-ID gelöscht");
+                    }
+                }
+            }
+            // Generiere neue Peer-ID
+            if let Err(e) = config.generate_and_save_peer_id() {
+                eprintln!("Fehler beim Generieren der neuen Peer-ID: {}", e);
+                app.quit();
+                return;
+            }
+            println!("Neue Peer-ID generiert: {:?}", config.peer_id);
+            build_ui(app);
+        } else {
+            // Prüfe, ob bereits eine Peer-ID existiert
+            if !Config::has_peer_id() {
+                // Zeige Modal-Dialog für Verantwortungserklärung
+                show_license_dialog(app);
+            } else {
+                build_ui(app);
+            }
+        }
     });
 
-    app.run();
+    // Parse GTK-Argumente manuell, um --random-id zu ignorieren
+    let gtk_args_vec: Vec<&str> = gtk_args.iter().map(|s| s.as_str()).collect();
+    app.run_with_args(&gtk_args_vec);
+}
+
+fn show_license_dialog(app: &Application) {
+    // Klone app für den Closure
+    let app_clone = app.clone();
+    
+    // Erstelle ein temporäres Fenster für den Dialog
+    let temp_window = ApplicationWindow::builder()
+        .application(app)
+        .title("DeckDrop")
+        .default_width(400)
+        .default_height(200)
+        .build();
+    
+    let dialog = MessageDialog::builder()
+        .transient_for(&temp_window)
+        .modal(true)
+        .message_type(MessageType::Warning)
+        .text("Verantwortungserklärung")
+        .secondary_text("Use only for games you are legally allowed to share. Use on your own responsibility.")
+        .buttons(ButtonsType::OkCancel)
+        .build();
+    
+    // Verstecke das temporäre Fenster
+    temp_window.hide();
+    
+    let temp_window_clone = temp_window.clone();
+    let app_clone2 = app_clone.clone();
+    dialog.connect_response(move |dialog, response| {
+        if response == gtk4::ResponseType::Ok {
+            // Benutzer hat akzeptiert - generiere Peer-ID
+            let mut config = Config::load();
+            if let Err(e) = config.generate_and_save_peer_id() {
+                eprintln!("Fehler beim Generieren der Peer-ID: {}", e);
+                // Zeige Fehler-Dialog
+                let error_dialog = MessageDialog::builder()
+                    .transient_for(&temp_window_clone)
+                    .modal(true)
+                    .message_type(MessageType::Error)
+                    .text("Fehler")
+                    .secondary_text(&format!("Konnte Peer-ID nicht generieren: {}", e))
+                    .buttons(ButtonsType::Ok)
+                    .build();
+                error_dialog.connect_response(|dialog, _| {
+                    dialog.close();
+                });
+                error_dialog.show();
+                dialog.close();
+                app_clone2.quit();
+                return;
+            }
+            
+            dialog.close();
+            // Starte die Hauptanwendung
+            build_ui(&app_clone2);
+        } else {
+            // Benutzer hat abgelehnt - schließe Programm
+            dialog.close();
+            app_clone2.quit();
+        }
+    });
+    
+    dialog.show();
 }
 
 fn build_ui(app: &Application) {
@@ -115,12 +220,15 @@ fn build_ui(app: &Application) {
     // TODO: Später die tatsächliche Anzahl der Spiele berechnen
     let games_count = Some(0u32); // Platzhalter für jetzt
     
+    // Lade Keypair für persistente Peer-ID
+    let keypair = crate::config::Config::load_keypair();
+    
     thread::spawn(move || {
         let rt = Runtime::new().expect("Failed to create Tokio runtime");
         
         // Network Discovery Task
         rt.spawn(async move {
-            let _handle = start_discovery(event_tx.clone(), Some(player_name.clone()), games_count).await;
+            let _handle = start_discovery(event_tx.clone(), Some(player_name.clone()), games_count, keypair).await;
 
             while let Some(event) = event_rx.recv().await {
                 // Events in den GTK Thread schicken
@@ -300,9 +408,23 @@ fn create_settings_tab(config: &Config) -> GtkBox {
         dialog.show();
     });
     
+    // Peer-ID anzeigen (nur lesend)
+    let peer_id_label = Label::new(Some("Peer-ID:"));
+    peer_id_label.set_halign(gtk4::Align::Start);
+    box_.append(&peer_id_label);
+    
+    let peer_id_display = Label::new(config.peer_id.as_deref());
+    peer_id_display.set_halign(gtk4::Align::Start);
+    peer_id_display.set_xalign(0.0);
+    peer_id_display.add_css_class("dim-label");
+    peer_id_display.set_wrap(true);
+    peer_id_display.set_selectable(true);
+    box_.append(&peer_id_display);
+    
     // Event-Handler für Speichern-Button
     let player_name_entry_clone = player_name_entry.clone();
     let games_path_entry_clone = games_path_entry.clone();
+    let peer_id_to_save = config.peer_id.clone();
     save_button.connect_clicked(move |_| {
         let player_name = player_name_entry_clone.text().to_string();
         let games_path_str = games_path_entry_clone.text().to_string();
@@ -311,6 +433,7 @@ fn create_settings_tab(config: &Config) -> GtkBox {
         let config = Config {
             player_name,
             games_path,
+            peer_id: peer_id_to_save.clone(),
         };
         
         if let Err(e) = config.save() {

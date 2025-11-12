@@ -494,6 +494,7 @@ dependencies = [
  "directories",
  "glib",
  "gtk4",
+ "libp2p",
  "serde",
  "serde_json",
  "tokio",
