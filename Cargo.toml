@@ -1,0 +1,6 @@
+[workspace]
+members = [
+     "deckdrop-network",
+     "deckdrop-gtk",
+]
+resolver = "2"
