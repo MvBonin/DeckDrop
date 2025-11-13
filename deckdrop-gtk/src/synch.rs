@@ -186,8 +186,26 @@ impl DownloadManifest {
 struct ChunkFileEntry {
     path: String,
     file_hash: String,      // SHA-256 Hash der gesamten Datei
+    #[serde(deserialize_with = "deserialize_i64_to_usize")]
     chunk_count: usize,     // Anzahl der 100MB Chunks
+    #[serde(deserialize_with = "deserialize_i64_to_u64")]
     file_size: u64,         // Dateigröße in Bytes
+}
+
+fn deserialize_i64_to_usize<'de, D>(deserializer: D) -> Result<usize, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = i64::deserialize(deserializer)?;
+    Ok(value as usize)
+}
+
+fn deserialize_i64_to_u64<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = i64::deserialize(deserializer)?;
+    Ok(value as u64)
 }
 
 /// Speichert einen Chunk temporär

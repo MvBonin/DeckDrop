@@ -115,8 +115,42 @@ impl GameInfo {
 struct FileChunkEntry {
     path: String,
     file_hash: String,      // SHA-256 Hash der gesamten Datei
+    #[serde(serialize_with = "serialize_usize_as_i64")]
+    #[serde(deserialize_with = "deserialize_i64_to_usize")]
     chunk_count: usize,     // Anzahl der 100MB Chunks
+    #[serde(serialize_with = "serialize_u64_as_i64")]
+    #[serde(deserialize_with = "deserialize_i64_to_u64")]
     file_size: u64,         // Dateigröße in Bytes
+}
+
+fn serialize_usize_as_i64<S>(value: &usize, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_i64(*value as i64)
+}
+
+fn deserialize_i64_to_usize<'de, D>(deserializer: D) -> Result<usize, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = i64::deserialize(deserializer)?;
+    Ok(value as usize)
+}
+
+fn serialize_u64_as_i64<S>(value: &u64, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_i64(*value as i64)
+}
+
+fn deserialize_i64_to_u64<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = i64::deserialize(deserializer)?;
+    Ok(value as u64)
 }
 
 /// Generiert die deckdrop_chunks.toml Datei für ein Spiel
@@ -208,6 +242,7 @@ where
     file_entries.sort_by(|a, b| a.path.cmp(&b.path));
     
     // Speichere als TOML
+    // Verwende jetzt serde Serialisierung mit den benutzerdefinierten Serializern
     let toml_string = toml::to_string_pretty(&file_entries)?;
     
     // Berechne SHA-256 Hash der generierten Datei (vor dem Schreiben)

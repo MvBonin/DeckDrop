@@ -1151,8 +1151,26 @@ mod tests {
         let games_count2 = Some(10u32);
         
         // Starte beide Discovery-Instanzen
-        let _handle1 = start_discovery(event_tx1, player_name1.clone(), games_count1, None).await;
-        let _handle2 = start_discovery(event_tx2, player_name2.clone(), games_count2, None).await;
+        let _handle1 = start_discovery(
+            event_tx1,
+            player_name1.clone(),
+            games_count1,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ).await;
+        let _handle2 = start_discovery(
+            event_tx2,
+            player_name2.clone(),
+            games_count2,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ).await;
         
         // Warte kurz, damit die Swarms initialisiert werden
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -1171,30 +1189,46 @@ mod tests {
             tokio::select! {
                 // Events von Peer 1 (sollte Bob finden)
                 event = event_rx1.recv() => {
-                    if let Some(DiscoveryEvent::PeerFound(peer)) = event {
-                        println!("Peer 1 (Alice) found peer: {} (name: {:?}, games: {:?})", 
-                            peer.id, peer.player_name, peer.games_count);
-                        
-                        // Prüfe ob es Bob ist (hat Bob's Metadaten)
-                        if peer.player_name == player_name2 && peer.games_count == games_count2 {
-                            peer1_found_bob = true;
-                            bob_metadata_correct = true;
-                            println!("✓ Peer 1 correctly identified Bob with metadata");
+                    match event {
+                        Some(DiscoveryEvent::PeerFound(peer)) => {
+                            println!("Peer 1 (Alice) found peer: {} (name: {:?}, games: {:?})", 
+                                peer.id, peer.player_name, peer.games_count);
+                            
+                            // Prüfe ob es Bob ist (hat Bob's Metadaten)
+                            if peer.player_name == player_name2 && peer.games_count == games_count2 {
+                                peer1_found_bob = true;
+                                bob_metadata_correct = true;
+                                println!("✓ Peer 1 correctly identified Bob with metadata");
+                            }
                         }
+                        Some(DiscoveryEvent::GamesListReceived { .. }) => {}
+                        Some(DiscoveryEvent::GameMetadataReceived { .. }) => {}
+                        Some(DiscoveryEvent::ChunkReceived { .. }) => {}
+                        Some(DiscoveryEvent::ChunkRequestFailed { .. }) => {}
+                        Some(DiscoveryEvent::PeerLost(_)) => {}
+                        None => {}
                     }
                 }
                 // Events von Peer 2 (sollte Alice finden)
                 event = event_rx2.recv() => {
-                    if let Some(DiscoveryEvent::PeerFound(peer)) = event {
-                        println!("Peer 2 (Bob) found peer: {} (name: {:?}, games: {:?})", 
-                            peer.id, peer.player_name, peer.games_count);
-                        
-                        // Prüfe ob es Alice ist (hat Alice's Metadaten)
-                        if peer.player_name == player_name1 && peer.games_count == games_count1 {
-                            peer2_found_alice = true;
-                            alice_metadata_correct = true;
-                            println!("✓ Peer 2 correctly identified Alice with metadata");
+                    match event {
+                        Some(DiscoveryEvent::PeerFound(peer)) => {
+                            println!("Peer 2 (Bob) found peer: {} (name: {:?}, games: {:?})", 
+                                peer.id, peer.player_name, peer.games_count);
+                            
+                            // Prüfe ob es Alice ist (hat Alice's Metadaten)
+                            if peer.player_name == player_name1 && peer.games_count == games_count1 {
+                                peer2_found_alice = true;
+                                alice_metadata_correct = true;
+                                println!("✓ Peer 2 correctly identified Alice with metadata");
+                            }
                         }
+                        Some(DiscoveryEvent::GamesListReceived { .. }) => {}
+                        Some(DiscoveryEvent::GameMetadataReceived { .. }) => {}
+                        Some(DiscoveryEvent::ChunkReceived { .. }) => {}
+                        Some(DiscoveryEvent::ChunkRequestFailed { .. }) => {}
+                        Some(DiscoveryEvent::PeerLost(_)) => {}
+                        None => {}
                     }
                 }
                 _ = tokio::time::sleep(Duration::from_millis(100)) => {
@@ -1293,18 +1327,23 @@ mod tests {
         
         // Start two discovery instances in separate tasks
         let handle1 = tokio::spawn(async move {
-            run_discovery(sender1, None, event_tx1, None, None, None).await;
+            run_discovery(sender1, None, event_tx1, None, None, None, None, None, None, None).await;
         });
         
         let handle2 = tokio::spawn(async move {
-            run_discovery(_sender2, None, event_tx2, None, None, None).await;
+            run_discovery(_sender2, None, event_tx2, None, None, None, None, None, None, None).await;
         });
         
         // Wait a bit for discovery to start
         sleep(Duration::from_millis(1000)).await;
         
         // Check if we received any peers (they should discover each other)
-        let _timeout = tokio::time::timeout(Duration::from_secs(5), receiver1.recv()).await;
+        // Note: We can't easily check events here without proper event handling
+        // This test just verifies that discovery starts without crashing
+        let _timeout = tokio::time::timeout(Duration::from_secs(2), async {
+            // Just wait a bit
+            sleep(Duration::from_millis(100)).await;
+        }).await;
         
         // Clean up
         handle1.abort();
@@ -1414,7 +1453,15 @@ mod tests {
         let identify_config = IdentifyConfig::new("/deckdrop/1.0.0".to_string(), id_keys.public());
         let identify = Identify::new(identify_config);
         let games_list = create_games_list_behaviour();
-        let _behaviour = DiscoveryBehaviour { mdns: mdns.unwrap(), identify, games_list };
+        let game_metadata = create_game_metadata_behaviour();
+        let chunks = create_chunk_behaviour();
+        let _behaviour = DiscoveryBehaviour { 
+            mdns: mdns.unwrap(), 
+            identify, 
+            games_list,
+            game_metadata,
+            chunks,
+        };
         // Verify behaviour was created
         assert!(true); // If we get here, creation succeeded
     }
@@ -1467,7 +1514,16 @@ mod tests {
         let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<DiscoveryEvent>(32);
         
         // Start discovery
-        let handle = start_discovery(event_tx, Some("TestPlayer".to_string()), Some(10), None).await;
+        let handle = start_discovery(
+            event_tx,
+            Some("TestPlayer".to_string()),
+            Some(10),
+            None,
+            None,
+            None,
+            None,
+            None,
+        ).await;
         
         // Verify handle was returned
         assert!(!handle.is_finished());
@@ -1545,8 +1601,26 @@ mod tests {
         let games_count2 = Some(10u32);
         
         // Starte beide Discovery-Instanzen
-        let handle1 = start_discovery(event_tx1, player_name1.clone(), games_count1, None).await;
-        let handle2 = start_discovery(event_tx2, player_name2.clone(), games_count2, None).await;
+        let handle1 = start_discovery(
+            event_tx1,
+            player_name1.clone(),
+            games_count1,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ).await;
+        let handle2 = start_discovery(
+            event_tx2,
+            player_name2.clone(),
+            games_count2,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ).await;
         
         // Warte kurz, damit die Swarms initialisiert werden
         sleep(Duration::from_millis(500)).await;

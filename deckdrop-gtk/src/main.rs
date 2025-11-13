@@ -1043,15 +1043,28 @@ fn show_add_game_dialog(parent: &ApplicationWindow, download_path: &std::path::P
         let game_info_for_thread = game_info.clone();
         
         // Spawn Progress-Update-Handler im GTK Main Context
+        // Wir sind bereits im Main Context, daher können wir Widgets direkt aktualisieren
         let main_context = glib::MainContext::default();
         main_context.spawn_local(async move {
             while let Ok(message) = progress_rx.recv().await {
+                println!("Progress-Message empfangen: {}", message);
+                eprintln!("Progress-Message empfangen: {}", message);
+                
                 if message.starts_with("progress:") {
+                    // Format: "progress:current:total:filename"
                     let parts: Vec<&str> = message.splitn(4, ':').collect();
                     if parts.len() == 4 {
                         if let (Ok(current), Ok(total)) = (parts[1].parse::<usize>(), parts[2].parse::<usize>()) {
-                            let file_name = parts[3];
-                            let percentage = (current as f64 / total as f64) * 100.0;
+                            let file_name = parts[3].to_string();
+                            let percentage = if total > 0 {
+                                (current as f64 / total as f64) * 100.0
+                            } else {
+                                0.0
+                            };
+                            println!("Update Progress: {}/{} = {:.1}%", current, total, percentage);
+                            eprintln!("Update Progress: {}/{} = {:.1}%", current, total, percentage);
+                            
+                            // Wir sind bereits im Main Context - direkte UI-Updates
                             progress_bar_for_thread.set_fraction(percentage / 100.0);
                             progress_bar_for_thread.set_text(Some(&format!("{:.1}%", percentage)));
                             progress_label_for_thread.set_text(&format!("Verarbeite Datei {}/{}: {}", current, total, file_name));
@@ -1059,6 +1072,10 @@ fn show_add_game_dialog(parent: &ApplicationWindow, download_path: &std::path::P
                     }
                 } else if message.starts_with("done:") {
                     let hash = message.strip_prefix("done:").unwrap_or("");
+                    println!("Chunk-Generierung abgeschlossen, Hash: {}", hash);
+                    eprintln!("Chunk-Generierung abgeschlossen, Hash: {}", hash);
+                    
+                    // Wir sind bereits im Main Context - direkte UI-Updates
                     progress_bar_for_thread.set_fraction(1.0);
                     progress_bar_for_thread.set_text(Some("100%"));
                     progress_label_for_thread.set_text("Chunk-Generierung abgeschlossen. Speichere Spiel...");
@@ -1085,6 +1102,10 @@ fn show_add_game_dialog(parent: &ApplicationWindow, download_path: &std::path::P
                     }
                 } else if message.starts_with("error:") {
                     let error_msg = message.strip_prefix("error:").unwrap_or("Unbekannter Fehler");
+                    println!("Fehler: {}", error_msg);
+                    eprintln!("Fehler: {}", error_msg);
+                    
+                    // Wir sind bereits im Main Context - direkte UI-Updates
                     progress_label_for_thread.set_text(&format!("Fehler: {}", error_msg));
                     save_button_for_thread.set_sensitive(true);
                 }
