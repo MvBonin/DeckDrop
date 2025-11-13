@@ -70,11 +70,12 @@ impl DownloadManifest {
         let mut total_chunks = 0;
         
         for entry in chunks_data {
-            total_chunks += entry.chunk_count;
+            let chunk_count = entry.chunk_count as usize;
+            total_chunks += chunk_count;
             
             // Generiere Chunk-Hashes dynamisch basierend auf Position
             // Format: "{file_hash}:{chunk_index}" für eindeutige Identifikation
-            let chunk_hashes: Vec<String> = (0..entry.chunk_count)
+            let chunk_hashes: Vec<String> = (0..chunk_count)
                 .map(|i| format!("{}:{}", entry.file_hash, i))
                 .collect();
             
@@ -84,7 +85,7 @@ impl DownloadManifest {
                     chunk_hashes,
                     status: DownloadStatus::Pending,
                     downloaded_chunks: Vec::new(),
-                    file_size: Some(entry.file_size),
+                    file_size: Some(entry.file_size as u64),
                 },
             );
         }
@@ -182,30 +183,13 @@ impl DownloadManifest {
 }
 
 /// Struktur für einen Eintrag in deckdrop_chunks.toml
+/// Verwendet i64 statt usize/u64 für TOML-Kompatibilität
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ChunkFileEntry {
     path: String,
     file_hash: String,      // SHA-256 Hash der gesamten Datei
-    #[serde(deserialize_with = "deserialize_i64_to_usize")]
-    chunk_count: usize,     // Anzahl der 100MB Chunks
-    #[serde(deserialize_with = "deserialize_i64_to_u64")]
-    file_size: u64,         // Dateigröße in Bytes
-}
-
-fn deserialize_i64_to_usize<'de, D>(deserializer: D) -> Result<usize, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let value = i64::deserialize(deserializer)?;
-    Ok(value as usize)
-}
-
-fn deserialize_i64_to_u64<'de, D>(deserializer: D) -> Result<u64, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let value = i64::deserialize(deserializer)?;
-    Ok(value as u64)
+    chunk_count: i64,       // Anzahl der 100MB Chunks (i64 für TOML)
+    file_size: i64,         // Dateigröße in Bytes (i64 für TOML)
 }
 
 /// Speichert einen Chunk temporär
@@ -436,7 +420,7 @@ pub fn check_and_reconstruct_files(
     // Erstelle HashMap für schnellen Zugriff auf file_hash
     let file_hashes: HashMap<String, (String, u64)> = chunks_data
         .into_iter()
-        .map(|e| (e.path.clone(), (e.file_hash, e.file_size)))
+        .map(|e| (e.path.clone(), (e.file_hash, e.file_size as u64)))
         .collect();
     
     for (file_path, file_info) in &manifest.chunks {

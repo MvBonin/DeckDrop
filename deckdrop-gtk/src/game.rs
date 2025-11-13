@@ -111,47 +111,15 @@ impl GameInfo {
 }
 
 /// Struktur für einen Datei-Eintrag in deckdrop_chunks.toml
+/// Verwendet i64 statt usize/u64 für TOML-Kompatibilität
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct FileChunkEntry {
     path: String,
     file_hash: String,      // SHA-256 Hash der gesamten Datei
-    #[serde(serialize_with = "serialize_usize_as_i64")]
-    #[serde(deserialize_with = "deserialize_i64_to_usize")]
-    chunk_count: usize,     // Anzahl der 100MB Chunks
-    #[serde(serialize_with = "serialize_u64_as_i64")]
-    #[serde(deserialize_with = "deserialize_i64_to_u64")]
-    file_size: u64,         // Dateigröße in Bytes
+    chunk_count: i64,       // Anzahl der 100MB Chunks (i64 für TOML)
+    file_size: i64,         // Dateigröße in Bytes (i64 für TOML)
 }
 
-fn serialize_usize_as_i64<S>(value: &usize, serializer: S) -> Result<S::Ok, S::Error>
-where
-    S: serde::Serializer,
-{
-    serializer.serialize_i64(*value as i64)
-}
-
-fn deserialize_i64_to_usize<'de, D>(deserializer: D) -> Result<usize, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let value = i64::deserialize(deserializer)?;
-    Ok(value as usize)
-}
-
-fn serialize_u64_as_i64<S>(value: &u64, serializer: S) -> Result<S::Ok, S::Error>
-where
-    S: serde::Serializer,
-{
-    serializer.serialize_i64(*value as i64)
-}
-
-fn deserialize_i64_to_u64<'de, D>(deserializer: D) -> Result<u64, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let value = i64::deserialize(deserializer)?;
-    Ok(value as u64)
-}
 
 /// Generiert die deckdrop_chunks.toml Datei für ein Spiel
 /// 
@@ -233,8 +201,8 @@ where
         file_entries.push(FileChunkEntry {
             path: path_str,
             file_hash: hash_hex,
-            chunk_count,
-            file_size,
+            chunk_count: chunk_count as i64,
+            file_size: file_size as i64,
         });
     }
     
