@@ -30,8 +30,11 @@ pub enum DiscoveryEvent {
     },
 }
 
+/// Callback-Typ zum Laden von Spielen
+pub type GamesLoader = Arc<dyn Fn() -> Vec<NetworkGameInfo> + Send + Sync>;
+
 // Wrapper function for GTK integration
-pub async fn start_discovery(event_tx: tokio::sync::mpsc::Sender<DiscoveryEvent>, player_name: Option<String>, games_count: Option<u32>, keypair: Option<libp2p::identity::Keypair>) -> tokio::task::JoinHandle<()> {
+pub async fn start_discovery(event_tx: tokio::sync::mpsc::Sender<DiscoveryEvent>, player_name: Option<String>, games_count: Option<u32>, keypair: Option<libp2p::identity::Keypair>, games_loader: Option<GamesLoader>) -> tokio::task::JoinHandle<()> {
     let (sender, mut receiver) = crate::network::channel::new_peer_channel();
     let event_tx_for_lost = event_tx.clone();
     let player_name_clone = player_name.clone();
@@ -61,18 +64,19 @@ pub async fn start_discovery(event_tx: tokio::sync::mpsc::Sender<DiscoveryEvent>
     tokio::spawn(async move {
         println!("run_discovery Task gestartet");
         eprintln!("run_discovery Task gestartet");
-        let result = run_discovery(sender, None, event_tx_for_lost, player_name_clone, games_count_clone, keypair).await;
+        let result = run_discovery(sender, None, event_tx_for_lost, player_name_clone, games_count_clone, keypair, games_loader).await;
         println!("run_discovery beendet: {:?}", result);
         eprintln!("run_discovery beendet: {:?}", result);
     })
 }
 
-pub async fn run_discovery(sender: PeerUpdateSender, our_peer_id: Option<String>, event_tx: tokio::sync::mpsc::Sender<DiscoveryEvent>, our_player_name: Option<String>, our_games_count: Option<u32>, keypair: Option<libp2p::identity::Keypair>) {
+pub async fn run_discovery(sender: PeerUpdateSender, our_peer_id: Option<String>, event_tx: tokio::sync::mpsc::Sender<DiscoveryEvent>, our_player_name: Option<String>, our_games_count: Option<u32>, keypair: Option<libp2p::identity::Keypair>, games_loader: Option<GamesLoader>) {
     // Map to track peer info by peer ID for handshake updates
     let peer_info_map: Arc<tokio::sync::Mutex<HashMap<String, PeerInfo>>> = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     let peer_info_map_clone = peer_info_map.clone();
     let sender_clone = sender.clone();
     let event_tx_clone = event_tx.clone();
+    let games_loader_clone = games_loader.clone();
     
     // Handshake wird jetzt über identify Protokoll gehandhabt
     // Channel nicht mehr benötigt, aber behalten für Kompatibilität
@@ -319,19 +323,39 @@ pub async fn run_discovery(sender: PeerUpdateSender, our_peer_id: Option<String>
                                 match message {
                                     libp2p::request_response::Message::Request { request: _, channel, .. } => {
                                         // Ein Peer fragt nach unserer Spiele-Liste
-                                        // Wir müssen die Spiele laden und zurücksenden
-                                        // Für jetzt senden wir eine leere Liste
-                                        // TODO: Lade tatsächliche Spiele aus dem Download-Pfad
-                                        let response = GamesListResponse { games: Vec::new() };
+                                        // Lade Spiele über den Callback, falls vorhanden
+                                        let games = if let Some(ref loader) = games_loader_clone {
+                                            loader()
+                                        } else {
+                                            Vec::new()
+                                        };
+                                        println!("Sende {} Spiele an Peer {}", games.len(), peer);
+                                        eprintln!("Sende {} Spiele an Peer {}", games.len(), peer);
+                                        let response = GamesListResponse { games };
                                         let _ = swarm.behaviour_mut().games_list.send_response(channel, response);
                                     }
                                     libp2p::request_response::Message::Response { response, .. } => {
                                         // Wir haben eine Spiele-Liste von einem Peer erhalten
                                         let peer_id_str = peer.to_string();
-                                        let _ = event_tx_clone.send(DiscoveryEvent::GamesListReceived {
+                                        println!("GamesList Response erhalten von {}: {} Spiele", peer_id_str, response.games.len());
+                                        eprintln!("GamesList Response erhalten von {}: {} Spiele", peer_id_str, response.games.len());
+                                        for game in &response.games {
+                                            println!("  - {} (v{}) [key: {}]", game.name, game.version, game.unique_key());
+                                            eprintln!("  - {} (v{}) [key: {}]", game.name, game.version, game.unique_key());
+                                        }
+                                        match event_tx_clone.send(DiscoveryEvent::GamesListReceived {
                                             peer_id: peer_id_str,
                                             games: response.games,
-                                        }).await;
+                                        }).await {
+                                            Ok(()) => {
+                                                println!("GamesListReceived Event erfolgreich an GTK Thread gesendet");
+                                                eprintln!("GamesListReceived Event erfolgreich an GTK Thread gesendet");
+                                            }
+                                            Err(e) => {
+                                                eprintln!("FEHLER beim Senden von GamesListReceived Event: {}", e);
+                                                println!("FEHLER beim Senden von GamesListReceived Event: {}", e);
+                                            }
+                                        }
                                     }
                                 }
                             }

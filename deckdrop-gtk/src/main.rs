@@ -35,24 +35,53 @@ fn main() {
         // Wenn --random-id gesetzt ist, generiere eine neue Peer-ID
         if random_id {
             println!("--random-id Flag gesetzt: Generiere neue Peer-ID...");
-            let mut config = Config::load();
-            // Lösche alte Keypair-Datei, falls vorhanden
+            
+            // Generiere zuerst eine neue Peer-ID (ohne sie zu speichern)
+            use libp2p::identity;
+            use libp2p::PeerId;
+            let keypair = identity::Keypair::generate_ed25519();
+            let peer_id = PeerId::from(keypair.public());
+            let peer_id_str = peer_id.to_string();
+            
+            // Setze den Peer-ID-Unterordner BEVOR wir die Konfiguration laden
+            Config::set_peer_id_subdir(&peer_id_str);
+            
+            // Erstelle eine neue Konfiguration mit Standardwerten
+            let mut config = Config::default();
+            config.peer_id = Some(peer_id_str.clone());
+            
+            // Speichere die Keypair-Datei im neuen Unterordner
             if let Some(keypair_path) = Config::keypair_path() {
-                if keypair_path.exists() {
-                    if let Err(e) = std::fs::remove_file(&keypair_path) {
-                        eprintln!("Warnung: Konnte alte Keypair-Datei nicht löschen: {}", e);
-                    } else {
-                        println!("Alte Peer-ID gelöscht");
+                if let Some(parent) = keypair_path.parent() {
+                    if let Err(e) = std::fs::create_dir_all(parent) {
+                        eprintln!("Fehler beim Erstellen des Verzeichnisses: {}", e);
+                    }
+                }
+                match keypair.to_protobuf_encoding() {
+                    Ok(bytes) => {
+                        if let Err(e) = std::fs::write(&keypair_path, bytes) {
+                            eprintln!("Fehler beim Speichern der Keypair: {}", e);
+                            app.quit();
+                            return;
+                        }
+                        println!("Neue Peer-ID generiert und gespeichert: {}", peer_id);
+                    }
+                    Err(e) => {
+                        eprintln!("Fehler beim Serialisieren der Keypair: {}", e);
+                        app.quit();
+                        return;
                     }
                 }
             }
-            // Generiere neue Peer-ID
-            if let Err(e) = config.generate_and_save_peer_id() {
-                eprintln!("Fehler beim Generieren der neuen Peer-ID: {}", e);
+            
+            // Speichere die neue Konfiguration (mit Standardwerten, leere Spieleliste)
+            if let Err(e) = config.save() {
+                eprintln!("Fehler beim Speichern der Konfiguration: {}", e);
                 app.quit();
                 return;
             }
-            println!("Neue Peer-ID generiert: {:?}", config.peer_id);
+            
+            println!("Neue Konfiguration mit Peer-ID {} erstellt", peer_id);
             build_ui(app);
         } else {
             // Prüfe, ob bereits eine Peer-ID existiert
@@ -231,30 +260,99 @@ fn build_ui(app: &Application) {
     // Tokio Runtime in einem separaten Thread starten, damit sie am Leben bleibt
     let glib_tx_clone = glib_tx.clone();
     let player_name = config.player_name.clone();
-    // TODO: Später die tatsächliche Anzahl der Spiele berechnen
-    let games_count = Some(0u32); // Platzhalter für jetzt
+    // Berechne die tatsächliche Anzahl der Spiele
+    let games_count = {
+        let mut count = 0u32;
+        for game_path in &config.game_paths {
+            if check_game_config_exists(game_path) {
+                count += 1;
+            }
+            if game_path.is_dir() {
+                let additional_games = load_games_from_directory(game_path);
+                count += additional_games.len() as u32;
+            }
+        }
+        Some(count)
+    };
     
     // Lade Keypair für persistente Peer-ID
     let keypair = crate::config::Config::load_keypair();
+    
+    // Erstelle Callback zum Laden von Spielen
+    let games_loader: Option<deckdrop_network::network::discovery::GamesLoader> = {
+        use deckdrop_network::network::games::NetworkGameInfo;
+        use std::sync::Arc;
+        Some(Arc::new(move || {
+            let config = Config::load();
+            let mut network_games = Vec::new();
+            
+            // Lade Spiele aus allen in der Config gespeicherten Pfaden
+            for game_path in &config.game_paths {
+                // Prüfe, ob das Verzeichnis selbst ein Spiel enthält
+                if check_game_config_exists(game_path) {
+                    if let Ok(game_info) = GameInfo::load_from_path(game_path) {
+                        // Konvertiere GameInfo zu NetworkGameInfo
+                        network_games.push(NetworkGameInfo {
+                            game_id: game_info.game_id,
+                            name: game_info.name,
+                            version: game_info.version,
+                            start_file: game_info.start_file,
+                            start_args: game_info.start_args,
+                            description: game_info.description,
+                            creator_peer_id: game_info.creator_peer_id,
+                        });
+                    }
+                }
+                // Lade auch Spiele aus Unterverzeichnissen (falls es ein Verzeichnis ist)
+                if game_path.is_dir() {
+                    let additional_games = load_games_from_directory(game_path);
+                    for (_path, game_info) in additional_games {
+                        network_games.push(NetworkGameInfo {
+                            game_id: game_info.game_id,
+                            name: game_info.name,
+                            version: game_info.version,
+                            start_file: game_info.start_file,
+                            start_args: game_info.start_args,
+                            description: game_info.description,
+                            creator_peer_id: game_info.creator_peer_id,
+                        });
+                    }
+                }
+            }
+            
+            network_games
+        }))
+    };
     
     thread::spawn(move || {
         let rt = Runtime::new().expect("Failed to create Tokio runtime");
         
         // Network Discovery Task
         rt.spawn(async move {
-            let _handle = start_discovery(event_tx.clone(), Some(player_name.clone()), games_count, keypair).await;
+            let _handle = start_discovery(event_tx.clone(), Some(player_name.clone()), games_count, keypair, games_loader).await;
             println!("Discovery gestartet, warte auf Events...");
             eprintln!("Discovery gestartet, warte auf Events...");
 
             while let Some(event) = event_rx.recv().await {
                 println!("Event empfangen im Tokio Thread: {:?}", event);
                 eprintln!("Event empfangen im Tokio Thread: {:?}", event);
+                
+                // Prüfe, ob es ein GamesListReceived Event ist
+                if let DiscoveryEvent::GamesListReceived { peer_id, games } = &event {
+                    println!("*** GamesListReceived Event im Tokio Thread: {} Spiele von {} ***", games.len(), peer_id);
+                    eprintln!("*** GamesListReceived Event im Tokio Thread: {} Spiele von {} ***", games.len(), peer_id);
+                }
+                
                 // Events in den GTK Thread schicken
-                if let Err(e) = glib_tx_clone.send(event).await {
-                    eprintln!("Fehler beim Senden des Events an GTK Thread: {}", e);
-                } else {
-                    println!("Event erfolgreich an GTK Thread gesendet");
-                    eprintln!("Event erfolgreich an GTK Thread gesendet");
+                match glib_tx_clone.send(event).await {
+                    Ok(()) => {
+                        println!("Event erfolgreich an GTK Thread gesendet");
+                        eprintln!("Event erfolgreich an GTK Thread gesendet");
+                    }
+                    Err(e) => {
+                        eprintln!("FEHLER beim Senden des Events an GTK Thread: {}", e);
+                        println!("FEHLER beim Senden des Events an GTK Thread: {}", e);
+                    }
                 }
             }
         });
@@ -301,6 +399,12 @@ fn build_ui(app: &Application) {
                 break;
             };
             
+            // Prüfe, ob network_games_list verfügbar ist, bevor wir Events verarbeiten
+            let network_games_list_available = network_games_list_weak.upgrade().is_some();
+            if !network_games_list_available {
+                eprintln!("WARNUNG: network_games_list nicht verfügbar beim Event-Handling!");
+            }
+            
             match event {
                 DiscoveryEvent::PeerFound(peer) => {
                     // Prüfe ob Peer bereits existiert und ob sich die Metadaten geändert haben
@@ -338,11 +442,13 @@ fn build_ui(app: &Application) {
                         update_peers_list(&peers_list, &known_peers_clone);
                         
                         // Entferne auch die Spiele dieses Peers
-                        let mut games = network_games_clone.borrow_mut();
-                        games.retain(|_, peer_games| {
-                            peer_games.retain(|(p_id, _)| p_id != &peer_id);
-                            !peer_games.is_empty()
-                        });
+                        {
+                            let mut games = network_games_clone.borrow_mut();
+                            games.retain(|_, peer_games| {
+                                peer_games.retain(|(p_id, _)| p_id != &peer_id);
+                                !peer_games.is_empty()
+                            });
+                        } // mutable borrow endet hier
                         
                         if let Some(network_games_list) = network_games_list_weak.upgrade() {
                             update_network_games_list(&network_games_list, &network_games_clone);
@@ -352,19 +458,44 @@ fn build_ui(app: &Application) {
                     status_label.set_text(&format!("Status: Online • Peers: {}", peer_count));
                 }
                 DiscoveryEvent::GamesListReceived { peer_id, games } => {
+                    println!("=== GamesListReceived Event im GTK Thread ===");
+                    eprintln!("=== GamesListReceived Event im GTK Thread ===");
                     println!("Spiele-Liste erhalten von {}: {} Spiele", peer_id, games.len());
+                    eprintln!("Spiele-Liste erhalten von {}: {} Spiele", peer_id, games.len());
                     
                     // Aktualisiere die Netzwerk-Spiele-Liste
-                    let mut network_games_map = network_games_clone.borrow_mut();
-                    for game in games {
-                        network_games_map
-                            .entry(game.game_id.clone())
-                            .or_insert_with(Vec::new)
-                            .push((peer_id.clone(), game));
-                    }
+                    // Gruppiere nach game_id + version (unique_key)
+                    let games_count = {
+                        let mut network_games_map = network_games_clone.borrow_mut();
+                        for game in games {
+                            let key = game.unique_key();
+                            println!("Füge Spiel hinzu: {} (key: {})", game.name, key);
+                            eprintln!("Füge Spiel hinzu: {} (key: {})", game.name, key);
+                            network_games_map
+                                .entry(key)
+                                .or_insert_with(Vec::new)
+                                .push((peer_id.clone(), game));
+                        }
+                        
+                        let count = network_games_map.len();
+                        println!("Aktuelle Anzahl Spiele in network_games_map: {}", count);
+                        eprintln!("Aktuelle Anzahl Spiele in network_games_map: {}", count);
+                        count
+                    }; // mutable borrow endet hier
                     
-                    if let Some(network_games_list) = network_games_list_weak.upgrade() {
-                        update_network_games_list(&network_games_list, &network_games_clone);
+                    // Versuche die Liste zu aktualisieren
+                    match network_games_list_weak.upgrade() {
+                        Some(network_games_list) => {
+                            println!("Aktualisiere Netzwerk-Spiele-Liste...");
+                            eprintln!("Aktualisiere Netzwerk-Spiele-Liste...");
+                            update_network_games_list(&network_games_list, &network_games_clone);
+                            println!("Netzwerk-Spiele-Liste aktualisiert!");
+                            eprintln!("Netzwerk-Spiele-Liste aktualisiert!");
+                        }
+                        None => {
+                            eprintln!("FEHLER: network_games_list weak reference ist nicht mehr verfügbar!");
+                            println!("FEHLER: network_games_list weak reference ist nicht mehr verfügbar!");
+                        }
                     }
                 }
             }
@@ -542,6 +673,11 @@ fn show_add_game_dialog(parent: &ApplicationWindow, download_path: &std::path::P
                             if GameInfo::load_from_path(&path).is_ok() {
                                 // Valide TOML gefunden - Spiel direkt hinzufügen ohne Dialog
                                 // Die Peer-ID bleibt die vom Ersteller (bereits in der TOML)
+                                // Füge den Pfad zur Config hinzu
+                                let mut config = Config::load();
+                                if let Err(e) = config.add_game_path(&path) {
+                                    eprintln!("Fehler beim Hinzufügen des Spiel-Pfads zur Config: {}", e);
+                                }
                                 // Das Spiel wird automatisch zur Liste hinzugefügt
                                 dialog_clone2.close();
                                 update_games_list(&games_list_clone2, &download_path_clone2);
@@ -617,7 +753,14 @@ fn show_add_game_dialog(parent: &ApplicationWindow, download_path: &std::path::P
         // Speichere TOML (überschreibt vorhandene)
         match game_info.save_to_path(&game_path) {
             Ok(_) => {
+                // Füge den Spiel-Pfad zur Config hinzu
+                let mut config = Config::load();
+                if let Err(e) = config.add_game_path(&game_path) {
+                    eprintln!("Fehler beim Hinzufügen des Spiel-Pfads zur Config: {}", e);
+                }
+                
                 dialog_clone.close();
+                // Aktualisiere die Liste mit den Pfaden aus der Config
                 update_games_list(&games_list_clone, &download_path_clone);
             }
             Err(e) => {
@@ -646,14 +789,34 @@ fn show_error_dialog(parent: &Window, message: &str) {
     error_dialog.show();
 }
 
-fn update_games_list(games_list: &ListBox, download_path: &std::path::PathBuf) {
+fn update_games_list(games_list: &ListBox, _download_path: &std::path::PathBuf) {
     // Entferne alle vorhandenen Zeilen
     while let Some(row) = games_list.row_at_index(0) {
         games_list.remove(&row);
     }
     
-    // Lade Spiele aus dem Verzeichnis
-    let games = load_games_from_directory(download_path);
+    // Lade Config mit Spiel-Pfaden
+    let config = Config::load();
+    let mut games = Vec::new();
+    
+    // Lade Spiele aus allen in der Config gespeicherten Pfaden
+    for game_path in &config.game_paths {
+        // Prüfe, ob das Verzeichnis selbst ein Spiel enthält
+        if check_game_config_exists(game_path) {
+            if let Ok(game_info) = GameInfo::load_from_path(game_path) {
+                games.push((game_path.clone(), game_info));
+            }
+        }
+        // Lade auch Spiele aus Unterverzeichnissen (falls es ein Verzeichnis ist)
+        if game_path.is_dir() {
+            let additional_games = load_games_from_directory(game_path);
+            games.extend(additional_games);
+        }
+    }
+    
+    // Entferne Duplikate (basierend auf Pfad)
+    games.sort_by(|a, b| a.0.cmp(&b.0));
+    games.dedup_by(|a, b| a.0 == b.0);
     
     if games.is_empty() {
         let row = ListBoxRow::new();
@@ -732,6 +895,9 @@ fn update_network_games_list(games_list: &ListBox, network_games: &Rc<RefCell<Ha
     
     let games_map = network_games.borrow();
     
+    println!("update_network_games_list: {} Spiele in der Map", games_map.len());
+    eprintln!("update_network_games_list: {} Spiele in der Map", games_map.len());
+    
     if games_map.is_empty() {
         let row = ListBoxRow::new();
         let label = Label::new(Some("Keine Spiele im Netzwerk gefunden. Warte auf Peers..."));
@@ -742,8 +908,10 @@ fn update_network_games_list(games_list: &ListBox, network_games: &Rc<RefCell<Ha
         return;
     }
     
-    // Zeige alle Spiele, gruppiert nach game_id
-    for (_game_id, peer_games) in games_map.iter() {
+    // Zeige alle Spiele, gruppiert nach game_id + version (unique_key)
+    for (_unique_key, peer_games) in games_map.iter() {
+        println!("Zeige Spiel: {} ({} Peers)", peer_games.first().map(|(_, g)| &g.name).unwrap_or(&"Unknown".to_string()), peer_games.len());
+        eprintln!("Zeige Spiel: {} ({} Peers)", peer_games.first().map(|(_, g)| &g.name).unwrap_or(&"Unknown".to_string()), peer_games.len());
         // Nimm das erste Spiel als Referenz (alle sollten die gleichen Metadaten haben)
         if let Some((_, game_info)) = peer_games.first() {
             let row = ListBoxRow::new();
@@ -766,14 +934,15 @@ fn update_network_games_list(games_list: &ListBox, network_games: &Rc<RefCell<Ha
             version_label.set_xalign(0.0);
             row_box.append(&version_label);
             
-            // Anzahl Peers, die dieses Spiel haben
-            if peer_games.len() > 1 {
-                let peers_label = Label::new(Some(&format!("Verfügbar bei {} Peers", peer_games.len())));
-                peers_label.set_halign(gtk4::Align::Start);
-                peers_label.set_xalign(0.0);
-                peers_label.add_css_class("dim-label");
-                row_box.append(&peers_label);
-            }
+            // Anzahl Peers, die dieses Spiel haben (immer anzeigen)
+            let peers_count = peer_games.len();
+            let peers_label = Label::new(Some(&format!("Verfügbar bei {} Peer{}", 
+                peers_count, 
+                if peers_count == 1 { "" } else { "s" })));
+            peers_label.set_halign(gtk4::Align::Start);
+            peers_label.set_xalign(0.0);
+            peers_label.add_css_class("dim-label");
+            row_box.append(&peers_label);
             
             // Beschreibung (falls vorhanden)
             if let Some(ref description) = game_info.description {
@@ -891,6 +1060,7 @@ fn create_settings_tab(config: &Config) -> GtkBox {
             player_name,
             download_path,
             peer_id: peer_id_to_save.clone(),
+            game_paths: Vec::new(), // Wird aus der gespeicherten Config geladen
         };
         
         if let Err(e) = config.save() {

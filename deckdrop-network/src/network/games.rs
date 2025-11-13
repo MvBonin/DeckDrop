@@ -16,7 +16,7 @@ pub struct GamesListResponse {
 }
 
 /// Spiel-Informationen für das Netzwerk (ohne lokale Pfade)
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct NetworkGameInfo {
     pub game_id: String,  // Eindeutige Spiel-ID zum Vergleich
     pub name: String,
@@ -27,6 +27,13 @@ pub struct NetworkGameInfo {
     #[serde(default)]
     pub description: Option<String>,
     pub creator_peer_id: Option<String>,
+}
+
+impl NetworkGameInfo {
+    /// Erstellt einen eindeutigen Schlüssel für dieses Spiel (game_id + version)
+    pub fn unique_key(&self) -> String {
+        format!("{}:{}", self.game_id, self.version)
+    }
 }
 
 /// Codec für Game-Listen-Requests/Responses
@@ -513,6 +520,123 @@ mod tests {
         assert!(json.contains("--windowed --debug"));
         assert!(json.contains("Ein vollständiges Spiel"));
         assert!(json.contains("creator-456"));
+    }
+
+    #[test]
+    fn test_network_game_info_unique_key() {
+        // Test: unique_key sollte game_id + version kombinieren
+        let game1 = NetworkGameInfo {
+            game_id: "game-123".to_string(),
+            name: "Test Game".to_string(),
+            version: "1.0".to_string(),
+            start_file: "game.exe".to_string(),
+            start_args: None,
+            description: None,
+            creator_peer_id: None,
+        };
+        
+        let game2 = NetworkGameInfo {
+            game_id: "game-123".to_string(),
+            name: "Test Game".to_string(),
+            version: "2.0".to_string(), // Andere Version
+            start_file: "game.exe".to_string(),
+            start_args: None,
+            description: None,
+            creator_peer_id: None,
+        };
+        
+        let game3 = NetworkGameInfo {
+            game_id: "game-123".to_string(),
+            name: "Test Game".to_string(),
+            version: "1.0".to_string(), // Gleiche Version wie game1
+            start_file: "game.exe".to_string(),
+            start_args: None,
+            description: None,
+            creator_peer_id: None,
+        };
+        
+        assert_eq!(game1.unique_key(), "game-123:1.0");
+        assert_eq!(game2.unique_key(), "game-123:2.0");
+        assert_eq!(game3.unique_key(), "game-123:1.0");
+        assert_eq!(game1.unique_key(), game3.unique_key()); // Gleiche game_id + version
+        assert_ne!(game1.unique_key(), game2.unique_key()); // Verschiedene Versionen
+    }
+}
+
+#[cfg(test)]
+mod integration_tests {
+    use super::*;
+    use libp2p::identity;
+
+    #[test]
+    fn test_two_peers_game_exchange_serialization() {
+        // Erstelle zwei Keypairs für die Peers (für Peer-IDs)
+        let keypair1 = identity::Keypair::generate_ed25519();
+        let peer_id1 = libp2p::PeerId::from(keypair1.public());
+        
+        let keypair2 = identity::Keypair::generate_ed25519();
+        let _peer_id2 = libp2p::PeerId::from(keypair2.public());
+        
+        // Erstelle ein Test-Spiel für Peer 1
+        let test_game = NetworkGameInfo {
+            game_id: "test-game-123".to_string(),
+            name: "Test Game".to_string(),
+            version: "1.0".to_string(),
+            start_file: "game.exe".to_string(),
+            start_args: None,
+            description: Some("Ein Test-Spiel".to_string()),
+            creator_peer_id: Some(peer_id1.to_string()),
+        };
+        
+        // Test: unique_key funktioniert korrekt
+        assert_eq!(test_game.unique_key(), "test-game-123:1.0");
+        
+        // Test: Serialisierung/Deserialisierung (simuliert den Austausch zwischen Peers)
+        let response = GamesListResponse {
+            games: vec![test_game.clone()],
+        };
+        
+        // Serialisiere (Peer 1 sendet)
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("test-game-123"));
+        assert!(json.contains("Test Game"));
+        assert!(json.contains("1.0"));
+        
+        // Deserialisiere (Peer 2 empfängt)
+        let deserialized: GamesListResponse = serde_json::from_str(&json).unwrap();
+        
+        assert_eq!(deserialized.games.len(), 1);
+        assert_eq!(deserialized.games[0].game_id, "test-game-123");
+        assert_eq!(deserialized.games[0].name, "Test Game");
+        assert_eq!(deserialized.games[0].version, "1.0");
+        assert_eq!(deserialized.games[0].unique_key(), "test-game-123:1.0");
+        assert_eq!(deserialized.games[0].creator_peer_id, Some(peer_id1.to_string()));
+        
+        // Test: Verschiedene Versionen haben verschiedene unique_keys
+        let test_game_v2 = NetworkGameInfo {
+            game_id: "test-game-123".to_string(),
+            name: "Test Game".to_string(),
+            version: "2.0".to_string(),
+            start_file: "game.exe".to_string(),
+            start_args: None,
+            description: Some("Ein Test-Spiel v2".to_string()),
+            creator_peer_id: Some(peer_id1.to_string()),
+        };
+        
+        assert_eq!(test_game_v2.unique_key(), "test-game-123:2.0");
+        assert_ne!(test_game.unique_key(), test_game_v2.unique_key());
+        
+        // Test: Beide Versionen können gleichzeitig existieren
+        let response_both = GamesListResponse {
+            games: vec![test_game.clone(), test_game_v2.clone()],
+        };
+        
+        let json_both = serde_json::to_string(&response_both).unwrap();
+        let deserialized_both: GamesListResponse = serde_json::from_str(&json_both).unwrap();
+        
+        assert_eq!(deserialized_both.games.len(), 2);
+        assert_eq!(deserialized_both.games[0].unique_key(), "test-game-123:1.0");
+        assert_eq!(deserialized_both.games[1].unique_key(), "test-game-123:2.0");
     }
 }
 

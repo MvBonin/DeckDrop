@@ -1,6 +1,10 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+
+// Statische Variable für den aktuellen Peer-ID-Unterordner
+static PEER_ID_SUBDIR: OnceLock<Option<String>> = OnceLock::new();
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -9,6 +13,8 @@ pub struct Config {
     pub download_path: PathBuf,
     #[serde(default)]
     pub peer_id: Option<String>,
+    #[serde(default)]
+    pub game_paths: Vec<PathBuf>,
 }
 
 impl Default for Config {
@@ -17,14 +23,70 @@ impl Default for Config {
             player_name: "Player".to_string(),
             download_path: PathBuf::from("~/Games"),
             peer_id: None,
+            game_paths: Vec::new(),
         }
     }
 }
 
 impl Config {
+    /// Setzt den Peer-ID-Unterordner für die Konfiguration
+    /// Wird verwendet, wenn --random-id gesetzt ist
+    pub fn set_peer_id_subdir(peer_id: &str) {
+        PEER_ID_SUBDIR.set(Some(peer_id.to_string())).ok();
+    }
+    
+    /// Gibt den aktuellen Peer-ID-Unterordner zurück
+    fn get_peer_id_subdir() -> Option<String> {
+        PEER_ID_SUBDIR.get().and_then(|s| s.clone())
+    }
+    
     /// Lädt die Konfiguration aus der Datei oder gibt Standardwerte zurück
     /// Generiert KEINE Peer-ID automatisch - das muss explizit über generate_and_save_peer_id() gemacht werden
     pub fn load() -> Self {
+        // Versuche zuerst, die Peer-ID aus dem Hauptverzeichnis zu laden
+        let main_keypair_path = directories::ProjectDirs::from("com", "deckdrop", "deckdrop")
+            .map(|dirs| dirs.config_dir().join("peer_id.key"));
+        
+        let mut peer_id_loaded = false;
+        
+        // Wenn kein Peer-ID-Unterordner gesetzt ist, versuche die Keypair-Datei im Hauptverzeichnis zu finden
+        if Self::get_peer_id_subdir().is_none() {
+            if let Some(ref main_path) = main_keypair_path {
+                if main_path.exists() {
+                    if let Some(peer_id) = Self::load_peer_id_from_keypair_file(main_path) {
+                        // Keypair im Hauptverzeichnis gefunden - verwende Hauptverzeichnis
+                        peer_id_loaded = true;
+                    }
+                }
+            }
+            
+            // Wenn keine Keypair-Datei im Hauptverzeichnis gefunden wurde, durchsuche Unterordner
+            if !peer_id_loaded {
+                if let Some(base_dir) = directories::ProjectDirs::from("com", "deckdrop", "deckdrop") {
+                    let config_dir = base_dir.config_dir();
+                    if let Ok(entries) = fs::read_dir(config_dir) {
+                        for entry in entries.flatten() {
+                            let path = entry.path();
+                            if path.is_dir() {
+                                let keypair_path = path.join("peer_id.key");
+                                if keypair_path.exists() {
+                                    if let Some(peer_id) = Self::load_peer_id_from_keypair_file(&keypair_path) {
+                                        // Keypair in Unterordner gefunden - setze Unterordner
+                                        Self::set_peer_id_subdir(&peer_id);
+                                        peer_id_loaded = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            // Peer-ID-Unterordner ist bereits gesetzt (z.B. durch --random-id)
+            peer_id_loaded = true;
+        }
+        
         let config_path = Self::config_path();
         
         let mut config = if let Some(path) = config_path {
@@ -35,6 +97,10 @@ impl Config {
                             Ok(mut config) => {
                                 // Expandiere ~ im Pfad
                                 config.download_path = Self::expand_path(&config.download_path);
+                                // Expandiere ~ in allen Spiel-Pfaden
+                                config.game_paths = config.game_paths.iter()
+                                    .map(|p| Self::expand_path(p))
+                                    .collect();
                                 config
                             }
                             Err(e) => {
@@ -65,17 +131,68 @@ impl Config {
         config
     }
     
+    /// Lädt die Peer-ID aus einer spezifischen Keypair-Datei
+    fn load_peer_id_from_keypair_file(keypair_path: &Path) -> Option<String> {
+        use libp2p::identity;
+        use libp2p::PeerId;
+        
+        if !keypair_path.exists() {
+            return None;
+        }
+        
+        match fs::read(keypair_path) {
+            Ok(bytes) => {
+                match identity::Keypair::from_protobuf_encoding(&bytes) {
+                    Ok(keypair) => {
+                        let peer_id = PeerId::from(keypair.public());
+                        Some(peer_id.to_string())
+                    }
+                    Err(_) => None,
+                }
+            }
+            Err(_) => None,
+        }
+    }
+    
     /// Prüft, ob bereits eine Peer-ID existiert (ohne eine zu generieren)
     pub fn has_peer_id() -> bool {
-        Self::keypair_path()
-            .map(|path| path.exists())
-            .unwrap_or(false)
+        // Prüfe zuerst im Hauptverzeichnis
+        let main_keypair_path = directories::ProjectDirs::from("com", "deckdrop", "deckdrop")
+            .map(|dirs| dirs.config_dir().join("peer_id.key"));
+        
+        if let Some(ref main_path) = main_keypair_path {
+            if main_path.exists() {
+                return true;
+            }
+        }
+        
+        // Wenn nicht im Hauptverzeichnis, durchsuche Unterordner
+        if let Some(base_dir) = directories::ProjectDirs::from("com", "deckdrop", "deckdrop") {
+            let config_dir = base_dir.config_dir();
+            if let Ok(entries) = fs::read_dir(config_dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        let keypair_path = path.join("peer_id.key");
+                        if keypair_path.exists() {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        
+        false
     }
     
     /// Generiert eine neue Peer-ID und speichert sie
     pub fn generate_and_save_peer_id(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         if let Some(peer_id) = Self::load_or_generate_peer_id() {
             self.peer_id = Some(peer_id.clone());
+            // Setze den Peer-ID-Unterordner, wenn noch nicht gesetzt
+            if Self::get_peer_id_subdir().is_none() {
+                Self::set_peer_id_subdir(&peer_id);
+            }
             self.save()?;
             Ok(())
         } else {
@@ -205,8 +322,15 @@ impl Config {
     
     /// Gibt den Pfad zur Keypair-Datei zurück
     pub fn keypair_path() -> Option<PathBuf> {
-        directories::ProjectDirs::from("com", "deckdrop", "deckdrop")
-            .map(|dirs| dirs.config_dir().join("peer_id.key"))
+        let base_dir = directories::ProjectDirs::from("com", "deckdrop", "deckdrop")?;
+        let config_dir = base_dir.config_dir();
+        
+        // Wenn ein Peer-ID-Unterordner gesetzt ist, verwende diesen
+        if let Some(subdir) = Self::get_peer_id_subdir() {
+            Some(config_dir.join(&subdir).join("peer_id.key"))
+        } else {
+            Some(config_dir.join("peer_id.key"))
+        }
     }
 
     /// Speichert die Konfiguration in eine Datei
@@ -222,6 +346,10 @@ impl Config {
         // Normalisiere den Pfad für die Speicherung (konvertiere zu ~ wenn im Home-Verzeichnis)
         let mut config_to_save = self.clone();
         config_to_save.download_path = Self::normalize_path_for_save(&config_to_save.download_path);
+        // Normalisiere alle Spiel-Pfade
+        config_to_save.game_paths = config_to_save.game_paths.iter()
+            .map(|p| Self::normalize_path_for_save(p))
+            .collect();
         
         // Speichere die Konfiguration
         let json = serde_json::to_string_pretty(&config_to_save)?;
@@ -229,11 +357,36 @@ impl Config {
         
         Ok(())
     }
+    
+    /// Fügt einen Spiel-Pfad zur Konfiguration hinzu
+    pub fn add_game_path(&mut self, game_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+        let normalized_path = Self::normalize_path_for_save(game_path);
+        if !self.game_paths.contains(&normalized_path) {
+            self.game_paths.push(normalized_path);
+            self.save()?;
+        }
+        Ok(())
+    }
+    
+    /// Entfernt einen Spiel-Pfad aus der Konfiguration
+    pub fn remove_game_path(&mut self, game_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+        let normalized_path = Self::normalize_path_for_save(game_path);
+        self.game_paths.retain(|p| p != &normalized_path);
+        self.save()?;
+        Ok(())
+    }
 
     /// Gibt den Pfad zur Konfigurationsdatei zurück
     fn config_path() -> Option<PathBuf> {
-        directories::ProjectDirs::from("com", "deckdrop", "deckdrop")
-            .map(|dirs| dirs.config_dir().join("config.json"))
+        let base_dir = directories::ProjectDirs::from("com", "deckdrop", "deckdrop")?;
+        let config_dir = base_dir.config_dir();
+        
+        // Wenn ein Peer-ID-Unterordner gesetzt ist, verwende diesen
+        if let Some(subdir) = Self::get_peer_id_subdir() {
+            Some(config_dir.join(&subdir).join("config.json"))
+        } else {
+            Some(config_dir.join("config.json"))
+        }
     }
 
     /// Expandiert ~ im Pfad zu einem vollständigen Pfad

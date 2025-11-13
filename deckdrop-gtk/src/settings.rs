@@ -165,6 +165,7 @@ impl SettingsWindowClone {
             player_name,
             download_path,
             peer_id: current_config.peer_id,
+            game_paths: current_config.game_paths, // Behalte vorhandene Spiel-Pfade
         };
 
         if let Err(e) = config.save() {
