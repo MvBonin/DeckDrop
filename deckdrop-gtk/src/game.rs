@@ -1,6 +1,9 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::io::Read;
+use sha2::{Sha256, Digest};
+use hex;
 
 /// Struktur für Spiel-Informationen
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -16,6 +19,8 @@ pub struct GameInfo {
     pub description: Option<String>,
     #[serde(default)]
     pub creator_peer_id: Option<String>,
+    #[serde(default)]
+    pub hash: Option<String>, // SHA-256 Hash der deckdrop_chunks.toml im Format "sha256:XYZ"
 }
 
 /// Generiert eine eindeutige Spiel-ID
@@ -49,6 +54,7 @@ impl Default for GameInfo {
             start_args: None,
             description: None,
             creator_peer_id: None,
+            hash: None,
         }
     }
 }
@@ -76,7 +82,9 @@ impl GameInfo {
     }
     
     /// Speichert GameInfo als deckdrop.toml Datei
-    pub fn save_to_path(&self, game_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    /// 
+    /// Wenn chunks_hash angegeben ist, wird dieser als hash-Feld gespeichert.
+    pub fn save_to_path_with_hash(&self, game_path: &Path, chunks_hash: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
         let toml_path = game_path.join("deckdrop.toml");
         
         // Stelle sicher, dass das Verzeichnis existiert
@@ -84,11 +92,136 @@ impl GameInfo {
             fs::create_dir_all(parent)?;
         }
         
-        let toml_string = toml::to_string_pretty(self)?;
+        // Erstelle eine Kopie mit dem Hash, falls vorhanden
+        let mut game_info_to_save = self.clone();
+        if let Some(hash) = chunks_hash {
+            game_info_to_save.hash = Some(hash);
+        }
+        
+        let toml_string = toml::to_string_pretty(&game_info_to_save)?;
         fs::write(&toml_path, toml_string)?;
         
         Ok(())
     }
+    
+    /// Speichert GameInfo als deckdrop.toml Datei (ohne Hash)
+    pub fn save_to_path(&self, game_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+        self.save_to_path_with_hash(game_path, None)
+    }
+}
+
+/// Struktur für einen Datei-Eintrag in deckdrop_chunks.toml
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct FileChunkEntry {
+    path: String,
+    chunks: Vec<String>,
+}
+
+/// Generiert die deckdrop_chunks.toml Datei für ein Spiel
+/// 
+/// Diese Funktion durchsucht das Spielverzeichnis rekursiv und erstellt für jede Datei
+/// eine Liste von SHA-256 Hashes für 10MB Chunks.
+/// 
+/// Gibt den SHA-256 Hash der generierten Datei zurück (im Format "sha256:XYZ").
+pub fn generate_chunks_toml(game_path: &Path) -> Result<String, Box<dyn std::error::Error>> {
+    const CHUNK_SIZE: usize = 10 * 1024 * 1024; // 10MB
+    
+    let chunks_toml_path = game_path.join("deckdrop_chunks.toml");
+    let mut file_entries = Vec::new();
+    
+    // Durchsuche das Verzeichnis rekursiv
+    if !game_path.exists() {
+        return Err(format!("Spielverzeichnis existiert nicht: {}", game_path.display()).into());
+    }
+    
+    // Sammle alle Dateien (rekursiv)
+    let mut files_to_process = Vec::new();
+    collect_files_recursive(game_path, game_path, &mut files_to_process)?;
+    
+    // Verarbeite jede Datei
+    for file_path in files_to_process {
+        // Überspringe deckdrop.toml und deckdrop_chunks.toml
+        if let Some(file_name) = file_path.file_name() {
+            let file_name_str = file_name.to_string_lossy();
+            if file_name_str == "deckdrop.toml" || file_name_str == "deckdrop_chunks.toml" {
+                continue;
+            }
+        }
+        
+        // Berechne relative Pfad
+        let relative_path = file_path.strip_prefix(game_path)
+            .map_err(|e| format!("Fehler beim Berechnen des relativen Pfads: {}", e))?;
+        let path_str = relative_path.to_string_lossy().replace('\\', "/");
+        
+        // Öffne Datei und berechne Chunks
+        let mut file = fs::File::open(&file_path)?;
+        let mut chunks = Vec::new();
+        let mut buffer = vec![0u8; CHUNK_SIZE];
+        
+        loop {
+            let bytes_read = file.read(&mut buffer)?;
+            if bytes_read == 0 {
+                break;
+            }
+            
+            // Berechne SHA-256 Hash für diesen Chunk
+            let mut hasher = Sha256::new();
+            hasher.update(&buffer[..bytes_read]);
+            let hash = hasher.finalize();
+            let hash_hex = hex::encode(hash);
+            chunks.push(hash_hex);
+        }
+        
+        file_entries.push(FileChunkEntry {
+            path: path_str,
+            chunks,
+        });
+    }
+    
+    // Sortiere nach Pfad, um konsistente Reihenfolge zu gewährleisten
+    file_entries.sort_by(|a, b| a.path.cmp(&b.path));
+    
+    // Speichere als TOML
+    let toml_string = toml::to_string_pretty(&file_entries)?;
+    
+    // Berechne SHA-256 Hash der generierten Datei (vor dem Schreiben)
+    let mut hasher = Sha256::new();
+    hasher.update(toml_string.as_bytes());
+    let hash = hasher.finalize();
+    let hash_hex = hex::encode(hash);
+    let hash_string = format!("sha256:{}", hash_hex);
+    
+    // Schreibe die Datei
+    fs::write(&chunks_toml_path, toml_string)?;
+    
+    Ok(hash_string)
+}
+
+/// Sammelt rekursiv alle Dateien aus einem Verzeichnis
+fn collect_files_recursive(
+    base_path: &Path,
+    current_path: &Path,
+    files: &mut Vec<PathBuf>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !current_path.exists() {
+        return Ok(());
+    }
+    
+    if current_path.is_file() {
+        files.push(current_path.to_path_buf());
+        return Ok(());
+    }
+    
+    if current_path.is_dir() {
+        let entries = fs::read_dir(current_path)?;
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path();
+            collect_files_recursive(base_path, &path, files)?;
+        }
+    }
+    
+    Ok(())
 }
 
 /// Prüft, ob im angegebenen Spielpfad bereits eine deckdrop.toml existiert

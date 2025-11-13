@@ -1,11 +1,12 @@
 mod config;
 mod settings;
 mod game;
+mod synch;
 
 use deckdrop_network::network::discovery::{start_discovery, DiscoveryEvent};
 use deckdrop_network::network::peer::PeerInfo;
 use gtk4::prelude::*;
-use gtk4::{Application, ApplicationWindow, Label, Button, Box as GtkBox, Orientation, Separator, Stack, StackSwitcher, ScrolledWindow, ListBox, ListBoxRow, Entry as GtkEntry, MessageDialog, MessageType, ButtonsType, Window, FileChooserDialog, FileChooserAction, ResponseType, TextView};
+use gtk4::{Application, ApplicationWindow, Label, Button, Box as GtkBox, Orientation, Separator, Stack, StackSwitcher, ScrolledWindow, ListBox, ListBoxRow, Entry as GtkEntry, MessageDialog, MessageType, ButtonsType, Window, FileChooserDialog, FileChooserAction, ResponseType, TextView, ProgressBar};
 use crate::game::{GameInfo, check_game_config_exists, load_games_from_directory};
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
@@ -254,6 +255,9 @@ fn build_ui(app: &Application) {
     // Channel zwischen Network (Tokio) und GTK
     let (event_tx, mut event_rx) = mpsc::channel::<DiscoveryEvent>(32);
 
+    // Channel für Download-Requests (vom GTK-Thread zum Tokio-Thread)
+    let (download_request_tx, download_request_rx) = tokio::sync::mpsc::unbounded_channel::<deckdrop_network::network::discovery::DownloadRequest>();
+
     // Async channel für GTK Main Context
     let (glib_tx, glib_rx) = async_channel::unbounded::<DiscoveryEvent>();
 
@@ -324,12 +328,131 @@ fn build_ui(app: &Application) {
         }))
     };
     
+    // Erstelle Callback zum Laden von Spiel-Metadaten
+    let game_metadata_loader: Option<deckdrop_network::network::discovery::GameMetadataLoader> = {
+        use std::sync::Arc;
+        Some(Arc::new(move |game_id: &str| {
+            let config = Config::load();
+            
+            // Suche Spiel in allen game_paths
+            for game_path in &config.game_paths {
+                if check_game_config_exists(game_path) {
+                    if let Ok(game_info) = GameInfo::load_from_path(game_path) {
+                        if game_info.game_id == game_id {
+                            // Lade deckdrop.toml
+                            let toml_path = game_path.join("deckdrop.toml");
+                            let deckdrop_toml = std::fs::read_to_string(&toml_path).ok()?;
+                            
+                            // Lade deckdrop_chunks.toml
+                            let chunks_toml_path = game_path.join("deckdrop_chunks.toml");
+                            let deckdrop_chunks_toml = std::fs::read_to_string(&chunks_toml_path).ok()?;
+                            
+                            return Some((deckdrop_toml, deckdrop_chunks_toml));
+                        }
+                    }
+                }
+                
+                // Prüfe auch Unterverzeichnisse
+                if game_path.is_dir() {
+                    let additional_games = load_games_from_directory(game_path);
+                    for (path, game_info) in additional_games {
+                        if game_info.game_id == game_id {
+                            let toml_path = path.join("deckdrop.toml");
+                            let deckdrop_toml = std::fs::read_to_string(&toml_path).ok()?;
+                            
+                            let chunks_toml_path = path.join("deckdrop_chunks.toml");
+                            let deckdrop_chunks_toml = std::fs::read_to_string(&chunks_toml_path).ok()?;
+                            
+                            return Some((deckdrop_toml, deckdrop_chunks_toml));
+                        }
+                    }
+                }
+            }
+            
+            None
+        }))
+    };
+    
+    // Erstelle Callback zum Laden von Chunks
+    let chunk_loader: Option<deckdrop_network::network::discovery::ChunkLoader> = {
+        use std::sync::Arc;
+        Some(Arc::new(move |chunk_hash: &str| {
+            let config = Config::load();
+            
+            // Entferne "sha256:" Präfix falls vorhanden
+            let hash_name = chunk_hash.strip_prefix("sha256:").unwrap_or(chunk_hash);
+            
+            // Suche Chunk in allen game_paths
+            for game_path in &config.game_paths {
+                // Prüfe ob Spiel existiert
+                if check_game_config_exists(game_path) {
+                    // Lade deckdrop_chunks.toml um Chunk-Pfad zu finden
+                    let chunks_toml_path = game_path.join("deckdrop_chunks.toml");
+                    if let Ok(chunks_toml_content) = std::fs::read_to_string(&chunks_toml_path) {
+                        // Parse chunks.toml und finde Datei mit diesem Chunk
+                        if let Ok(chunks_data) = toml::from_str::<Vec<serde_json::Value>>(&chunks_toml_content) {
+                            for entry in chunks_data {
+                                if let Some(chunks) = entry.get("chunks").and_then(|c| c.as_array()) {
+                                    for chunk in chunks {
+                                        if let Some(chunk_str) = chunk.as_str() {
+                                            let chunk_hash_clean = chunk_str.strip_prefix("sha256:").unwrap_or(chunk_str);
+                                            if chunk_hash_clean == hash_name {
+                                                // Chunk gefunden - lade Datei und extrahiere Chunk
+                                                if let Some(file_path) = entry.get("path").and_then(|p| p.as_str()) {
+                                                    let full_path = game_path.join(file_path);
+                                                    if let Ok(mut file) = std::fs::File::open(&full_path) {
+                                                        use std::io::Read;
+                                                        const CHUNK_SIZE: usize = 10 * 1024 * 1024; // 10MB
+                                                        let mut buffer = vec![0u8; CHUNK_SIZE];
+                                                        
+                                                        // Finde den richtigen Chunk in der Datei
+                                                        // TODO: Implementiere korrekte Chunk-Extraktion basierend auf Position
+                                                        // Für jetzt: lade ersten Chunk
+                                                        if let Ok(bytes_read) = file.read(&mut buffer) {
+                                                            if bytes_read > 0 {
+                                                                buffer.truncate(bytes_read);
+                                                                // Validiere Hash
+                                                                use sha2::{Sha256, Digest};
+                                                                use hex;
+                                                                let mut hasher = Sha256::new();
+                                                                hasher.update(&buffer);
+                                                                let computed_hash = hex::encode(hasher.finalize());
+                                                                if computed_hash == hash_name {
+                                                                    return Some(buffer);
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            
+            None
+        }))
+    };
+    
     thread::spawn(move || {
         let rt = Runtime::new().expect("Failed to create Tokio runtime");
         
         // Network Discovery Task
         rt.spawn(async move {
-            let _handle = start_discovery(event_tx.clone(), Some(player_name.clone()), games_count, keypair, games_loader).await;
+            let _handle = start_discovery(
+                event_tx.clone(), 
+                Some(player_name.clone()), 
+                games_count, 
+                keypair, 
+                games_loader,
+                game_metadata_loader,
+                chunk_loader,
+                Some(download_request_rx),
+            ).await;
             println!("Discovery gestartet, warte auf Events...");
             eprintln!("Discovery gestartet, warte auf Events...");
 
@@ -381,9 +504,19 @@ fn build_ui(app: &Application) {
     let network_games: Rc<RefCell<HashMap<String, Vec<(String, NetworkGameInfo)>>>> = Rc::new(RefCell::new(HashMap::new()));
     let network_games_clone = network_games.clone();
     
+    // Aktive Downloads tracken
+    let active_downloads: ActiveDownloads = Rc::new(RefCell::new(HashMap::new()));
+    let active_downloads_clone = active_downloads.clone();
+    
+    // Clone download_request_tx für Button-Handler
+    let download_request_tx_clone = download_request_tx.clone();
+    
+    let download_request_tx_for_async = download_request_tx.clone();
     main_context.spawn_local_with_priority(glib::Priority::default(), async move {
         println!("GTK Event-Handler gestartet, warte auf Events...");
         eprintln!("GTK Event-Handler gestartet, warte auf Events...");
+        
+        let download_request_tx = download_request_tx_for_async;
         
         while let Ok(event) = glib_rx.recv().await {
             println!("Event empfangen im GTK Thread: {:?}", event);
@@ -451,11 +584,125 @@ fn build_ui(app: &Application) {
                         } // mutable borrow endet hier
                         
                         if let Some(network_games_list) = network_games_list_weak.upgrade() {
-                            update_network_games_list(&network_games_list, &network_games_clone);
+                            update_network_games_list(&network_games_list, &network_games_clone, &download_request_tx, &active_downloads_clone);
                         }
                     }
                     let peer_count = known_peers_clone.borrow().len();
                     status_label.set_text(&format!("Status: Online • Peers: {}", peer_count));
+                }
+                DiscoveryEvent::GameMetadataReceived { peer_id, game_id, deckdrop_toml, deckdrop_chunks_toml } => {
+                    println!("=== GameMetadataReceived Event im GTK Thread ===");
+                    eprintln!("=== GameMetadataReceived Event im GTK Thread ===");
+                    println!("Metadaten erhalten für Spiel {} von Peer {}", game_id, peer_id);
+                    eprintln!("Metadaten erhalten für Spiel {} von Peer {}", game_id, peer_id);
+                    
+                    // Erstelle Download-UI falls noch nicht vorhanden
+                    if !active_downloads_clone.borrow().contains_key(&game_id) {
+                        create_download_ui(&game_id, &active_downloads_clone, &download_request_tx_clone, &network_games_list_weak, &network_games_clone);
+                    }
+                    
+                    // Starte Download-Prozess
+                    if let Err(e) = crate::synch::start_game_download(&game_id, &deckdrop_toml, &deckdrop_chunks_toml) {
+                        eprintln!("Fehler beim Starten des Downloads: {}", e);
+                    } else {
+                        // Nach erfolgreichem Manifest-Erstellen: Starte Chunk-Downloads
+                        if let Err(e) = crate::synch::request_missing_chunks(
+                            &game_id,
+                            &[peer_id.clone()],
+                            &download_request_tx_clone,
+                        ) {
+                            eprintln!("Fehler beim Anfordern fehlender Chunks: {}", e);
+                        }
+                    }
+                }
+                DiscoveryEvent::ChunkReceived { peer_id, chunk_hash, chunk_data } => {
+                    println!("=== ChunkReceived Event im GTK Thread ===");
+                    eprintln!("=== ChunkReceived Event im GTK Thread ===");
+                    println!("Chunk {} erhalten von Peer {}: {} Bytes", chunk_hash, peer_id, chunk_data.len());
+                    eprintln!("Chunk {} erhalten von Peer {}: {} Bytes", chunk_hash, peer_id, chunk_data.len());
+                    
+                    // Finde game_id durch Suche in allen Manifesten
+                    if let Ok(game_id) = crate::synch::find_game_id_for_chunk(&chunk_hash) {
+                        // Prüfe ob Download pausiert ist
+                        let manifest_path = match crate::synch::get_manifest_path(&game_id) {
+                            Ok(path) => path,
+                            Err(e) => {
+                                eprintln!("Fehler beim Ermitteln des Manifest-Pfads: {}", e);
+                                continue;
+                            }
+                        };
+                        
+                        let manifest = match crate::synch::DownloadManifest::load(&manifest_path) {
+                            Ok(m) => m,
+                            Err(e) => {
+                                eprintln!("Fehler beim Laden des Manifests: {}", e);
+                                continue;
+                            }
+                        };
+                        
+                        // Überspringe wenn pausiert
+                        if manifest.overall_status == crate::synch::DownloadStatus::Paused {
+                            println!("Download pausiert, überspringe Chunk {}", chunk_hash);
+                            continue;
+                        }
+                        
+                        // Speichere Chunk
+                        let chunks_dir = match crate::synch::get_chunks_dir(&game_id) {
+                            Ok(dir) => dir,
+                            Err(e) => {
+                                eprintln!("Fehler beim Ermitteln des Chunks-Verzeichnisses: {}", e);
+                                continue;
+                            }
+                        };
+                        
+                        if let Err(e) = crate::synch::save_chunk(&chunk_hash, &chunk_data, &chunks_dir) {
+                            eprintln!("Fehler beim Speichern des Chunks {}: {}", chunk_hash, e);
+                            continue;
+                        }
+                        
+                        // Aktualisiere Manifest
+                        let mut manifest = match crate::synch::DownloadManifest::load(&manifest_path) {
+                            Ok(m) => m,
+                            Err(e) => {
+                                eprintln!("Fehler beim Laden des Manifests: {}", e);
+                                continue;
+                            }
+                        };
+                        
+                        manifest.mark_chunk_downloaded(&chunk_hash);
+                        
+                        if let Err(e) = manifest.save(&manifest_path) {
+                            eprintln!("Fehler beim Speichern des Manifests: {}", e);
+                            continue;
+                        }
+                        
+                        // Aktualisiere UI
+                        update_download_ui(&game_id, &active_downloads_clone);
+                        
+                        // Prüfe ob Dateien komplett sind und rekonstruiere sie
+                        if let Err(e) = crate::synch::check_and_reconstruct_files(&game_id, &manifest) {
+                            eprintln!("Fehler beim Rekonstruieren von Dateien: {}", e);
+                        }
+                        
+                        // Prüfe ob Spiel komplett ist
+                        if manifest.overall_status == crate::synch::DownloadStatus::Complete {
+                            if let Err(e) = crate::synch::finalize_game_download(&game_id, &manifest) {
+                                eprintln!("Fehler bei der Spiel-Finalisierung: {}", e);
+                            }
+                            // Entferne aus aktiven Downloads
+                            active_downloads_clone.borrow_mut().remove(&game_id);
+                            // Aktualisiere Liste
+                            if let Some(network_games_list) = network_games_list_weak.upgrade() {
+                                update_network_games_list(&network_games_list, &network_games_clone, &download_request_tx_clone, &active_downloads_clone);
+                            }
+                        }
+                    } else {
+                        eprintln!("Konnte game_id für Chunk {} nicht finden", chunk_hash);
+                    }
+                }
+                DiscoveryEvent::ChunkRequestFailed { peer_id, chunk_hash, error } => {
+                    eprintln!("Chunk-Request fehlgeschlagen: {} von {}: {}", chunk_hash, peer_id, error);
+                    // TODO: Versuche anderen Peer
                 }
                 DiscoveryEvent::GamesListReceived { peer_id, games } => {
                     println!("=== GamesListReceived Event im GTK Thread ===");
@@ -488,7 +735,7 @@ fn build_ui(app: &Application) {
                         Some(network_games_list) => {
                             println!("Aktualisiere Netzwerk-Spiele-Liste...");
                             eprintln!("Aktualisiere Netzwerk-Spiele-Liste...");
-                            update_network_games_list(&network_games_list, &network_games_clone);
+                            update_network_games_list(&network_games_list, &network_games_clone, &download_request_tx, &active_downloads_clone);
                             println!("Netzwerk-Spiele-Liste aktualisiert!");
                             eprintln!("Netzwerk-Spiele-Liste aktualisiert!");
                         }
@@ -654,6 +901,7 @@ fn show_add_game_dialog(parent: &ApplicationWindow, download_path: &std::path::P
     let download_path_clone = download_path.clone();
     let games_list_clone = games_list.clone();
     let dialog_clone = dialog.clone();
+    let path_entry_clone = path_entry.clone();
     browse_button.connect_clicked(move |_| {
         let file_dialog = FileChooserDialog::builder()
             .title("Spielverzeichnis auswählen")
@@ -664,6 +912,7 @@ fn show_add_game_dialog(parent: &ApplicationWindow, download_path: &std::path::P
         let download_path_clone2 = download_path_clone.clone();
         let games_list_clone2 = games_list_clone.clone();
         let dialog_clone2 = dialog_clone.clone();
+        let path_entry_clone2 = path_entry_clone.clone();
         file_dialog.connect_response(move |dialog, response| {
             if response == ResponseType::Accept {
                 if let Some(file) = dialog.file() {
@@ -681,12 +930,12 @@ fn show_add_game_dialog(parent: &ApplicationWindow, download_path: &std::path::P
                                 // Das Spiel wird automatisch zur Liste hinzugefügt
                                 dialog_clone2.close();
                                 update_games_list(&games_list_clone2, &download_path_clone2);
+                                dialog.close();
                                 return;
                             }
                         }
-                        // Keine valide TOML - Pfad setzen und Dialog bleibt offen
-                        // (Der Pfad wird im path_entry gesetzt, aber das ist nicht mehr nötig,
-                        // da wir den Dialog schließen wenn TOML vorhanden ist)
+                        // Keine valide TOML - Pfad in das Eingabefeld eintragen
+                        path_entry_clone2.set_text(&path.to_string_lossy());
                     }
                 }
             }
@@ -748,10 +997,21 @@ fn show_add_game_dialog(parent: &ApplicationWindow, download_path: &std::path::P
             start_args: if start_args.is_empty() { None } else { Some(start_args) },
             description: if description.trim().is_empty() { None } else { Some(description.trim().to_string()) },
             creator_peer_id: peer_id.clone(),
+            hash: None, // Wird später gesetzt, nachdem deckdrop_chunks.toml generiert wurde
         };
         
-        // Speichere TOML (überschreibt vorhandene)
-        match game_info.save_to_path(&game_path) {
+        // Generiere zuerst deckdrop_chunks.toml und berechne den Hash
+        let chunks_hash = match crate::game::generate_chunks_toml(&game_path) {
+            Ok(hash) => Some(hash),
+            Err(e) => {
+                eprintln!("Warnung: Fehler beim Generieren von deckdrop_chunks.toml: {}", e);
+                // Fehler ist nicht kritisch, Spiel kann trotzdem hinzugefügt werden
+                None
+            }
+        };
+        
+        // Speichere TOML mit dem Hash der deckdrop_chunks.toml
+        match game_info.save_to_path_with_hash(&game_path, chunks_hash) {
             Ok(_) => {
                 // Füge den Spiel-Pfad zur Config hinzu
                 let mut config = Config::load();
@@ -887,7 +1147,175 @@ fn update_games_list(games_list: &ListBox, _download_path: &std::path::PathBuf) 
     }
 }
 
-fn update_network_games_list(games_list: &ListBox, network_games: &Rc<RefCell<HashMap<String, Vec<(String, deckdrop_network::network::games::NetworkGameInfo)>>>>) {
+/// Erstellt Download-UI-Elemente für ein Spiel
+fn create_download_ui(
+    game_id: &str,
+    active_downloads: &ActiveDownloads,
+    download_request_tx: &tokio::sync::mpsc::UnboundedSender<deckdrop_network::network::discovery::DownloadRequest>,
+    network_games_list_weak: &glib::WeakRef<ListBox>,
+    network_games: &Rc<RefCell<HashMap<String, Vec<(String, deckdrop_network::network::games::NetworkGameInfo)>>>>,
+) {
+    let progress_bar = ProgressBar::new();
+    progress_bar.set_show_text(true);
+    progress_bar.set_fraction(0.0);
+    
+    let status_label = Label::new(Some("Initialisiere Download..."));
+    status_label.set_halign(gtk4::Align::Start);
+    status_label.set_xalign(0.0);
+    
+    let pause_button = Button::with_label("Pause");
+    let resume_button = Button::with_label("Resume");
+    resume_button.set_visible(false);
+    
+    let cancel_button = Button::with_label("Abbrechen");
+    cancel_button.add_css_class("destructive-action");
+    
+    let button_box = GtkBox::new(Orientation::Horizontal, 6);
+    button_box.append(&pause_button);
+    button_box.append(&resume_button);
+    button_box.append(&cancel_button);
+    
+    // Clone für Callbacks
+    let game_id_clone = game_id.to_string();
+    let active_downloads_clone = active_downloads.clone();
+    let download_request_tx_clone = download_request_tx.clone();
+    let network_games_list_weak_clone = network_games_list_weak.clone();
+    
+    // Pause-Button
+    pause_button.connect_clicked(move |_| {
+        if let Ok(manifest_path) = crate::synch::get_manifest_path(&game_id_clone) {
+            if let Ok(mut manifest) = crate::synch::DownloadManifest::load(&manifest_path) {
+                manifest.overall_status = crate::synch::DownloadStatus::Paused;
+                let _ = manifest.save(&manifest_path);
+                update_download_ui(&game_id_clone, &active_downloads_clone);
+            }
+        }
+    });
+    
+    // Resume-Button
+    let game_id_clone2 = game_id.to_string();
+    let active_downloads_clone2 = active_downloads.clone();
+    let download_request_tx_clone2 = download_request_tx.clone();
+    let network_games_clone_for_resume = network_games.clone();
+    resume_button.connect_clicked(move |_| {
+        if let Ok(manifest_path) = crate::synch::get_manifest_path(&game_id_clone2) {
+            if let Ok(mut manifest) = crate::synch::DownloadManifest::load(&manifest_path) {
+                manifest.overall_status = crate::synch::DownloadStatus::Downloading;
+                let _ = manifest.save(&manifest_path);
+                
+                // Hole verfügbare Peers aus network_games
+                // Suche nach game_id in allen unique_keys
+                let peer_ids: Vec<String> = {
+                    let network_games_borrowed = network_games_clone_for_resume.borrow();
+                    let mut peers = Vec::new();
+                    for (_unique_key, peer_games) in network_games_borrowed.iter() {
+                        if let Some((_, game_info)) = peer_games.first() {
+                            if game_info.game_id == game_id_clone2 {
+                                peers.extend(peer_games.iter().map(|(pid, _)| pid.clone()));
+                                break;
+                            }
+                        }
+                    }
+                    peers
+                };
+                
+                if !peer_ids.is_empty() {
+                    let _ = crate::synch::request_missing_chunks(&game_id_clone2, &peer_ids, &download_request_tx_clone2);
+                } else {
+                    eprintln!("Keine verfügbaren Peers für Resume von Spiel {}", game_id_clone2);
+                }
+                
+                update_download_ui(&game_id_clone2, &active_downloads_clone2);
+            }
+        }
+    });
+    
+    // Cancel-Button
+    let game_id_clone3 = game_id.to_string();
+    let active_downloads_clone3 = active_downloads.clone();
+    let network_games_list_weak_clone2 = network_games_list_weak.clone();
+    let network_games_clone_for_cancel = network_games.clone();
+    let download_request_tx_clone_for_cancel = download_request_tx.clone();
+    cancel_button.connect_clicked(move |_| {
+        if let Err(e) = crate::synch::cancel_game_download(&game_id_clone3) {
+            eprintln!("Fehler beim Abbrechen des Downloads: {}", e);
+        } else {
+            active_downloads_clone3.borrow_mut().remove(&game_id_clone3);
+            // Aktualisiere Liste
+            if let Some(network_games_list) = network_games_list_weak_clone2.upgrade() {
+                update_network_games_list(&network_games_list, &network_games_clone_for_cancel, &download_request_tx_clone_for_cancel, &active_downloads_clone3);
+            }
+        }
+    });
+    
+    let download_ui = DownloadUI {
+        progress_bar,
+        status_label,
+        pause_button,
+        resume_button,
+        cancel_button,
+        button_box,
+    };
+    
+    active_downloads.borrow_mut().insert(game_id.to_string(), download_ui);
+}
+
+/// Aktualisiert die Download-UI für ein Spiel
+fn update_download_ui(game_id: &str, active_downloads: &ActiveDownloads) {
+    if let Some(download_ui) = active_downloads.borrow().get(game_id) {
+        if let Ok(manifest_path) = crate::synch::get_manifest_path(game_id) {
+            if let Ok(manifest) = crate::synch::DownloadManifest::load(&manifest_path) {
+                download_ui.progress_bar.set_fraction(manifest.progress.percentage / 100.0);
+                download_ui.progress_bar.set_text(Some(&format!("{}%", manifest.progress.percentage as u32)));
+                download_ui.status_label.set_text(&format!("{} von {} Chunks heruntergeladen", 
+                    manifest.progress.downloaded_chunks,
+                    manifest.progress.total_chunks));
+                
+                // Aktualisiere Button-Sichtbarkeit
+                match manifest.overall_status {
+                    crate::synch::DownloadStatus::Downloading => {
+                        download_ui.pause_button.set_visible(true);
+                        download_ui.resume_button.set_visible(false);
+                        download_ui.cancel_button.set_visible(true);
+                    }
+                    crate::synch::DownloadStatus::Paused => {
+                        download_ui.pause_button.set_visible(false);
+                        download_ui.resume_button.set_visible(true);
+                        download_ui.cancel_button.set_visible(true);
+                    }
+                    crate::synch::DownloadStatus::Complete => {
+                        download_ui.pause_button.set_visible(false);
+                        download_ui.resume_button.set_visible(false);
+                        download_ui.cancel_button.set_visible(false);
+                        download_ui.status_label.set_text("✓ Download abgeschlossen");
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+/// Struktur für Download-UI-Elemente
+#[derive(Clone)]
+struct DownloadUI {
+    progress_bar: ProgressBar,
+    status_label: Label,
+    pause_button: Button,
+    resume_button: Button,
+    cancel_button: Button,
+    button_box: GtkBox,
+}
+
+/// Aktive Downloads tracken (game_id -> Download-UI)
+type ActiveDownloads = Rc<RefCell<HashMap<String, DownloadUI>>>;
+
+fn update_network_games_list(
+    games_list: &ListBox, 
+    network_games: &Rc<RefCell<HashMap<String, Vec<(String, deckdrop_network::network::games::NetworkGameInfo)>>>>,
+    download_request_tx: &tokio::sync::mpsc::UnboundedSender<deckdrop_network::network::discovery::DownloadRequest>,
+    active_downloads: &ActiveDownloads,
+) {
     // Entferne alle vorhandenen Zeilen
     while let Some(row) = games_list.row_at_index(0) {
         games_list.remove(&row);
@@ -907,6 +1335,30 @@ fn update_network_games_list(games_list: &ListBox, network_games: &Rc<RefCell<Ha
         games_list.append(&row);
         return;
     }
+    
+    // Lade lokale Spiele und erstelle eine Set der game_ids
+    let local_game_ids: std::collections::HashSet<String> = {
+        let config = crate::config::Config::load();
+        let mut ids = std::collections::HashSet::new();
+        
+        for game_path in &config.game_paths {
+            // Prüfe, ob das Verzeichnis selbst ein Spiel enthält
+            if check_game_config_exists(game_path) {
+                if let Ok(game_info) = GameInfo::load_from_path(game_path) {
+                    ids.insert(game_info.game_id);
+                }
+            }
+            // Lade auch Spiele aus Unterverzeichnissen
+            if game_path.is_dir() {
+                let additional_games = load_games_from_directory(game_path);
+                for (_path, game_info) in additional_games {
+                    ids.insert(game_info.game_id);
+                }
+            }
+        }
+        
+        ids
+    };
     
     // Zeige alle Spiele, gruppiert nach game_id + version (unique_key)
     for (_unique_key, peer_games) in games_map.iter() {
@@ -944,6 +1396,16 @@ fn update_network_games_list(games_list: &ListBox, network_games: &Rc<RefCell<Ha
             peers_label.add_css_class("dim-label");
             row_box.append(&peers_label);
             
+            // Prüfe, ob das Spiel auch in der eigenen Bibliothek vorhanden ist
+            if local_game_ids.contains(&game_info.game_id) {
+                let local_label = Label::new(Some("✓ Auch in eigener Bibliothek vorhanden"));
+                local_label.set_halign(gtk4::Align::Start);
+                local_label.set_xalign(0.0);
+                local_label.add_css_class("success");
+                local_label.add_css_class("dim-label");
+                row_box.append(&local_label);
+            }
+            
             // Beschreibung (falls vorhanden)
             if let Some(ref description) = game_info.description {
                 let description_label = Label::new(Some(description));
@@ -961,6 +1423,61 @@ fn update_network_games_list(games_list: &ListBox, network_games: &Rc<RefCell<Ha
             start_file_label.set_xalign(0.0);
             start_file_label.add_css_class("dim-label");
             row_box.append(&start_file_label);
+            
+            // Prüfe ob Download bereits aktiv ist
+            let game_id_for_download = game_info.game_id.clone();
+            let active_downloads_clone = active_downloads.clone();
+            let download_request_tx_clone_for_download = download_request_tx.clone();
+            
+            // Prüfe ob bereits ein Download für dieses Spiel existiert
+            let has_download = active_downloads.borrow().contains_key(&game_id_for_download);
+            
+            if has_download {
+                // Aktualisiere UI zuerst
+                update_download_ui(&game_id_for_download, active_downloads);
+                
+                // Hole UI-Elemente
+                if let Some(download_ui) = active_downloads.borrow().get(&game_id_for_download) {
+                    row_box.append(&download_ui.progress_bar);
+                    row_box.append(&download_ui.status_label);
+                    row_box.append(&download_ui.button_box);
+                }
+            } else {
+                // "Get this game" Button
+                let download_button = Button::with_label("Get this game");
+                download_button.add_css_class("suggested-action");
+                
+                // Clone für den Callback
+                let game_id_clone = game_info.game_id.clone();
+                let game_name_clone = game_info.name.clone();
+                let peer_ids: Vec<String> = peer_games.iter().map(|(pid, _)| pid.clone()).collect();
+                
+                let download_request_tx_for_button = download_request_tx.clone();
+                download_button.connect_clicked(move |_| {
+                    println!("Download gestartet für Spiel: {} (ID: {})", game_name_clone, game_id_clone);
+                    eprintln!("Download gestartet für Spiel: {} (ID: {})", game_name_clone, game_id_clone);
+                    
+                    // Wähle ersten verfügbaren Peer
+                    if let Some(peer_id) = peer_ids.first() {
+                        // Sende GameMetadataRequest
+                        if let Err(e) = download_request_tx_for_button.send(
+                            deckdrop_network::network::discovery::DownloadRequest::RequestGameMetadata {
+                                peer_id: peer_id.clone(),
+                                game_id: game_id_clone.clone(),
+                            }
+                        ) {
+                            eprintln!("Fehler beim Senden von GameMetadataRequest: {}", e);
+                        } else {
+                            println!("GameMetadataRequest gesendet an Peer {} für Spiel {}", peer_id, game_id_clone);
+                            eprintln!("GameMetadataRequest gesendet an Peer {} für Spiel {}", peer_id, game_id_clone);
+                        }
+                    } else {
+                        eprintln!("Keine verfügbaren Peers für Download von Spiel {}", game_id_clone);
+                    }
+                });
+                
+                row_box.append(&download_button);
+            }
             
             row.set_child(Some(&row_box));
             games_list.append(&row);

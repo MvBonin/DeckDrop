@@ -10,13 +10,20 @@ use std::collections::HashMap;
 use std::time::Duration;
 use std::sync::Arc;
 
-use crate::network::{peer::PeerInfo, channel::PeerUpdateSender, games::{GamesListBehaviour, GamesListRequest, GamesListResponse, NetworkGameInfo, create_games_list_behaviour}};
+use crate::network::{peer::PeerInfo, channel::PeerUpdateSender, games::{
+    GamesListBehaviour, GamesListRequest, GamesListResponse, NetworkGameInfo, 
+    create_games_list_behaviour,
+    GameMetadataBehaviour, GameMetadataRequest, GameMetadataResponse, create_game_metadata_behaviour,
+    ChunkBehaviour, ChunkRequest, ChunkResponse, create_chunk_behaviour,
+}};
 
 #[derive(libp2p::swarm::NetworkBehaviour)]
 pub struct DiscoveryBehaviour {
     pub mdns: Mdns,
     pub identify: Identify,
     pub games_list: GamesListBehaviour,
+    pub game_metadata: GameMetadataBehaviour,
+    pub chunks: ChunkBehaviour,
 }
 
 // Event type for GTK integration
@@ -28,13 +35,58 @@ pub enum DiscoveryEvent {
         peer_id: String,
         games: Vec<NetworkGameInfo>,
     },
+    GameMetadataReceived {
+        peer_id: String,
+        game_id: String,
+        deckdrop_toml: String,
+        deckdrop_chunks_toml: String,
+    },
+    ChunkReceived {
+        peer_id: String,
+        chunk_hash: String,
+        chunk_data: Vec<u8>,
+    },
+    ChunkRequestFailed {
+        peer_id: String,
+        chunk_hash: String,
+        error: String,
+    },
+}
+
+/// Request-Typen für Downloads (vom GTK-Thread zum Tokio-Thread)
+#[derive(Debug, Clone)]
+pub enum DownloadRequest {
+    RequestGameMetadata {
+        peer_id: String,
+        game_id: String,
+    },
+    RequestChunk {
+        peer_id: String,
+        chunk_hash: String,
+        game_id: String, // Für Tracking
+    },
 }
 
 /// Callback-Typ zum Laden von Spielen
 pub type GamesLoader = Arc<dyn Fn() -> Vec<NetworkGameInfo> + Send + Sync>;
 
+/// Callback-Typ zum Laden von Spiel-Metadaten (deckdrop.toml und deckdrop_chunks.toml)
+pub type GameMetadataLoader = Arc<dyn Fn(&str) -> Option<(String, String)> + Send + Sync>;
+
+/// Callback-Typ zum Laden eines Chunks
+pub type ChunkLoader = Arc<dyn Fn(&str) -> Option<Vec<u8>> + Send + Sync>;
+
 // Wrapper function for GTK integration
-pub async fn start_discovery(event_tx: tokio::sync::mpsc::Sender<DiscoveryEvent>, player_name: Option<String>, games_count: Option<u32>, keypair: Option<libp2p::identity::Keypair>, games_loader: Option<GamesLoader>) -> tokio::task::JoinHandle<()> {
+pub async fn start_discovery(
+    event_tx: tokio::sync::mpsc::Sender<DiscoveryEvent>, 
+    player_name: Option<String>, 
+    games_count: Option<u32>, 
+    keypair: Option<libp2p::identity::Keypair>, 
+    games_loader: Option<GamesLoader>,
+    game_metadata_loader: Option<GameMetadataLoader>,
+    chunk_loader: Option<ChunkLoader>,
+    download_request_rx: Option<tokio::sync::mpsc::UnboundedReceiver<DownloadRequest>>,
+) -> tokio::task::JoinHandle<()> {
     let (sender, mut receiver) = crate::network::channel::new_peer_channel();
     let event_tx_for_lost = event_tx.clone();
     let player_name_clone = player_name.clone();
@@ -64,19 +116,47 @@ pub async fn start_discovery(event_tx: tokio::sync::mpsc::Sender<DiscoveryEvent>
     tokio::spawn(async move {
         println!("run_discovery Task gestartet");
         eprintln!("run_discovery Task gestartet");
-        let result = run_discovery(sender, None, event_tx_for_lost, player_name_clone, games_count_clone, keypair, games_loader).await;
+        let result = run_discovery(sender, None, event_tx_for_lost, player_name_clone, games_count_clone, keypair, games_loader, game_metadata_loader, chunk_loader, download_request_rx).await;
         println!("run_discovery beendet: {:?}", result);
         eprintln!("run_discovery beendet: {:?}", result);
     })
 }
 
-pub async fn run_discovery(sender: PeerUpdateSender, our_peer_id: Option<String>, event_tx: tokio::sync::mpsc::Sender<DiscoveryEvent>, our_player_name: Option<String>, our_games_count: Option<u32>, keypair: Option<libp2p::identity::Keypair>, games_loader: Option<GamesLoader>) {
+pub async fn run_discovery(
+    sender: PeerUpdateSender, 
+    our_peer_id: Option<String>, 
+    event_tx: tokio::sync::mpsc::Sender<DiscoveryEvent>, 
+    our_player_name: Option<String>, 
+    our_games_count: Option<u32>, 
+    keypair: Option<libp2p::identity::Keypair>, 
+    games_loader: Option<GamesLoader>,
+    game_metadata_loader: Option<GameMetadataLoader>,
+    chunk_loader: Option<ChunkLoader>,
+    mut download_request_rx: Option<tokio::sync::mpsc::UnboundedReceiver<DownloadRequest>>,
+) {
     // Map to track peer info by peer ID for handshake updates
     let peer_info_map: Arc<tokio::sync::Mutex<HashMap<String, PeerInfo>>> = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     let peer_info_map_clone = peer_info_map.clone();
     let sender_clone = sender.clone();
     let event_tx_clone = event_tx.clone();
     let games_loader_clone = games_loader.clone();
+    let game_metadata_loader_clone = game_metadata_loader.clone();
+    let chunk_loader_clone = chunk_loader.clone();
+    
+    // Tracking für Chunk-Requests: request_id -> (chunk_hash, game_id)
+    // RequestId sollte Copy sein und als HashMap-Key verwendet werden können
+    use std::any::Any;
+    // Verwende einen Counter-basierten Ansatz für Request-Tracking
+    let mut chunk_request_counter: u64 = 0;
+    let pending_chunk_requests: Arc<tokio::sync::Mutex<HashMap<u64, (String, String)>>> = 
+        Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let pending_chunk_requests_clone = pending_chunk_requests.clone();
+    
+    // Tracking für Metadata-Requests: request_id -> game_id
+    let mut metadata_request_counter: u64 = 0;
+    let pending_metadata_requests: Arc<tokio::sync::Mutex<HashMap<u64, String>>> = 
+        Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let pending_metadata_requests_clone = pending_metadata_requests.clone();
     
     // Handshake wird jetzt über identify Protokoll gehandhabt
     // Channel nicht mehr benötigt, aber behalten für Kompatibilität
@@ -145,8 +225,16 @@ pub async fn run_discovery(sender: PeerUpdateSender, our_peer_id: Option<String>
     let identify = Identify::new(identify_config);
     
     let games_list = create_games_list_behaviour();
+    let game_metadata = create_game_metadata_behaviour();
+    let chunks = create_chunk_behaviour();
     
-    let behaviour = DiscoveryBehaviour { mdns, identify, games_list };
+    let behaviour = DiscoveryBehaviour { 
+        mdns, 
+        identify, 
+        games_list,
+        game_metadata,
+        chunks,
+    };
     
     // Use the same identity for the swarm
     let mut swarm = libp2p::SwarmBuilder::with_existing_identity(id_keys)
@@ -201,6 +289,67 @@ pub async fn run_discovery(sender: PeerUpdateSender, our_peer_id: Option<String>
     
     loop {
         tokio::select! {
+            // Handle Download Requests vom GTK-Thread
+            request = async {
+                if let Some(ref mut rx) = download_request_rx {
+                    rx.recv().await
+                } else {
+                    futures::future::pending().await
+                }
+            } => {
+                if let Some(request) = request {
+                    match request {
+                        DownloadRequest::RequestGameMetadata { peer_id, game_id } => {
+                            let peer_id_parsed = match PeerId::from_str(&peer_id) {
+                                Ok(id) => id,
+                                Err(e) => {
+                                    eprintln!("Ungültige Peer-ID für GameMetadata Request: {}: {}", peer_id, e);
+                                    continue;
+                                }
+                            };
+                            
+                            // Prüfe ob Peer verbunden ist
+                            if !swarm.connected_peers().any(|p| p == &peer_id_parsed) {
+                                eprintln!("Peer {} nicht verbunden für GameMetadata Request", peer_id);
+                                continue;
+                            }
+                            
+                            let request = GameMetadataRequest { game_id: game_id.clone() };
+                            let _request_id = swarm.behaviour_mut().game_metadata.send_request(&peer_id_parsed, request);
+                            
+                            // TODO: Tracke Request-ID für bessere Zuordnung
+                            // Für jetzt: game_id wird aus der Response extrahiert
+                            
+                            println!("GameMetadata Request gesendet an {} für game_id: {}", peer_id, game_id);
+                            eprintln!("GameMetadata Request gesendet an {} für game_id: {}", peer_id, game_id);
+                        }
+                        DownloadRequest::RequestChunk { peer_id, chunk_hash, game_id } => {
+                            let peer_id_parsed = match PeerId::from_str(&peer_id) {
+                                Ok(id) => id,
+                                Err(e) => {
+                                    eprintln!("Ungültige Peer-ID für Chunk Request: {}: {}", peer_id, e);
+                                    continue;
+                                }
+                            };
+                            
+                            // Prüfe ob Peer verbunden ist
+                            if !swarm.connected_peers().any(|p| p == &peer_id_parsed) {
+                                eprintln!("Peer {} nicht verbunden für Chunk Request", peer_id);
+                                continue;
+                            }
+                            
+                            let request = ChunkRequest { chunk_hash: chunk_hash.clone() };
+                            let _request_id = swarm.behaviour_mut().chunks.send_request(&peer_id_parsed, request);
+                            
+                            // TODO: Tracke Request-ID für bessere Zuordnung
+                            // Für jetzt: chunk_hash wird direkt verwendet, game_id wird aus Manifest gesucht
+                            
+                            println!("Chunk Request gesendet an {} für hash: {}", peer_id, chunk_hash);
+                            eprintln!("Chunk Request gesendet an {} für hash: {}", peer_id, chunk_hash);
+                        }
+                    }
+                }
+            }
             // Handle Swarm Events
             event = swarm.select_next_some() => {
                 println!("Swarm Event empfangen: {:?}", event);
@@ -368,6 +517,124 @@ pub async fn run_discovery(sender: PeerUpdateSender, our_peer_id: Option<String>
                             libp2p::request_response::Event::ResponseSent { .. } => {
                                 // Response wurde gesendet - ignorieren
                             }
+                        }
+                    }
+                    DiscoveryBehaviourEvent::GameMetadata(metadata_event) => {
+                        println!("GameMetadata Event empfangen: {:?}", metadata_event);
+                        eprintln!("GameMetadata Event empfangen: {:?}", metadata_event);
+                        match metadata_event {
+                            libp2p::request_response::Event::Message { message, peer, .. } => {
+                                match message {
+                                    libp2p::request_response::Message::Request { request, channel, .. } => {
+                                        // Ein Peer fragt nach Spiel-Metadaten
+                                        eprintln!("GameMetadata Request von {} für game_id: {}", peer, request.game_id);
+                                        
+                                        // Lade Metadaten über den Callback, falls vorhanden
+                                        let response = if let Some(ref loader) = game_metadata_loader_clone {
+                                            if let Some((deckdrop_toml, deckdrop_chunks_toml)) = loader(&request.game_id) {
+                                                GameMetadataResponse {
+                                                    deckdrop_toml,
+                                                    deckdrop_chunks_toml,
+                                                }
+                                            } else {
+                                                // Spiel nicht gefunden
+                                                eprintln!("Spiel {} nicht gefunden für GameMetadata Request", request.game_id);
+                                                GameMetadataResponse {
+                                                    deckdrop_toml: String::new(),
+                                                    deckdrop_chunks_toml: String::new(),
+                                                }
+                                            }
+                                        } else {
+                                            GameMetadataResponse {
+                                                deckdrop_toml: String::new(),
+                                                deckdrop_chunks_toml: String::new(),
+                                            }
+                                        };
+                                        let _ = swarm.behaviour_mut().game_metadata.send_response(channel, response);
+                                    }
+                                    libp2p::request_response::Message::Response { response, .. } => {
+                                        // Wir haben Metadaten erhalten
+                                        let peer_id_str = peer.to_string();
+                                        println!("GameMetadata Response erhalten von {}: {} Bytes deckdrop.toml, {} Bytes deckdrop_chunks.toml", 
+                                            peer_id_str, response.deckdrop_toml.len(), response.deckdrop_chunks_toml.len());
+                                        eprintln!("GameMetadata Response erhalten von {}: {} Bytes deckdrop.toml, {} Bytes deckdrop_chunks.toml", 
+                                            peer_id_str, response.deckdrop_toml.len(), response.deckdrop_chunks_toml.len());
+                                        
+                                        // Extrahiere game_id aus deckdrop.toml
+                                        // Parse TOML manuell, da NetworkGameInfo nicht direkt aus TOML deserialisierbar ist
+                                        let game_id = response.deckdrop_toml.lines()
+                                            .find(|l| l.trim().starts_with("game_id"))
+                                            .and_then(|l| l.split('=').nth(1))
+                                            .map(|s| s.trim().trim_matches('"').trim_matches('\'').to_string())
+                                            .unwrap_or_else(|| "unknown".to_string());
+                                        
+                                        let _ = event_tx_clone.send(DiscoveryEvent::GameMetadataReceived {
+                                            peer_id: peer_id_str,
+                                            game_id,
+                                            deckdrop_toml: response.deckdrop_toml,
+                                            deckdrop_chunks_toml: response.deckdrop_chunks_toml,
+                                        }).await;
+                                    }
+                                }
+                            }
+                            libp2p::request_response::Event::OutboundFailure { peer, error, .. } => {
+                                eprintln!("GameMetadata OutboundFailure für {}: {:?}", peer, error);
+                            }
+                            libp2p::request_response::Event::InboundFailure { peer, error, .. } => {
+                                eprintln!("GameMetadata InboundFailure für {}: {:?}", peer, error);
+                            }
+                            _ => {}
+                        }
+                    }
+                    DiscoveryBehaviourEvent::Chunks(chunk_event) => {
+                        println!("Chunks Event empfangen: {:?}", chunk_event);
+                        eprintln!("Chunks Event empfangen: {:?}", chunk_event);
+                        match chunk_event {
+                            libp2p::request_response::Event::Message { message, peer, .. } => {
+                                match message {
+                                    libp2p::request_response::Message::Request { request, channel, .. } => {
+                                        // Ein Peer fragt nach einem Chunk
+                                        eprintln!("Chunk Request von {} für hash: {}", peer, request.chunk_hash);
+                                        
+                                        // Lade Chunk über den Callback, falls vorhanden
+                                        let response = if let Some(ref loader) = chunk_loader_clone {
+                                            if let Some(chunk_data) = loader(&request.chunk_hash) {
+                                                ChunkResponse { chunk_data }
+                                            } else {
+                                                // Chunk nicht gefunden
+                                                eprintln!("Chunk {} nicht gefunden", request.chunk_hash);
+                                                ChunkResponse { chunk_data: Vec::new() }
+                                            }
+                                        } else {
+                                            ChunkResponse { chunk_data: Vec::new() }
+                                        };
+                                        let _ = swarm.behaviour_mut().chunks.send_response(channel, response);
+                                    }
+                                    libp2p::request_response::Message::Response { request_id: _, response, .. } => {
+                                        // Wir haben einen Chunk erhalten
+                                        // TODO: Verwende request_id für Tracking
+                                        // Für jetzt: chunk_hash muss aus dem Request-Kontext kommen
+                                        // Da wir request_id nicht tracken können, verwenden wir einen anderen Ansatz:
+                                        // Der chunk_hash wird später aus dem Manifest gesucht
+                                        let peer_id_str = peer.to_string();
+                                        println!("Chunk Response erhalten von {}: {} Bytes", peer_id_str, response.chunk_data.len());
+                                        eprintln!("Chunk Response erhalten von {}: {} Bytes", peer_id_str, response.chunk_data.len());
+                                        
+                                        // TODO: Implementiere korrektes Request-ID-Tracking
+                                        // Für jetzt: chunk_hash wird nicht übermittelt - muss aus Manifest gesucht werden
+                                        // Dies ist ein temporärer Workaround
+                                        eprintln!("Warnung: Chunk Response ohne chunk_hash - Implementierung unvollständig");
+                                    }
+                                }
+                            }
+                            libp2p::request_response::Event::OutboundFailure { peer, request_id: _, error, .. } => {
+                                eprintln!("Chunks OutboundFailure für {}: {:?}", peer, error);
+                                // TODO: Implementiere korrektes Request-ID-Tracking für Fehlerbehandlung
+                            }
+                            libp2p::request_response::Event::InboundFailure { peer, error, .. } => {
+                                eprintln!("Chunks InboundFailure für {}: {:?}", peer, error);
+                            }
+                            _ => {}
                         }
                     }
                     DiscoveryBehaviourEvent::Mdns(mdns_event) => {
