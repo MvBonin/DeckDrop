@@ -120,11 +120,16 @@ struct FileChunkEntry {
 /// Generiert die deckdrop_chunks.toml Datei für ein Spiel
 /// 
 /// Diese Funktion durchsucht das Spielverzeichnis rekursiv und erstellt für jede Datei
-/// eine Liste von SHA-256 Hashes für 10MB Chunks.
+/// eine Liste von SHA-256 Hashes für 100MB Chunks.
 /// 
 /// Gibt den SHA-256 Hash der generierten Datei zurück (im Format "sha256:XYZ").
-pub fn generate_chunks_toml(game_path: &Path) -> Result<String, Box<dyn std::error::Error>> {
-    const CHUNK_SIZE: usize = 10 * 1024 * 1024; // 10MB
+/// 
+/// `progress_callback`: Optionaler Callback, der mit (aktuelle_datei, gesamt_dateien, aktuelle_datei_name) aufgerufen wird
+pub fn generate_chunks_toml<F>(game_path: &Path, progress_callback: Option<F>) -> Result<String, Box<dyn std::error::Error>>
+where
+    F: Fn(usize, usize, &str),
+{
+    const CHUNK_SIZE: usize = 100 * 1024 * 1024; // 100MB
     
     let chunks_toml_path = game_path.join("deckdrop_chunks.toml");
     let mut file_entries = Vec::new();
@@ -138,8 +143,12 @@ pub fn generate_chunks_toml(game_path: &Path) -> Result<String, Box<dyn std::err
     let mut files_to_process = Vec::new();
     collect_files_recursive(game_path, game_path, &mut files_to_process)?;
     
-    // Verarbeite jede Datei
-    for file_path in files_to_process {
+    let total_files = files_to_process.len();
+    println!("Generiere Chunks für {} Dateien...", total_files);
+    eprintln!("Generiere Chunks für {} Dateien...", total_files);
+    
+        // Verarbeite jede Datei
+    for (file_index, file_path) in files_to_process.iter().enumerate() {
         // Überspringe deckdrop.toml und deckdrop_chunks.toml
         if let Some(file_name) = file_path.file_name() {
             let file_name_str = file_name.to_string_lossy();
@@ -153,16 +162,28 @@ pub fn generate_chunks_toml(game_path: &Path) -> Result<String, Box<dyn std::err
             .map_err(|e| format!("Fehler beim Berechnen des relativen Pfads: {}", e))?;
         let path_str = relative_path.to_string_lossy().replace('\\', "/");
         
+        // Logging und Progress-Callback
+        println!("Verarbeite Datei {}/{}: {}", file_index + 1, total_files, path_str);
+        eprintln!("Verarbeite Datei {}/{}: {}", file_index + 1, total_files, path_str);
+        if let Some(ref callback) = progress_callback {
+            callback(file_index + 1, total_files, &path_str);
+        }
+        
         // Öffne Datei und berechne Chunks
         let mut file = fs::File::open(&file_path)?;
+        let file_size = file.metadata()?.len();
         let mut chunks = Vec::new();
         let mut buffer = vec![0u8; CHUNK_SIZE];
+        let mut chunk_index = 0;
         
         loop {
             let bytes_read = file.read(&mut buffer)?;
             if bytes_read == 0 {
                 break;
             }
+            
+            chunk_index += 1;
+            println!("  Chunk {}: {} Bytes", chunk_index, bytes_read);
             
             // Berechne SHA-256 Hash für diesen Chunk
             let mut hasher = Sha256::new();
@@ -171,6 +192,9 @@ pub fn generate_chunks_toml(game_path: &Path) -> Result<String, Box<dyn std::err
             let hash_hex = hex::encode(hash);
             chunks.push(hash_hex);
         }
+        
+        println!("  Datei abgeschlossen: {} Chunks, {} Bytes", chunks.len(), file_size);
+        eprintln!("  Datei abgeschlossen: {} Chunks, {} Bytes", chunks.len(), file_size);
         
         file_entries.push(FileChunkEntry {
             path: path_str,

@@ -16,6 +16,7 @@ use std::cell::RefCell;
 use std::thread;
 use std::env;
 use crate::config::Config;
+use async_channel;
 
 fn main() {
     // Prüfe Command-Line-Argumente VOR GTK-Initialisierung
@@ -402,7 +403,7 @@ fn build_ui(app: &Application) {
                                                     let full_path = game_path.join(file_path);
                                                     if let Ok(mut file) = std::fs::File::open(&full_path) {
                                                         use std::io::Read;
-                                                        const CHUNK_SIZE: usize = 10 * 1024 * 1024; // 10MB
+                                                        const CHUNK_SIZE: usize = 100 * 1024 * 1024; // 100MB
                                                         let mut buffer = vec![0u8; CHUNK_SIZE];
                                                         
                                                         // Finde den richtigen Chunk in der Datei
@@ -882,6 +883,20 @@ fn show_add_game_dialog(parent: &ApplicationWindow, download_path: &std::path::P
     description_scrolled.set_hexpand(true);
     content_box.append(&description_scrolled);
     
+    // Fortschrittsanzeige (zunächst versteckt)
+    let progress_label = Label::new(Some(""));
+    progress_label.set_halign(gtk4::Align::Start);
+    progress_label.set_margin_top(12);
+    progress_label.set_visible(false);
+    content_box.append(&progress_label);
+    
+    let progress_bar = ProgressBar::new();
+    progress_bar.set_show_text(true);
+    progress_bar.set_hexpand(true);
+    progress_bar.set_visible(false);
+    progress_bar.set_margin_top(6);
+    content_box.append(&progress_bar);
+    
     // Button-Box
     let button_box = GtkBox::new(Orientation::Horizontal, 8);
     button_box.set_halign(gtk4::Align::End);
@@ -956,6 +971,9 @@ fn show_add_game_dialog(parent: &ApplicationWindow, download_path: &std::path::P
     let games_list_clone = games_list.clone();
     let dialog_clone = dialog.clone();
     let description_text_view_clone = description_text_view.clone();
+    let progress_label_clone = progress_label.clone();
+    let progress_bar_clone = progress_bar.clone();
+    let save_button_clone = save_button.clone();
     let config = Config::load();
     let peer_id = config.peer_id.clone();
     save_button.connect_clicked(move |_| {
@@ -988,9 +1006,20 @@ fn show_add_game_dialog(parent: &ApplicationWindow, download_path: &std::path::P
         
         let game_path = std::path::PathBuf::from(&game_path_str);
         
-        // Erstelle GameInfo mit Peer-ID
+        // Zeige Fortschrittsanzeige
+        progress_label_clone.set_visible(true);
+        progress_bar_clone.set_visible(true);
+        progress_label_clone.set_text("Initialisiere Chunk-Generierung...");
+        progress_bar_clone.set_fraction(0.0);
+        progress_bar_clone.set_text(Some("0%"));
+        
+        // Deaktiviere Save-Button während der Verarbeitung
+        save_button_clone.set_sensitive(false);
+        
+        // Erstelle GameInfo mit Peer-ID (wird später gesetzt)
+        let game_id = crate::game::generate_game_id();
         let game_info = GameInfo {
-            game_id: crate::game::generate_game_id(), // Generiere neue game_id
+            game_id: game_id.clone(),
             name: name.clone(),
             version: if version.is_empty() { "1.0".to_string() } else { version },
             start_file,
@@ -1000,33 +1029,98 @@ fn show_add_game_dialog(parent: &ApplicationWindow, download_path: &std::path::P
             hash: None, // Wird später gesetzt, nachdem deckdrop_chunks.toml generiert wurde
         };
         
-        // Generiere zuerst deckdrop_chunks.toml und berechne den Hash
-        let chunks_hash = match crate::game::generate_chunks_toml(&game_path) {
-            Ok(hash) => Some(hash),
-            Err(e) => {
-                eprintln!("Warnung: Fehler beim Generieren von deckdrop_chunks.toml: {}", e);
-                // Fehler ist nicht kritisch, Spiel kann trotzdem hinzugefügt werden
-                None
-            }
-        };
+        // Channel für Progress-Updates (String = "progress:current:total:filename" oder "done:hash" oder "error:message")
+        let (progress_tx, progress_rx) = async_channel::unbounded::<String>();
+        let progress_label_for_thread = progress_label_clone.clone();
+        let progress_bar_for_thread = progress_bar_clone.clone();
+        let save_button_for_thread = save_button_clone.clone();
+        let dialog_clone_for_thread = dialog_clone.clone();
+        let games_list_clone_for_thread = games_list_clone.clone();
+        let download_path_clone_for_thread = download_path_clone.clone();
+        let game_path_for_ui = game_path.clone();
+        let game_info_for_ui = game_info.clone();
+        let game_path_for_thread = game_path.clone();
+        let game_info_for_thread = game_info.clone();
         
-        // Speichere TOML mit dem Hash der deckdrop_chunks.toml
-        match game_info.save_to_path_with_hash(&game_path, chunks_hash) {
-            Ok(_) => {
-                // Füge den Spiel-Pfad zur Config hinzu
-                let mut config = Config::load();
-                if let Err(e) = config.add_game_path(&game_path) {
-                    eprintln!("Fehler beim Hinzufügen des Spiel-Pfads zur Config: {}", e);
+        // Spawn Progress-Update-Handler im GTK Main Context
+        let main_context = glib::MainContext::default();
+        main_context.spawn_local(async move {
+            while let Ok(message) = progress_rx.recv().await {
+                if message.starts_with("progress:") {
+                    let parts: Vec<&str> = message.splitn(4, ':').collect();
+                    if parts.len() == 4 {
+                        if let (Ok(current), Ok(total)) = (parts[1].parse::<usize>(), parts[2].parse::<usize>()) {
+                            let file_name = parts[3];
+                            let percentage = (current as f64 / total as f64) * 100.0;
+                            progress_bar_for_thread.set_fraction(percentage / 100.0);
+                            progress_bar_for_thread.set_text(Some(&format!("{:.1}%", percentage)));
+                            progress_label_for_thread.set_text(&format!("Verarbeite Datei {}/{}: {}", current, total, file_name));
+                        }
+                    }
+                } else if message.starts_with("done:") {
+                    let hash = message.strip_prefix("done:").unwrap_or("");
+                    progress_bar_for_thread.set_fraction(1.0);
+                    progress_bar_for_thread.set_text(Some("100%"));
+                    progress_label_for_thread.set_text("Chunk-Generierung abgeschlossen. Speichere Spiel...");
+                    
+                    // Speichere TOML mit dem Hash der deckdrop_chunks.toml
+                    let chunks_hash = if hash.is_empty() { None } else { Some(hash.to_string()) };
+                    match game_info_for_ui.save_to_path_with_hash(&game_path_for_ui, chunks_hash) {
+                        Ok(_) => {
+                            // Füge den Spiel-Pfad zur Config hinzu
+                            let mut config = Config::load();
+                            if let Err(e) = config.add_game_path(&game_path_for_ui) {
+                                eprintln!("Fehler beim Hinzufügen des Spiel-Pfads zur Config: {}", e);
+                            }
+                            
+                            dialog_clone_for_thread.close();
+                            // Aktualisiere die Liste mit den Pfaden aus der Config
+                            update_games_list(&games_list_clone_for_thread, &download_path_clone_for_thread);
+                        }
+                        Err(e) => {
+                            progress_label_for_thread.set_text(&format!("Fehler beim Speichern: {}", e));
+                            save_button_for_thread.set_sensitive(true);
+                            show_error_dialog(&dialog_clone_for_thread, &format!("Fehler beim Speichern: {}", e));
+                        }
+                    }
+                } else if message.starts_with("error:") {
+                    let error_msg = message.strip_prefix("error:").unwrap_or("Unbekannter Fehler");
+                    progress_label_for_thread.set_text(&format!("Fehler: {}", error_msg));
+                    save_button_for_thread.set_sensitive(true);
                 }
-                
-                dialog_clone.close();
-                // Aktualisiere die Liste mit den Pfaden aus der Config
-                update_games_list(&games_list_clone, &download_path_clone);
             }
-            Err(e) => {
-                show_error_dialog(&dialog_clone, &format!("Fehler beim Speichern: {}", e));
+        });
+        
+        // Führe Chunk-Generierung in separatem Thread aus
+        thread::spawn(move || {
+            let game_path_for_chunks = game_path_for_thread.clone();
+            println!("Starte Chunk-Generierung für: {}", game_path_for_chunks.display());
+            eprintln!("Starte Chunk-Generierung für: {}", game_path_for_chunks.display());
+            
+            // Generiere deckdrop_chunks.toml mit Progress-Callback
+            let progress_tx_clone = progress_tx.clone();
+            let chunks_hash = match crate::game::generate_chunks_toml(&game_path_for_chunks, Some(move |current: usize, total: usize, file_name: &str| {
+                let _ = progress_tx_clone.send(format!("progress:{}:{}:{}", current, total, file_name));
+            })) {
+                Ok(hash) => {
+                    println!("Chunk-Generierung abgeschlossen. Hash: {}", hash);
+                    eprintln!("Chunk-Generierung abgeschlossen. Hash: {}", hash);
+                    Some(hash)
+                }
+                Err(e) => {
+                    eprintln!("Fehler beim Generieren von deckdrop_chunks.toml: {}", e);
+                    let _ = progress_tx.send(format!("error:{}", e));
+                    None
+                }
+            };
+            
+            // Sende Completion-Signal
+            if let Some(hash) = chunks_hash {
+                let _ = progress_tx.send(format!("done:{}", hash));
+            } else {
+                let _ = progress_tx.send("done:".to_string());
             }
-        }
+        });
     });
     
     dialog.show();
