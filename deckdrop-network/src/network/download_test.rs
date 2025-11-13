@@ -52,14 +52,18 @@ hash = "sha256:test_hash"
         );
         
         // Erstelle Test-Chunks (2 Chunks für eine Test-Datei)
-        let chunk1_hash = "sha256:abc123";
-        let chunk2_hash = "sha256:def456";
+        // Neues Format: file_hash + chunk_count
+        let file_hash = "abc123def456"; // Test file_hash
+        let chunk_count = 2;
+        let file_size = 8 * 1024 * 1024; // 8MB Test-Datei
         let deckdrop_chunks_toml = format!(
             r#"[[file]]
 path = "test.bin"
-chunks = ["{}", "{}"]
+file_hash = "{}"
+chunk_count = {}
+file_size = {}
 "#,
-            chunk1_hash, chunk2_hash
+            file_hash, chunk_count, file_size
         );
         
         // Erstelle GameMetadataLoader für Peer 1
@@ -74,15 +78,18 @@ chunks = ["{}", "{}"]
         });
         
         // Erstelle ChunkLoader für Peer 1
+        // Neues Format: "{file_hash}:{chunk_index}"
         let chunk1_data = vec![0u8; 5 * 1024 * 1024]; // 5MB Test-Daten
         let chunk2_data = vec![1u8; 3 * 1024 * 1024]; // 3MB Test-Daten
         
         let chunk1_data_clone = chunk1_data.clone();
         let chunk2_data_clone = chunk2_data.clone();
+        let file_hash_clone = file_hash.to_string();
         let chunk_loader: ChunkLoader = Arc::new(move |chunk_hash: &str| {
-            if chunk_hash == chunk1_hash {
+            // Neues Format: "{file_hash}:{chunk_index}"
+            if chunk_hash == format!("{}:0", file_hash_clone) {
                 Some(chunk1_data_clone.clone())
-            } else if chunk_hash == chunk2_hash {
+            } else if chunk_hash == format!("{}:1", file_hash_clone) {
                 Some(chunk2_data_clone.clone())
             } else {
                 None
@@ -185,20 +192,21 @@ chunks = ["{}", "{}"]
         
         assert!(metadata_received, "GameMetadata sollte empfangen worden sein");
         
-        // Peer 2 fragt nach Chunks
+        // Peer 2 fragt nach Chunks (neues Format: "{file_hash}:{chunk_index}")
         download_request_tx2_final.send(DownloadRequest::RequestChunk {
             peer_id: peer1_id_str.clone(),
-            chunk_hash: chunk1_hash.to_string(),
+            chunk_hash: format!("{}:0", file_hash),
             game_id: "test_game_123".to_string(),
         }).unwrap();
         
         download_request_tx2_final.send(DownloadRequest::RequestChunk {
             peer_id: peer1_id_str.clone(),
-            chunk_hash: chunk2_hash.to_string(),
+            chunk_hash: format!("{}:1", file_hash),
             game_id: "test_game_123".to_string(),
         }).unwrap();
         
         // Warte auf ChunkReceived Events
+        let file_hash_for_validation = file_hash.to_string();
         let mut chunks_received = 0;
         timeout_counter = 0;
         while chunks_received < 2 && timeout_counter < 50 {
@@ -208,11 +216,11 @@ chunks = ["{}", "{}"]
                         println!("Peer 2 hat Chunk {} erhalten: {} Bytes von {}", chunk_hash, chunk_data.len(), peer_id);
                         assert_eq!(peer_id, peer1_id_str);
                         
-                        // Validiere Chunk-Daten
-                        if chunk_hash == chunk1_hash {
+                        // Validiere Chunk-Daten (neues Format: "{file_hash}:{chunk_index}")
+                        if chunk_hash == format!("{}:0", file_hash_for_validation) {
                             assert_eq!(chunk_data.len(), 5 * 1024 * 1024);
                             assert_eq!(chunk_data[0], 0u8);
-                        } else if chunk_hash == chunk2_hash {
+                        } else if chunk_hash == format!("{}:1", file_hash_for_validation) {
                             assert_eq!(chunk_data.len(), 3 * 1024 * 1024);
                             assert_eq!(chunk_data[0], 1u8);
                         }

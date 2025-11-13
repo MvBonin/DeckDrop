@@ -380,48 +380,44 @@ fn build_ui(app: &Application) {
         Some(Arc::new(move |chunk_hash: &str| {
             let config = Config::load();
             
-            // Entferne "sha256:" Präfix falls vorhanden
-            let hash_name = chunk_hash.strip_prefix("sha256:").unwrap_or(chunk_hash);
+            // Neues Format: "{file_hash}:{chunk_index}"
+            let parts: Vec<&str> = chunk_hash.split(':').collect();
+            if parts.len() != 2 {
+                eprintln!("Ungültiges Chunk-Hash-Format: {}", chunk_hash);
+                return None;
+            }
+            
+            let file_hash = parts[0];
+            let chunk_index = parts[1].parse::<usize>().ok()?;
             
             // Suche Chunk in allen game_paths
             for game_path in &config.game_paths {
                 // Prüfe ob Spiel existiert
                 if check_game_config_exists(game_path) {
-                    // Lade deckdrop_chunks.toml um Chunk-Pfad zu finden
+                    // Lade deckdrop_chunks.toml um Datei mit diesem file_hash zu finden
                     let chunks_toml_path = game_path.join("deckdrop_chunks.toml");
                     if let Ok(chunks_toml_content) = std::fs::read_to_string(&chunks_toml_path) {
-                        // Parse chunks.toml und finde Datei mit diesem Chunk
+                        // Parse chunks.toml
                         if let Ok(chunks_data) = toml::from_str::<Vec<serde_json::Value>>(&chunks_toml_content) {
                             for entry in chunks_data {
-                                if let Some(chunks) = entry.get("chunks").and_then(|c| c.as_array()) {
-                                    for chunk in chunks {
-                                        if let Some(chunk_str) = chunk.as_str() {
-                                            let chunk_hash_clean = chunk_str.strip_prefix("sha256:").unwrap_or(chunk_str);
-                                            if chunk_hash_clean == hash_name {
-                                                // Chunk gefunden - lade Datei und extrahiere Chunk
-                                                if let Some(file_path) = entry.get("path").and_then(|p| p.as_str()) {
-                                                    let full_path = game_path.join(file_path);
-                                                    if let Ok(mut file) = std::fs::File::open(&full_path) {
-                                                        use std::io::Read;
-                                                        const CHUNK_SIZE: usize = 100 * 1024 * 1024; // 100MB
-                                                        let mut buffer = vec![0u8; CHUNK_SIZE];
-                                                        
-                                                        // Finde den richtigen Chunk in der Datei
-                                                        // TODO: Implementiere korrekte Chunk-Extraktion basierend auf Position
-                                                        // Für jetzt: lade ersten Chunk
-                                                        if let Ok(bytes_read) = file.read(&mut buffer) {
-                                                            if bytes_read > 0 {
-                                                                buffer.truncate(bytes_read);
-                                                                // Validiere Hash
-                                                                use sha2::{Sha256, Digest};
-                                                                use hex;
-                                                                let mut hasher = Sha256::new();
-                                                                hasher.update(&buffer);
-                                                                let computed_hash = hex::encode(hasher.finalize());
-                                                                if computed_hash == hash_name {
-                                                                    return Some(buffer);
-                                                                }
-                                                            }
+                                // Prüfe ob file_hash übereinstimmt
+                                if let Some(entry_file_hash) = entry.get("file_hash").and_then(|h| h.as_str()) {
+                                    if entry_file_hash == file_hash {
+                                        // Datei gefunden - extrahiere Chunk basierend auf Index
+                                        if let Some(file_path) = entry.get("path").and_then(|p| p.as_str()) {
+                                            let full_path = game_path.join(file_path);
+                                            if let Ok(mut file) = std::fs::File::open(&full_path) {
+                                                use std::io::{Read, Seek, SeekFrom};
+                                                const CHUNK_SIZE: usize = 100 * 1024 * 1024; // 100MB
+                                                
+                                                // Springe zum richtigen Chunk
+                                                let offset = (chunk_index as u64) * (CHUNK_SIZE as u64);
+                                                if file.seek(SeekFrom::Start(offset)).is_ok() {
+                                                    let mut buffer = vec![0u8; CHUNK_SIZE];
+                                                    if let Ok(bytes_read) = file.read(&mut buffer) {
+                                                        if bytes_read > 0 {
+                                                            buffer.truncate(bytes_read);
+                                                            return Some(buffer);
                                                         }
                                                     }
                                                 }
@@ -923,6 +919,10 @@ fn show_add_game_dialog(parent: &ApplicationWindow, download_path: &std::path::P
             .action(FileChooserAction::SelectFolder)
             .transient_for(&dialog_clone)
             .build();
+        
+        // Füge OK und Abbrechen Buttons hinzu
+        file_dialog.add_button("Abbrechen", ResponseType::Cancel);
+        file_dialog.add_button("Auswählen", ResponseType::Accept);
         
         let download_path_clone2 = download_path_clone.clone();
         let games_list_clone2 = games_list_clone.clone();

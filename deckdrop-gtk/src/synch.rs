@@ -70,14 +70,21 @@ impl DownloadManifest {
         let mut total_chunks = 0;
         
         for entry in chunks_data {
-            total_chunks += entry.chunks.len();
+            total_chunks += entry.chunk_count;
+            
+            // Generiere Chunk-Hashes dynamisch basierend auf Position
+            // Format: "{file_hash}:{chunk_index}" für eindeutige Identifikation
+            let chunk_hashes: Vec<String> = (0..entry.chunk_count)
+                .map(|i| format!("{}:{}", entry.file_hash, i))
+                .collect();
+            
             chunks.insert(
                 entry.path.clone(),
                 FileChunkInfo {
-                    chunk_hashes: entry.chunks,
+                    chunk_hashes,
                     status: DownloadStatus::Pending,
                     downloaded_chunks: Vec::new(),
-                    file_size: None,
+                    file_size: Some(entry.file_size),
                 },
             );
         }
@@ -178,36 +185,33 @@ impl DownloadManifest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ChunkFileEntry {
     path: String,
-    chunks: Vec<String>,
+    file_hash: String,      // SHA-256 Hash der gesamten Datei
+    chunk_count: usize,     // Anzahl der 100MB Chunks
+    file_size: u64,         // Dateigröße in Bytes
 }
 
 /// Speichert einen Chunk temporär
 pub fn save_chunk(chunk_hash: &str, chunk_data: &[u8], chunks_dir: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
     fs::create_dir_all(chunks_dir)?;
     
-    // Entferne "sha256:" Präfix falls vorhanden
-    let hash_name = chunk_hash.strip_prefix("sha256:").unwrap_or(chunk_hash);
-    let chunk_path = chunks_dir.join(format!("{}.chunk", hash_name));
+    // Neues Format: "{file_hash}:{chunk_index}" - verwende gesamten String als Dateiname
+    // Ersetze ":" durch "_" für Dateinamen-Kompatibilität
+    let safe_hash_name = chunk_hash.replace(':', "_");
+    let chunk_path = chunks_dir.join(format!("{}.chunk", safe_hash_name));
     
     fs::write(&chunk_path, chunk_data)?;
     
-    // Validiere Hash
-    let mut hasher = Sha256::new();
-    hasher.update(chunk_data);
-    let computed_hash = hasher.finalize();
-    let computed_hex = hex::encode(computed_hash);
-    
-    if computed_hex != hash_name {
-        return Err(format!("Hash-Validierung fehlgeschlagen für Chunk {}", chunk_hash).into());
-    }
+    // Keine Hash-Validierung hier - wird später bei der Datei-Rekonstruktion validiert
+    // (da wir nur den file_hash haben, nicht den Chunk-Hash)
     
     Ok(chunk_path)
 }
 
 /// Lädt einen gespeicherten Chunk
 pub fn load_chunk(chunk_hash: &str, chunks_dir: &Path) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    let hash_name = chunk_hash.strip_prefix("sha256:").unwrap_or(chunk_hash);
-    let chunk_path = chunks_dir.join(format!("{}.chunk", hash_name));
+    // Neues Format: "{file_hash}:{chunk_index}" - ersetze ":" durch "_" für Dateinamen
+    let safe_hash_name = chunk_hash.replace(':', "_");
+    let chunk_path = chunks_dir.join(format!("{}.chunk", safe_hash_name));
     
     let data = fs::read(&chunk_path)?;
     Ok(data)
@@ -215,10 +219,12 @@ pub fn load_chunk(chunk_hash: &str, chunks_dir: &Path) -> Result<Vec<u8>, Box<dy
 
 /// Rekonstruiert eine Datei aus ihren Chunks
 pub fn reconstruct_file(
-    _file_path: &str,
+    file_path: &str,
     chunk_hashes: &[String],
     chunks_dir: &Path,
     output_path: &Path,
+    expected_file_hash: &str,
+    expected_file_size: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Stelle sicher, dass das Ausgabeverzeichnis existiert
     if let Some(parent) = output_path.parent() {
@@ -228,9 +234,39 @@ pub fn reconstruct_file(
     let mut file = fs::File::create(output_path)?;
     use std::io::Write;
     
-    for chunk_hash in chunk_hashes {
+    // Lade Chunks in der richtigen Reihenfolge (sortiert nach Index)
+    let mut chunk_indices: Vec<(usize, &String)> = chunk_hashes
+        .iter()
+        .enumerate()
+        .map(|(i, hash)| {
+            // Extrahiere Index aus Hash-Format "{file_hash}:{index}"
+            let index = hash.split(':').last().and_then(|s| s.parse::<usize>().ok()).unwrap_or(i);
+            (index, hash)
+        })
+        .collect();
+    chunk_indices.sort_by_key(|(idx, _)| *idx);
+    
+    for (_index, chunk_hash) in chunk_indices {
         let chunk_data = load_chunk(chunk_hash, chunks_dir)?;
         file.write_all(&chunk_data)?;
+    }
+    
+    // Validiere die rekonstruierte Datei mit dem file_hash
+    let mut hasher = Sha256::new();
+    let file_data = fs::read(output_path)?;
+    
+    // Prüfe Dateigröße
+    if file_data.len() as u64 != expected_file_size {
+        return Err(format!("Dateigröße stimmt nicht überein: erwartet {}, erhalten {}", expected_file_size, file_data.len()).into());
+    }
+    
+    // Prüfe Hash
+    hasher.update(&file_data);
+    let computed_hash = hasher.finalize();
+    let computed_hex = hex::encode(computed_hash);
+    
+    if computed_hex != expected_file_hash {
+        return Err(format!("Hash-Validierung fehlgeschlagen für Datei {}: erwartet {}, erhalten {}", file_path, expected_file_hash, computed_hex).into());
     }
     
     Ok(())
@@ -370,6 +406,21 @@ pub fn check_and_reconstruct_files(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let chunks_dir = get_chunks_dir(game_id)?;
     
+    // Lade deckdrop_chunks.toml um file_hash zu erhalten
+    let manifest_path = get_manifest_path(game_id)?;
+    let chunks_toml_path = manifest_path.parent()
+        .ok_or("Konnte Manifest-Verzeichnis nicht finden")?
+        .join("deckdrop_chunks.toml");
+    
+    let chunks_toml_content = fs::read_to_string(&chunks_toml_path)?;
+    let chunks_data: Vec<ChunkFileEntry> = toml::from_str(&chunks_toml_content)?;
+    
+    // Erstelle HashMap für schnellen Zugriff auf file_hash
+    let file_hashes: HashMap<String, (String, u64)> = chunks_data
+        .into_iter()
+        .map(|e| (e.path.clone(), (e.file_hash, e.file_size)))
+        .collect();
+    
     for (file_path, file_info) in &manifest.chunks {
         if file_info.status == DownloadStatus::Complete 
             && file_info.downloaded_chunks.len() == file_info.chunk_hashes.len() {
@@ -377,12 +428,24 @@ pub fn check_and_reconstruct_files(
             let output_path = PathBuf::from(&manifest.game_path).join(file_path);
             
             if !output_path.exists() {
-                // Rekonstruiere Datei nur wenn sie noch nicht existiert
-                if let Err(e) = reconstruct_file(file_path, &file_info.chunk_hashes, &chunks_dir, &output_path) {
-                    eprintln!("Fehler beim Rekonstruieren von {}: {}", file_path, e);
+                // Hole file_hash und file_size
+                if let Some((file_hash, file_size)) = file_hashes.get(file_path) {
+                    // Rekonstruiere Datei nur wenn sie noch nicht existiert
+                    if let Err(e) = reconstruct_file(
+                        file_path,
+                        &file_info.chunk_hashes,
+                        &chunks_dir,
+                        &output_path,
+                        file_hash,
+                        *file_size,
+                    ) {
+                        eprintln!("Fehler beim Rekonstruieren von {}: {}", file_path, e);
+                    } else {
+                        println!("Datei rekonstruiert: {}", file_path);
+                        eprintln!("Datei rekonstruiert: {}", file_path);
+                    }
                 } else {
-                    println!("Datei rekonstruiert: {}", file_path);
-                    eprintln!("Datei rekonstruiert: {}", file_path);
+                    eprintln!("Konnte file_hash für {} nicht finden", file_path);
                 }
             }
         }

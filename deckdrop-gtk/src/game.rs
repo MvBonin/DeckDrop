@@ -114,7 +114,9 @@ impl GameInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct FileChunkEntry {
     path: String,
-    chunks: Vec<String>,
+    file_hash: String,      // SHA-256 Hash der gesamten Datei
+    chunk_count: usize,     // Anzahl der 100MB Chunks
+    file_size: u64,         // Dateigröße in Bytes
 }
 
 /// Generiert die deckdrop_chunks.toml Datei für ein Spiel
@@ -169,36 +171,36 @@ where
             callback(file_index + 1, total_files, &path_str);
         }
         
-        // Öffne Datei und berechne Chunks
+        // Öffne Datei und berechne Hash der gesamten Datei
         let mut file = fs::File::open(&file_path)?;
         let file_size = file.metadata()?.len();
-        let mut chunks = Vec::new();
-        let mut buffer = vec![0u8; CHUNK_SIZE];
-        let mut chunk_index = 0;
+        
+        // Berechne Anzahl der Chunks (aufrunden)
+        let chunk_count = ((file_size as usize + CHUNK_SIZE - 1) / CHUNK_SIZE) as usize;
+        
+        // Berechne SHA-256 Hash der gesamten Datei
+        let mut hasher = Sha256::new();
+        let mut buffer = vec![0u8; 8192]; // 8KB Buffer für effizientes Lesen
         
         loop {
             let bytes_read = file.read(&mut buffer)?;
             if bytes_read == 0 {
                 break;
             }
-            
-            chunk_index += 1;
-            println!("  Chunk {}: {} Bytes", chunk_index, bytes_read);
-            
-            // Berechne SHA-256 Hash für diesen Chunk
-            let mut hasher = Sha256::new();
             hasher.update(&buffer[..bytes_read]);
-            let hash = hasher.finalize();
-            let hash_hex = hex::encode(hash);
-            chunks.push(hash_hex);
         }
         
-        println!("  Datei abgeschlossen: {} Chunks, {} Bytes", chunks.len(), file_size);
-        eprintln!("  Datei abgeschlossen: {} Chunks, {} Bytes", chunks.len(), file_size);
+        let hash = hasher.finalize();
+        let hash_hex = hex::encode(hash);
+        
+        println!("  Datei abgeschlossen: {} Chunks, {} Bytes, Hash: {}", chunk_count, file_size, hash_hex);
+        eprintln!("  Datei abgeschlossen: {} Chunks, {} Bytes, Hash: {}", chunk_count, file_size, hash_hex);
         
         file_entries.push(FileChunkEntry {
             path: path_str,
-            chunks,
+            file_hash: hash_hex,
+            chunk_count,
+            file_size,
         });
     }
     
