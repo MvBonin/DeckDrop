@@ -1,4 +1,4 @@
-name: Build Binary
+name: Build Binary + AppImage
 
 on:
   push:
@@ -10,6 +10,7 @@ on:
 jobs:
   build:
     runs-on: ubuntu-22.04
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -23,20 +24,50 @@ jobs:
       - name: Install Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libgtk-4-dev
+          sudo apt-get install -y libgtk-4-dev \
+                                  libfuse2 \
+                                  patchelf \
+                                  wget
 
       - name: Build Binary
         run: |
           cargo build --release --bin deckdrop-gtk
 
-      - name: Upload artifact (always)
+      - name: Prepare AppDir
+        run: |
+          mkdir -p AppDir/usr/bin
+          mkdir -p AppDir/usr/share/applications
+          mkdir -p AppDir/usr/share/icons/hicolor/256x256/apps
+
+          cp target/release/deckdrop-gtk AppDir/usr/bin/deckdrop
+          cp assets/deckdrop.desktop AppDir/usr/share/applications/
+          cp assets/deckdrop.png AppDir/usr/share/icons/hicolor/256x256/apps/
+
+      - name: Download appimagetool
+        run: |
+          wget https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x appimagetool-x86_64.AppImage
+
+      - name: Build AppImage
+        run: |
+          ./appimagetool-x86_64.AppImage AppDir DeckDrop-x86_64.AppImage
+
+      - name: Upload binary (always)
         uses: actions/upload-artifact@v4
         with:
           name: DeckDrop-Binary
           path: target/release/deckdrop-gtk
 
+      - name: Upload AppImage (always)
+        uses: actions/upload-artifact@v4
+        with:
+          name: DeckDrop-AppImage
+          path: DeckDrop-x86_64.AppImage
+
       - name: Upload to GitHub Release (only if tag)
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: target/release/deckdrop-gtk
+          files: |
+            target/release/deckdrop-gtk
+            DeckDrop-x86_64.AppImage

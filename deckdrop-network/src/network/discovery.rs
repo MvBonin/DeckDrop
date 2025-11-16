@@ -1451,8 +1451,8 @@ mod tests {
         assert_eq!(peer_info.addr, Some("2001:db8::1".to_string()));
     }
 
-    #[test]
-    fn test_discovery_behaviour_creation() {
+    #[tokio::test]
+    async fn test_discovery_behaviour_creation() {
         let peer_id = PeerId::random();
         let mdns_config = libp2p::mdns::Config::default();
         
