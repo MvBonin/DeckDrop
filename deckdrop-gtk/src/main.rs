@@ -2,6 +2,7 @@ mod config;
 mod settings;
 mod game;
 mod synch;
+mod gamechecker;
 
 use deckdrop_network::network::discovery::{start_discovery, DiscoveryEvent};
 use deckdrop_network::network::peer::PeerInfo;

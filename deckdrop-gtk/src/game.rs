@@ -2,7 +2,6 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::io::Read;
-use sha2::{Sha256, Digest};
 use hex;
 
 /// Struktur für Spiel-Informationen
@@ -20,7 +19,7 @@ pub struct GameInfo {
     #[serde(default)]
     pub creator_peer_id: Option<String>,
     #[serde(default)]
-    pub hash: Option<String>, // SHA-256 Hash der deckdrop_chunks.toml im Format "sha256:XYZ"
+    pub hash: Option<String>, // Blake3 Hash der deckdrop_chunks.toml im Format "blake3:XYZ"
 }
 
 /// Generiert eine eindeutige Spiel-ID
@@ -115,7 +114,7 @@ impl GameInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct FileChunkEntry {
     path: String,
-    file_hash: String,      // SHA-256 Hash der gesamten Datei
+    file_hash: String,      // Blake3 Hash der gesamten Datei
     chunk_count: i64,       // Anzahl der 100MB Chunks (i64 für TOML)
     file_size: i64,         // Dateigröße in Bytes (i64 für TOML)
 }
@@ -124,9 +123,9 @@ struct FileChunkEntry {
 /// Generiert die deckdrop_chunks.toml Datei für ein Spiel
 /// 
 /// Diese Funktion durchsucht das Spielverzeichnis rekursiv und erstellt für jede Datei
-/// eine Liste von SHA-256 Hashes für 100MB Chunks.
+/// einen Hash (Blake3, Standard) für die gesamte Datei.
 /// 
-/// Gibt den SHA-256 Hash der generierten Datei zurück (im Format "sha256:XYZ").
+/// Gibt den Blake3 Hash der generierten Datei zurück (im Format "blake3:XYZ").
 /// 
 /// `progress_callback`: Optionaler Callback, der mit (aktuelle_datei, gesamt_dateien, aktuelle_datei_name) aufgerufen wird
 pub fn generate_chunks_toml<F>(game_path: &Path, progress_callback: Option<F>) -> Result<String, Box<dyn std::error::Error>>
@@ -180,20 +179,8 @@ where
         // Berechne Anzahl der Chunks (aufrunden)
         let chunk_count = ((file_size as usize + CHUNK_SIZE - 1) / CHUNK_SIZE) as usize;
         
-        // Berechne SHA-256 Hash der gesamten Datei
-        let mut hasher = Sha256::new();
-        let mut buffer = vec![0u8; 8192]; // 8KB Buffer für effizientes Lesen
-        
-        loop {
-            let bytes_read = file.read(&mut buffer)?;
-            if bytes_read == 0 {
-                break;
-            }
-            hasher.update(&buffer[..bytes_read]);
-        }
-        
-        let hash = hasher.finalize();
-        let hash_hex = hex::encode(hash);
+        // Berechne Blake3 Hash der gesamten Datei mit wiederverwendbarer Funktion
+        let hash_hex = crate::gamechecker::calculate_file_hash(&file_path)?;
         
         println!("  Datei abgeschlossen: {} Chunks, {} Bytes, Hash: {}", chunk_count, file_size, hash_hex);
         eprintln!("  Datei abgeschlossen: {} Chunks, {} Bytes, Hash: {}", chunk_count, file_size, hash_hex);
@@ -213,12 +200,18 @@ where
     // Verwende jetzt serde Serialisierung mit den benutzerdefinierten Serializern
     let toml_string = toml::to_string_pretty(&file_entries)?;
     
-    // Berechne SHA-256 Hash der generierten Datei (vor dem Schreiben)
-    let mut hasher = Sha256::new();
-    hasher.update(toml_string.as_bytes());
-    let hash = hasher.finalize();
-    let hash_hex = hex::encode(hash);
-    let hash_string = format!("sha256:{}", hash_hex);
+    // Berechne Blake3 Hash der generierten Datei (vor dem Schreiben)
+    use crate::gamechecker::calculate_file_hash;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+    
+    // Schreibe TOML in temporäre Datei für Hash-Berechnung
+    let mut temp_file = NamedTempFile::new()?;
+    temp_file.write_all(toml_string.as_bytes())?;
+    temp_file.flush()?;
+    
+    let hash_hex = calculate_file_hash(temp_file.path())?;
+    let hash_string = format!("blake3:{}", hash_hex);
     
     // Schreibe die Datei
     fs::write(&chunks_toml_path, toml_string)?;
@@ -361,6 +354,7 @@ mod tests {
             start_args: Some("--fullscreen".to_string()),
             description: Some("Ein Test-Spiel".to_string()),
             creator_peer_id: Some("peer-123".to_string()),
+            hash: None,
         };
         
         // Serialisiere zu TOML
@@ -390,6 +384,7 @@ mod tests {
             start_args: None,
             description: None,
             creator_peer_id: None,
+            hash: None,
         };
         
         // Beim Deserialisieren sollte game_id durch default generiert werden

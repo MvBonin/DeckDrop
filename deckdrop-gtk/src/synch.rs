@@ -2,7 +2,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use sha2::{Sha256, Digest};
 use hex;
 
 /// Manifest-Struktur für Download-Status
@@ -63,8 +62,13 @@ impl DownloadManifest {
         game_path: String,
         chunks_toml_content: &str,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        // Parse deckdrop_chunks.toml
-        let chunks_data: Vec<ChunkFileEntry> = toml::from_str(chunks_toml_content)?;
+        // Parse deckdrop_chunks.toml - Format: [[file]]
+        #[derive(Deserialize)]
+        struct ChunksToml {
+            file: Vec<ChunkFileEntry>,
+        }
+        let chunks_toml: ChunksToml = toml::from_str(chunks_toml_content)?;
+        let chunks_data = chunks_toml.file;
         
         let mut chunks = HashMap::new();
         let mut total_chunks = 0;
@@ -187,7 +191,7 @@ impl DownloadManifest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ChunkFileEntry {
     path: String,
-    file_hash: String,      // SHA-256 Hash der gesamten Datei
+    file_hash: String,      // Blake3 Hash der gesamten Datei
     chunk_count: i64,       // Anzahl der 100MB Chunks (i64 für TOML)
     file_size: i64,         // Dateigröße in Bytes (i64 für TOML)
 }
@@ -253,8 +257,7 @@ pub fn reconstruct_file(
         file.write_all(&chunk_data)?;
     }
     
-    // Validiere die rekonstruierte Datei mit dem file_hash
-    let mut hasher = Sha256::new();
+    // Validiere die rekonstruierte Datei mit dem file_hash (Blake3)
     let file_data = fs::read(output_path)?;
     
     // Prüfe Dateigröße
@@ -262,13 +265,13 @@ pub fn reconstruct_file(
         return Err(format!("Dateigröße stimmt nicht überein: erwartet {}, erhalten {}", expected_file_size, file_data.len()).into());
     }
     
-    // Prüfe Hash
-    hasher.update(&file_data);
-    let computed_hash = hasher.finalize();
-    let computed_hex = hex::encode(computed_hash);
+    // Prüfe Hash (Blake3)
+    use crate::gamechecker::calculate_file_hash;
+    let computed_hash = calculate_file_hash(output_path)?;
     
-    if computed_hex != expected_file_hash {
-        return Err(format!("Hash-Validierung fehlgeschlagen für Datei {}: erwartet {}, erhalten {}", file_path, expected_file_hash, computed_hex).into());
+    if computed_hash != expected_file_hash {
+        return Err(format!("Hash-Validierung fehlgeschlagen für Datei {}: erwartet {}, erhalten {}", 
+            file_path, expected_file_hash, computed_hash).into());
     }
     
     Ok(())
@@ -415,7 +418,12 @@ pub fn check_and_reconstruct_files(
         .join("deckdrop_chunks.toml");
     
     let chunks_toml_content = fs::read_to_string(&chunks_toml_path)?;
-    let chunks_data: Vec<ChunkFileEntry> = toml::from_str(&chunks_toml_content)?;
+    #[derive(Deserialize)]
+    struct ChunksToml {
+        file: Vec<ChunkFileEntry>,
+    }
+    let chunks_toml: ChunksToml = toml::from_str(&chunks_toml_content)?;
+    let chunks_data = chunks_toml.file;
     
     // Erstelle HashMap für schnellen Zugriff auf file_hash
     let file_hashes: HashMap<String, (String, u64)> = chunks_data
@@ -511,4 +519,231 @@ pub fn cancel_game_download(game_id: &str) -> Result<(), Box<dyn std::error::Err
     eprintln!("Download abgebrochen und Daten gelöscht für Spiel: {}", game_id);
     
     Ok(())
+}
+
+// Integritätsprüfung wurde nach gamechecker.rs verschoben
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn test_download_manifest_from_chunks_toml() {
+        let chunks_toml = r#"[[file]]
+path = "test.bin"
+file_hash = "abc123def456"
+chunk_count = 2
+file_size = 150000000
+"#;
+        
+        let manifest = DownloadManifest::from_chunks_toml(
+            "test-game".to_string(),
+            "Test Game".to_string(),
+            "/path/to/game".to_string(),
+            chunks_toml,
+        ).unwrap();
+        
+        assert_eq!(manifest.game_id, "test-game");
+        assert_eq!(manifest.game_name, "Test Game");
+        assert_eq!(manifest.progress.total_chunks, 2);
+        assert_eq!(manifest.chunks.len(), 1);
+        
+        let file_info = manifest.chunks.get("test.bin").unwrap();
+        assert_eq!(file_info.chunk_hashes.len(), 2);
+        assert_eq!(file_info.chunk_hashes[0], "abc123def456:0");
+        assert_eq!(file_info.chunk_hashes[1], "abc123def456:1");
+    }
+
+    #[test]
+    fn test_save_and_load_chunk() {
+        let temp_dir = TempDir::new().unwrap();
+        let chunks_dir = temp_dir.path();
+        
+        let chunk_hash = "test_file:0";
+        let chunk_data = vec![1, 2, 3, 4, 5];
+        
+        let saved_path = save_chunk(chunk_hash, &chunk_data, chunks_dir).unwrap();
+        assert!(saved_path.exists());
+        
+        let loaded_data = load_chunk(chunk_hash, chunks_dir).unwrap();
+        assert_eq!(loaded_data, chunk_data);
+    }
+
+    #[test]
+    fn test_reconstruct_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let chunks_dir = temp_dir.path();
+        let output_dir = temp_dir.path().join("output");
+        fs::create_dir_all(&output_dir).unwrap();
+        
+        // Erstelle Test-Datei
+        let mut test_data = vec![0u8; 150 * 1024 * 1024]; // 150MB
+        for i in 0..test_data.len() {
+            // Fülle mit Mustern
+            test_data[i] = (i % 256) as u8;
+        }
+        
+        // Berechne Hash (Blake3)
+        use crate::gamechecker::calculate_file_hash;
+        use tempfile::NamedTempFile;
+        use std::io::Write;
+        
+        let mut temp_file = NamedTempFile::new().unwrap();
+        temp_file.write_all(&test_data).unwrap();
+        temp_file.flush().unwrap();
+        let file_hash = calculate_file_hash(temp_file.path()).unwrap();
+        
+        // Teile in Chunks (2 Chunks: 100MB + 50MB)
+        let chunk1 = &test_data[0..100 * 1024 * 1024];
+        let chunk2 = &test_data[100 * 1024 * 1024..];
+        
+        // Speichere Chunks
+        save_chunk(&format!("{}:0", file_hash), chunk1, chunks_dir).unwrap();
+        save_chunk(&format!("{}:1", file_hash), chunk2, chunks_dir).unwrap();
+        
+        // Rekonstruiere
+        let output_path = output_dir.join("test.bin");
+        let chunk_hashes = vec![
+            format!("{}:0", file_hash),
+            format!("{}:1", file_hash),
+        ];
+        
+        reconstruct_file(
+            "test.bin",
+            &chunk_hashes,
+            chunks_dir,
+            &output_path,
+            &file_hash,
+            test_data.len() as u64,
+        ).unwrap();
+        
+        // Prüfe rekonstruierte Datei
+        let reconstructed = fs::read(&output_path).unwrap();
+        assert_eq!(reconstructed.len(), test_data.len());
+        assert_eq!(reconstructed, test_data);
+    }
+
+
+    #[tokio::test]
+    async fn test_two_peers_chunk_exchange() {
+        // Erstelle temporäres Verzeichnis für beide Peers
+        let temp_dir1 = TempDir::new().unwrap();
+        let temp_dir2 = TempDir::new().unwrap();
+        
+        let game_id = "test-game-2peers";
+        
+        // Peer 1: Hat das Spiel
+        let game_path1 = temp_dir1.path().join("game");
+        fs::create_dir_all(&game_path1).unwrap();
+        
+        // Erstelle Test-Datei für Peer 1 (200MB)
+        let test_data = vec![42u8; 200 * 1024 * 1024];
+        let test_file_path = game_path1.join("test.bin");
+        fs::write(&test_file_path, &test_data).unwrap();
+        
+        // Berechne Hash mit wiederverwendbarer Funktion
+        let computed_hash = crate::gamechecker::calculate_file_hash(&test_file_path).unwrap();
+        
+        // Erstelle deckdrop_chunks.toml für Peer 1
+        let chunks_toml = format!(
+            r#"[[file]]
+path = "test.bin"
+file_hash = "{}"
+chunk_count = 2
+file_size = {}
+"#,
+            computed_hash, test_data.len()
+        );
+        
+        fs::write(game_path1.join("deckdrop_chunks.toml"), chunks_toml).unwrap();
+        
+        // Peer 2: Startet Download
+        let game_path2 = temp_dir2.path().join("game");
+        let chunks_dir2 = temp_dir2.path().join("chunks");
+        fs::create_dir_all(&chunks_dir2).unwrap();
+        
+        // Erstelle Manifest für Peer 2
+        let deckdrop_toml = format!(
+            r#"game_id = "{}"
+name = "Test Game"
+version = "1.0"
+start_file = "test.bin"
+"#,
+            game_id
+        );
+        
+        let deckdrop_chunks_toml = format!(
+            r#"[[file]]
+path = "test.bin"
+file_hash = "{}"
+chunk_count = 2
+file_size = {}
+"#,
+            computed_hash, test_data.len()
+        );
+        
+        // Starte Download für Peer 2
+        start_game_download(game_id, &deckdrop_toml, &deckdrop_chunks_toml).unwrap();
+        
+        // Simuliere Chunk-Transfer von Peer 1 zu Peer 2
+        // Chunk 1: 0-100MB
+        let chunk1 = &test_data[0..100 * 1024 * 1024];
+        let chunk1_hash = format!("{}:0", computed_hash);
+        save_chunk(&chunk1_hash, chunk1, &chunks_dir2).unwrap();
+        
+        // Chunk 2: 100-200MB
+        let chunk2 = &test_data[100 * 1024 * 1024..];
+        let chunk2_hash = format!("{}:1", computed_hash);
+        save_chunk(&chunk2_hash, chunk2, &chunks_dir2).unwrap();
+        
+        // Lade Manifest und markiere Chunks als heruntergeladen
+        let manifest_path = get_manifest_path(game_id).unwrap();
+        let mut manifest = DownloadManifest::load(&manifest_path).unwrap();
+        
+        manifest.mark_chunk_downloaded(&chunk1_hash);
+        manifest.mark_chunk_downloaded(&chunk2_hash);
+        manifest.save(&manifest_path).unwrap();
+        
+        // Prüfe ob alle Chunks vorhanden sind
+        assert_eq!(manifest.progress.downloaded_chunks, 2);
+        assert_eq!(manifest.progress.total_chunks, 2);
+        
+        // Rekonstruiere Datei
+        let output_path = game_path2.join("test.bin");
+        let file_info = manifest.chunks.get("test.bin").unwrap();
+        
+        reconstruct_file(
+            "test.bin",
+            &file_info.chunk_hashes,
+            &chunks_dir2,
+            &output_path,
+            &computed_hash,
+            test_data.len() as u64,
+        ).unwrap();
+        
+        // Prüfe rekonstruierte Datei
+        let reconstructed = fs::read(&output_path).unwrap();
+        assert_eq!(reconstructed.len(), test_data.len());
+        assert_eq!(reconstructed, test_data);
+        
+        // Erstelle deckdrop_chunks.toml für Integritätsprüfung
+        let chunks_toml_for_check = format!(
+            r#"[[file]]
+path = "test.bin"
+file_hash = "{}"
+chunk_count = 2
+file_size = {}
+"#,
+            computed_hash, test_data.len()
+        );
+        fs::write(game_path2.join("deckdrop_chunks.toml"), chunks_toml_for_check).unwrap();
+        
+        // Prüfe Integrität
+        let integrity_result = crate::gamechecker::verify_game_integrity(&game_path2).unwrap();
+        assert_eq!(integrity_result.verified_files, 1);
+        assert_eq!(integrity_result.failed_files.len(), 0);
+        
+        println!("✓ Test erfolgreich: Zwei Peers haben Chunks ausgetauscht und Datei rekonstruiert!");
+    }
 }

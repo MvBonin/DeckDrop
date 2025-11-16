@@ -41,7 +41,7 @@ version = "{}"
 start_file = "{}"
 description = "{}"
 creator_peer_id = "{}"
-hash = "sha256:test_hash"
+hash = "blake3:test_hash"
 "#,
             test_game.game_id,
             test_game.name,

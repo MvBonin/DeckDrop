@@ -300,12 +300,13 @@ pub fn create_game_metadata_behaviour() -> GameMetadataBehaviour {
 /// Request zum Abfragen eines Chunks
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChunkRequest {
-    pub chunk_hash: String,  // SHA-256 Hash im Format "sha256:XYZ"
+    pub chunk_hash: String,  // Blake3 Hash im Format "{hash}:{chunk_index}"
 }
 
 /// Response mit Chunk-Daten
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChunkResponse {
+    pub chunk_hash: String,   // Der Hash des Chunks (zur Identifikation)
     pub chunk_data: Vec<u8>,  // Die Chunk-Daten (max 10MB)
 }
 
@@ -339,7 +340,18 @@ impl Codec for ChunkCodec {
         T: AsyncRead + Unpin + Send,
     {
         // Für Chunk-Responses verwenden wir binäres Format (nicht JSON)
-        // Lese Länge (4 Bytes)
+        // Lese chunk_hash Länge (4 Bytes)
+        let mut hash_len_bytes = [0u8; 4];
+        io.read_exact(&mut hash_len_bytes).await?;
+        let hash_len = u32::from_be_bytes(hash_len_bytes) as usize;
+        
+        // Lese chunk_hash
+        let mut chunk_hash_bytes = vec![0u8; hash_len];
+        io.read_exact(&mut chunk_hash_bytes).await?;
+        let chunk_hash = String::from_utf8(chunk_hash_bytes)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        
+        // Lese Chunk-Daten Länge (4 Bytes)
         let mut len_bytes = [0u8; 4];
         io.read_exact(&mut len_bytes).await?;
         let data_len = u32::from_be_bytes(len_bytes) as usize;
@@ -348,7 +360,7 @@ impl Codec for ChunkCodec {
         let mut chunk_data = vec![0u8; data_len];
         io.read_exact(&mut chunk_data).await?;
         
-        Ok(ChunkResponse { chunk_data })
+        Ok(ChunkResponse { chunk_hash, chunk_data })
     }
 
     async fn write_request<T>(&mut self, _protocol: &Self::Protocol, io: &mut T, req: Self::Request) -> io::Result<()>
@@ -370,11 +382,16 @@ impl Codec for ChunkCodec {
     where
         T: AsyncWrite + Unpin + Send,
     {
-        // Schreibe Länge (4 Bytes)
-        let len = res.chunk_data.len() as u32;
-        io.write_all(&len.to_be_bytes()).await?;
+        // Für Chunk-Responses verwenden wir binäres Format (nicht JSON)
+        // Schreibe chunk_hash Länge und chunk_hash
+        let hash_bytes = res.chunk_hash.as_bytes();
+        let hash_len = hash_bytes.len() as u32;
+        io.write_all(&hash_len.to_be_bytes()).await?;
+        io.write_all(hash_bytes).await?;
         
-        // Schreibe Chunk-Daten
+        // Schreibe Chunk-Daten Länge und Chunk-Daten
+        let data_len = res.chunk_data.len() as u32;
+        io.write_all(&data_len.to_be_bytes()).await?;
         io.write_all(&res.chunk_data).await?;
         io.flush().await?;
         
@@ -836,12 +853,13 @@ pub fn create_game_metadata_behaviour() -> GameMetadataBehaviour {
 /// Request zum Abfragen eines Chunks
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChunkRequest {
-    pub chunk_hash: String,  // SHA-256 Hash im Format "sha256:XYZ"
+    pub chunk_hash: String,  // Blake3 Hash im Format "{hash}:{chunk_index}"
 }
 
 /// Response mit Chunk-Daten
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChunkResponse {
+    pub chunk_hash: String,   // Der Hash des Chunks (zur Identifikation)
     pub chunk_data: Vec<u8>,  // Die Chunk-Daten (max 10MB)
 }
 
@@ -875,7 +893,18 @@ impl Codec for ChunkCodec {
         T: AsyncRead + Unpin + Send,
     {
         // Für Chunk-Responses verwenden wir binäres Format (nicht JSON)
-        // Lese Länge (4 Bytes)
+        // Lese chunk_hash Länge (4 Bytes)
+        let mut hash_len_bytes = [0u8; 4];
+        io.read_exact(&mut hash_len_bytes).await?;
+        let hash_len = u32::from_be_bytes(hash_len_bytes) as usize;
+        
+        // Lese chunk_hash
+        let mut chunk_hash_bytes = vec![0u8; hash_len];
+        io.read_exact(&mut chunk_hash_bytes).await?;
+        let chunk_hash = String::from_utf8(chunk_hash_bytes)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        
+        // Lese Chunk-Daten Länge (4 Bytes)
         let mut len_bytes = [0u8; 4];
         io.read_exact(&mut len_bytes).await?;
         let data_len = u32::from_be_bytes(len_bytes) as usize;
@@ -884,7 +913,7 @@ impl Codec for ChunkCodec {
         let mut chunk_data = vec![0u8; data_len];
         io.read_exact(&mut chunk_data).await?;
         
-        Ok(ChunkResponse { chunk_data })
+        Ok(ChunkResponse { chunk_hash, chunk_data })
     }
 
     async fn write_request<T>(&mut self, _protocol: &Self::Protocol, io: &mut T, req: Self::Request) -> io::Result<()>
@@ -906,11 +935,16 @@ impl Codec for ChunkCodec {
     where
         T: AsyncWrite + Unpin + Send,
     {
-        // Schreibe Länge (4 Bytes)
-        let len = res.chunk_data.len() as u32;
-        io.write_all(&len.to_be_bytes()).await?;
+        // Für Chunk-Responses verwenden wir binäres Format (nicht JSON)
+        // Schreibe chunk_hash Länge und chunk_hash
+        let hash_bytes = res.chunk_hash.as_bytes();
+        let hash_len = hash_bytes.len() as u32;
+        io.write_all(&hash_len.to_be_bytes()).await?;
+        io.write_all(hash_bytes).await?;
         
-        // Schreibe Chunk-Daten
+        // Schreibe Chunk-Daten Länge und Chunk-Daten
+        let data_len = res.chunk_data.len() as u32;
+        io.write_all(&data_len.to_be_bytes()).await?;
         io.write_all(&res.chunk_data).await?;
         io.flush().await?;
         

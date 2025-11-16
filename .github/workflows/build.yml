@@ -1,0 +1,45 @@
+name: Build AppImage
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*.*.*"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          override: true
+
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.0-dev squashfs-tools fuse
+
+      - name: Build AppImage
+        run: |
+          cargo install tauri-cli
+          yarn install # falls du yarn/bun/npm nutzt – sonst entfernen
+          yarn tauri build # oder bun/tauri/whatever du nutzt
+          cp src-tauri/target/release/bundle/appimage/*.AppImage DeckDrop.AppImage
+
+      - name: Upload artifact (always)
+        uses: actions/upload-artifact@v4
+        with:
+          name: DeckDrop-AppImage
+          path: DeckDrop.AppImage
+
+      - name: Upload to GitHub Release (only if tag)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: DeckDrop.AppImage

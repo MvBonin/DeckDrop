@@ -599,31 +599,43 @@ pub async fn run_discovery(
                                         // Lade Chunk über den Callback, falls vorhanden
                                         let response = if let Some(ref loader) = chunk_loader_clone {
                                             if let Some(chunk_data) = loader(&request.chunk_hash) {
-                                                ChunkResponse { chunk_data }
+                                                ChunkResponse { 
+                                                    chunk_hash: request.chunk_hash.clone(),
+                                                    chunk_data 
+                                                }
                                             } else {
                                                 // Chunk nicht gefunden
                                                 eprintln!("Chunk {} nicht gefunden", request.chunk_hash);
-                                                ChunkResponse { chunk_data: Vec::new() }
+                                                ChunkResponse { 
+                                                    chunk_hash: request.chunk_hash.clone(),
+                                                    chunk_data: Vec::new() 
+                                                }
                                             }
                                         } else {
-                                            ChunkResponse { chunk_data: Vec::new() }
+                                            ChunkResponse { 
+                                                chunk_hash: request.chunk_hash.clone(),
+                                                chunk_data: Vec::new() 
+                                            }
                                         };
                                         let _ = swarm.behaviour_mut().chunks.send_response(channel, response);
                                     }
                                     libp2p::request_response::Message::Response { request_id: _, response, .. } => {
                                         // Wir haben einen Chunk erhalten
-                                        // TODO: Verwende request_id für Tracking
-                                        // Für jetzt: chunk_hash muss aus dem Request-Kontext kommen
-                                        // Da wir request_id nicht tracken können, verwenden wir einen anderen Ansatz:
-                                        // Der chunk_hash wird später aus dem Manifest gesucht
                                         let peer_id_str = peer.to_string();
-                                        println!("Chunk Response erhalten von {}: {} Bytes", peer_id_str, response.chunk_data.len());
-                                        eprintln!("Chunk Response erhalten von {}: {} Bytes", peer_id_str, response.chunk_data.len());
+                                        println!("Chunk Response erhalten von {}: {} Bytes für hash {}", 
+                                            peer_id_str, response.chunk_data.len(), response.chunk_hash);
+                                        eprintln!("Chunk Response erhalten von {}: {} Bytes für hash {}", 
+                                            peer_id_str, response.chunk_data.len(), response.chunk_hash);
                                         
-                                        // TODO: Implementiere korrektes Request-ID-Tracking
-                                        // Für jetzt: chunk_hash wird nicht übermittelt - muss aus Manifest gesucht werden
-                                        // Dies ist ein temporärer Workaround
-                                        eprintln!("Warnung: Chunk Response ohne chunk_hash - Implementierung unvollständig");
+                                        // Sende Event mit chunk_hash
+                                        let event_tx_for_chunk = event_tx_clone.clone();
+                                        tokio::spawn(async move {
+                                            let _ = event_tx_for_chunk.send(DiscoveryEvent::ChunkReceived {
+                                                peer_id: peer_id_str,
+                                                chunk_hash: response.chunk_hash.clone(),
+                                                chunk_data: response.chunk_data.clone(),
+                                            }).await;
+                                        });
                                     }
                                 }
                             }
@@ -1710,6 +1722,15 @@ mod tests {
                         }
                         Some(DiscoveryEvent::GamesListReceived { .. }) => {
                             // Ignoriere GamesListReceived Events in diesem Test
+                        }
+                        Some(DiscoveryEvent::GameMetadataReceived { .. }) => {
+                            // Ignoriere GameMetadataReceived Events in diesem Test
+                        }
+                        Some(DiscoveryEvent::ChunkReceived { .. }) => {
+                            // Ignoriere ChunkReceived Events in diesem Test
+                        }
+                        Some(DiscoveryEvent::ChunkRequestFailed { .. }) => {
+                            // Ignoriere ChunkRequestFailed Events in diesem Test
                         }
                         None => break,
                     }
