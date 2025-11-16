@@ -196,9 +196,20 @@ where
     // Sortiere nach Pfad, um konsistente Reihenfolge zu gewährleisten
     file_entries.sort_by(|a, b| a.path.cmp(&b.path));
     
-    // Speichere als TOML
-    // Verwende jetzt serde Serialisierung mit den benutzerdefinierten Serializern
-    let toml_string = toml::to_string_pretty(&file_entries)?;
+    // Speichere als TOML im Format [[file]]
+    // Verwende Wrapper-Struktur für korrektes TOML-Format (Array von Tabellen)
+    use serde::Serialize;
+    #[derive(Serialize)]
+    struct ChunksToml {
+        #[serde(rename = "file")]
+        file: Vec<FileChunkEntry>,
+    }
+    
+    let chunks_toml = ChunksToml {
+        file: file_entries,
+    };
+    
+    let toml_string = toml::to_string_pretty(&chunks_toml)?;
     
     // Berechne Blake3 Hash der generierten Datei (vor dem Schreiben)
     use crate::gamechecker::calculate_file_hash;
@@ -394,6 +405,69 @@ mod tests {
         // Wenn game_id leer war, sollte sie durch default generiert werden
         // Aber in diesem Fall ist sie explizit leer, also testen wir die Serialisierung
         assert!(toml_string.contains("name = \"Test\""));
+    }
+
+    #[test]
+    fn test_generate_chunks_toml_write_and_delete() {
+        use tempfile::TempDir;
+        
+        // Erstelle temporäres Verzeichnis
+        let temp_dir = TempDir::new().unwrap();
+        let game_path = temp_dir.path();
+        
+        // Erstelle eine Dummy-Datei
+        let dummy_file_path = game_path.join("dummy.txt");
+        let dummy_content = b"This is a test file for the TOML chunk test";
+        fs::write(&dummy_file_path, dummy_content).unwrap();
+        
+        // Generiere deckdrop_chunks.toml (ohne Progress-Callback)
+        let hash_result: Result<String, Box<dyn std::error::Error>> = generate_chunks_toml(game_path, None::<fn(usize, usize, &str)>);
+        assert!(hash_result.is_ok(), "generate_chunks_toml sollte erfolgreich sein");
+        
+        let hash_string = hash_result.unwrap();
+        assert!(hash_string.starts_with("blake3:"), "Hash sollte mit 'blake3:' beginnen");
+        
+        // Prüfe ob deckdrop_chunks.toml erstellt wurde
+        let chunks_toml_path = game_path.join("deckdrop_chunks.toml");
+        assert!(chunks_toml_path.exists(), "deckdrop_chunks.toml sollte existieren");
+        
+        // Lese und prüfe TOML-Inhalt
+        let toml_content = fs::read_to_string(&chunks_toml_path).unwrap();
+        assert!(toml_content.contains("[[file]]"), "TOML sollte [[file]] Format haben");
+        assert!(toml_content.contains("path = \"dummy.txt\""), "TOML sollte dummy.txt enthalten");
+        assert!(toml_content.contains("file_hash"), "TOML sollte file_hash enthalten");
+        assert!(toml_content.contains("chunk_count"), "TOML sollte chunk_count enthalten");
+        assert!(toml_content.contains("file_size"), "TOML sollte file_size enthalten");
+        
+        // Prüfe ob TOML korrekt geparst werden kann
+        // Verwende toml::Value für flexibles Parsing
+        use toml::Value;
+        let parsed: Value = toml::from_str(&toml_content)
+            .expect("TOML sollte korrekt geparst werden können");
+        
+        // Prüfe ob die Struktur korrekt ist
+        if let Some(Value::Array(file_array)) = parsed.get("file") {
+            assert_eq!(file_array.len(), 1, "Es sollte genau eine Datei geben");
+            if let Some(Value::Table(file_entry)) = file_array.first() {
+                assert_eq!(file_entry.get("path").and_then(|v| v.as_str()), Some("dummy.txt"));
+                assert_eq!(file_entry.get("file_size").and_then(|v| v.as_integer()), Some(dummy_content.len() as i64));
+                assert_eq!(file_entry.get("chunk_count").and_then(|v| v.as_integer()), Some(1)); // Kleine Datei = 1 Chunk
+            } else {
+                panic!("File entry sollte eine Tabelle sein");
+            }
+        } else {
+            panic!("TOML sollte ein 'file' Array enthalten");
+        }
+        
+        // Lösche deckdrop_chunks.toml
+        fs::remove_file(&chunks_toml_path).unwrap();
+        assert!(!chunks_toml_path.exists(), "deckdrop_chunks.toml sollte gelöscht sein");
+        
+        // Lösche auch die Dummy-Datei
+        fs::remove_file(&dummy_file_path).unwrap();
+        assert!(!dummy_file_path.exists(), "dummy.txt sollte gelöscht sein");
+        
+        // TempDir wird automatisch gelöscht wenn es out of scope geht
     }
 }
 
