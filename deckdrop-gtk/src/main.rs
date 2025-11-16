@@ -398,32 +398,50 @@ fn build_ui(app: &Application) {
                     // Lade deckdrop_chunks.toml um Datei mit diesem file_hash zu finden
                     let chunks_toml_path = game_path.join("deckdrop_chunks.toml");
                     if let Ok(chunks_toml_content) = std::fs::read_to_string(&chunks_toml_path) {
-                        // Parse chunks.toml
-                        if let Ok(chunks_data) = toml::from_str::<Vec<serde_json::Value>>(&chunks_toml_content) {
-                            for entry in chunks_data {
+                        // Parse chunks.toml im korrekten Format [[file]]
+                        #[derive(serde::Deserialize)]
+                        struct ChunksToml {
+                            file: Vec<ChunkFileEntry>,
+                        }
+                        #[derive(serde::Deserialize)]
+                        struct ChunkFileEntry {
+                            path: String,
+                            file_hash: String,
+                            chunk_count: i64,
+                            file_size: i64,
+                        }
+                        
+                        if let Ok(chunks_toml) = toml::from_str::<ChunksToml>(&chunks_toml_content) {
+                            for entry in chunks_toml.file {
                                 // Prüfe ob file_hash übereinstimmt
-                                if let Some(entry_file_hash) = entry.get("file_hash").and_then(|h| h.as_str()) {
-                                    if entry_file_hash == file_hash {
+                                if entry.file_hash == file_hash {
+                                    // Prüfe ob chunk_index gültig ist
+                                    if chunk_index < entry.chunk_count as usize {
                                         // Datei gefunden - extrahiere Chunk basierend auf Index
-                                        if let Some(file_path) = entry.get("path").and_then(|p| p.as_str()) {
-                                            let full_path = game_path.join(file_path);
-                                            if let Ok(mut file) = std::fs::File::open(&full_path) {
-                                                use std::io::{Read, Seek, SeekFrom};
-                                                const CHUNK_SIZE: usize = 100 * 1024 * 1024; // 100MB
-                                                
-                                                // Springe zum richtigen Chunk
-                                                let offset = (chunk_index as u64) * (CHUNK_SIZE as u64);
-                                                if file.seek(SeekFrom::Start(offset)).is_ok() {
-                                                    let mut buffer = vec![0u8; CHUNK_SIZE];
-                                                    if let Ok(bytes_read) = file.read(&mut buffer) {
-                                                        if bytes_read > 0 {
-                                                            buffer.truncate(bytes_read);
-                                                            return Some(buffer);
-                                                        }
+                                        let full_path = game_path.join(&entry.path);
+                                        if let Ok(mut file) = std::fs::File::open(&full_path) {
+                                            use std::io::{Read, Seek, SeekFrom};
+                                            const CHUNK_SIZE: usize = 100 * 1024 * 1024; // 100MB
+                                            
+                                            // Springe zum richtigen Chunk
+                                            let offset = (chunk_index as u64) * (CHUNK_SIZE as u64);
+                                            if file.seek(SeekFrom::Start(offset)).is_ok() {
+                                                let mut buffer = vec![0u8; CHUNK_SIZE];
+                                                if let Ok(bytes_read) = file.read(&mut buffer) {
+                                                    if bytes_read > 0 {
+                                                        buffer.truncate(bytes_read);
+                                                        
+                                                        // Validiere Chunk-Hash (optional, aber empfohlen)
+                                                        // Der Chunk-Hash sollte "{file_hash}:{chunk_index}" sein
+                                                        // Wir können hier die Chunk-Daten validieren
+                                                        return Some(buffer);
                                                     }
                                                 }
                                             }
                                         }
+                                    } else {
+                                        eprintln!("Chunk-Index {} außerhalb des gültigen Bereichs (0-{}) für Datei {}", 
+                                            chunk_index, entry.chunk_count - 1, entry.path);
                                     }
                                 }
                             }
