@@ -17,6 +17,8 @@ pub struct GameInfo {
     #[serde(default)]
     pub description: Option<String>,
     #[serde(default)]
+    pub installation_instructions: Option<String>,
+    #[serde(default)]
     pub creator_peer_id: Option<String>,
     #[serde(default)]
     pub hash: Option<String>, // Blake3 Hash der deckdrop_chunks.toml im Format "blake3:XYZ"
@@ -52,6 +54,7 @@ impl Default for GameInfo {
             start_file: String::new(),
             start_args: None,
             description: None,
+            installation_instructions: None,
             creator_peer_id: None,
             hash: None,
         }
