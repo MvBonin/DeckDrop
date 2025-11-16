@@ -69,6 +69,18 @@ pub struct LightCheckResult {
 /// Prüft die Integrität und Vollständigkeit eines Spiels
 /// Validiert alle Dateien anhand ihrer Hashes aus deckdrop_chunks.toml
 pub fn verify_game_integrity(game_path: &Path) -> Result<GameIntegrityResult, Box<dyn std::error::Error>> {
+    verify_game_integrity_with_progress::<fn(usize, usize)>(game_path, None)
+}
+
+/// Prüft die Integrität und Vollständigkeit eines Spiels mit Progress-Callback
+/// Der Callback wird nach jeder geprüften Datei aufgerufen: callback(current_index, total_files)
+pub fn verify_game_integrity_with_progress<F>(
+    game_path: &Path,
+    progress_callback: Option<F>
+) -> Result<GameIntegrityResult, Box<dyn std::error::Error>>
+where
+    F: Fn(usize, usize),
+{
     let chunks_toml_path = game_path.join("deckdrop_chunks.toml");
     
     if !chunks_toml_path.exists() {
@@ -85,18 +97,22 @@ pub fn verify_game_integrity(game_path: &Path) -> Result<GameIntegrityResult, Bo
     
     let chunks_data: ChunksToml = toml::from_str(&chunks_toml_content)?;
     
+    let total_files = chunks_data.file.len();
     let mut result = GameIntegrityResult {
-        total_files: chunks_data.file.len(),
+        total_files,
         verified_files: 0,
         failed_files: Vec::new(),
         missing_files: Vec::new(),
     };
     
-    for entry in chunks_data.file {
+    for (index, entry) in chunks_data.file.iter().enumerate() {
         let file_path = game_path.join(&entry.path);
         
         if !file_path.exists() {
             result.missing_files.push(entry.path.clone());
+            if let Some(ref callback) = progress_callback {
+                callback(index + 1, total_files);
+            }
             continue;
         }
         
@@ -109,6 +125,9 @@ pub fn verify_game_integrity(game_path: &Path) -> Result<GameIntegrityResult, Bo
                 file_path: entry.path.clone(),
                 error: format!("Dateigröße stimmt nicht: erwartet {}, erhalten {}", entry.file_size, file_data.len()),
             });
+            if let Some(ref callback) = progress_callback {
+                callback(index + 1, total_files);
+            }
             continue;
         }
         
@@ -122,10 +141,18 @@ pub fn verify_game_integrity(game_path: &Path) -> Result<GameIntegrityResult, Bo
                 error: format!("Hash stimmt nicht: erwartet {}, erhalten {}", 
                     entry.file_hash, computed_hash),
             });
+            if let Some(ref callback) = progress_callback {
+                callback(index + 1, total_files);
+            }
             continue;
         }
         
         result.verified_files += 1;
+        
+        // Callback nach erfolgreicher Prüfung
+        if let Some(ref callback) = progress_callback {
+            callback(index + 1, total_files);
+        }
     }
     
     Ok(result)
@@ -151,7 +178,7 @@ pub fn light_check_game(game_path: &Path) -> Result<LightCheckResult, Box<dyn st
     let chunks_data: ChunksToml = toml::from_str(&chunks_toml_content)?;
     
     // Erstelle Set der erwarteten Dateien
-    let mut expected_files: std::collections::HashSet<String> = chunks_data.file
+    let expected_files: std::collections::HashSet<String> = chunks_data.file
         .iter()
         .map(|e| e.path.clone())
         .collect();

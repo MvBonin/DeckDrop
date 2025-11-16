@@ -25,21 +25,22 @@ fn main() -> iced::Result {
         DeckDropApp::view,
     )
     .theme(|_state: &DeckDropApp| iced::Theme::Dark)
-    .subscription(move |_state: &DeckDropApp| {
-        // Periodischer Tick für Event-Polling
+    .subscription(|_state: &DeckDropApp| {
+        // Periodischer Tick für Event-Polling (alle 100ms)
         use iced::Subscription;
-        
-        // Erstelle einen Stream, der periodisch Ticks sendet
         use iced::futures::StreamExt;
         use iced::futures::stream;
+        use std::time::Duration;
+        use futures_timer::Delay;
         
         Subscription::run(move || {
-            stream::unfold((), move |_| {
-                async move {
-                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            stream::unfold(
+                (),
+                move |_| async move {
+                    Delay::new(Duration::from_millis(100)).await;
                     Some((Message::Tick, ()))
                 }
-            })
+            )
         })
     })
     .window(iced::window::Settings {

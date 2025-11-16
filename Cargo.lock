@@ -1132,6 +1132,7 @@ dependencies = [
  "deckdrop-core",
  "deckdrop-network",
  "directories",
+ "futures-timer",
  "iced",
  "libp2p",
  "rfd",

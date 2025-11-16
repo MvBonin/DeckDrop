@@ -14,7 +14,7 @@ pub mod synch;
 // Re-export wichtige Typen für einfacheren Zugriff
 pub use config::Config;
 pub use game::{GameInfo, load_games_from_directory, check_game_config_exists, generate_chunks_toml};
-pub use gamechecker::{calculate_file_hash, verify_game_integrity, light_check_game};
+pub use gamechecker::{calculate_file_hash, verify_game_integrity, verify_game_integrity_with_progress, light_check_game};
 pub use synch::{
     DownloadManifest, DownloadStatus, DownloadProgress,
     start_game_download, request_missing_chunks, 
