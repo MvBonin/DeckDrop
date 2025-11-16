@@ -20,10 +20,5 @@ jobs:
           toolchain: stable
           override: true
 
-      - name: Install Dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libgtk-4-dev
-
       - name: Run cargo test
         run: cargo test --all

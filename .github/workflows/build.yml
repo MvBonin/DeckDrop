@@ -24,14 +24,13 @@ jobs:
       - name: Install Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libgtk-4-dev \
-                                  libfuse2 \
+          sudo apt-get install -y libfuse2 \
                                   patchelf \
                                   wget
 
       - name: Build Binary
         run: |
-          cargo build --release --bin deckdrop-gtk
+          cargo build --release --package deckdrop-ui
 
       - name: Prepare AppDir
         run: |
@@ -39,7 +38,7 @@ jobs:
           mkdir -p AppDir/usr/share/applications
           mkdir -p AppDir/usr/share/icons/hicolor/256x256/apps
 
-          cp target/release/deckdrop-gtk AppDir/usr/bin/deckdrop
+          cp target/release/deckdrop AppDir/usr/bin/deckdrop
 
           # Create desktop file - appimagetool expects it to match the AppImage name (DeckDrop)
           cat > AppDir/usr/share/applications/DeckDrop.desktop << 'EOF'
@@ -97,7 +96,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: DeckDrop-Binary
-          path: target/release/deckdrop-gtk
+          path: target/release/deckdrop
 
       - name: Upload AppImage (always)
         uses: actions/upload-artifact@v4
@@ -110,5 +109,5 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            target/release/deckdrop-gtk
+            target/release/deckdrop
             DeckDrop-x86_64.AppImage
