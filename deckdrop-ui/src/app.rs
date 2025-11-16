@@ -51,7 +51,7 @@ pub struct DeckDropApp {
     pub add_game_start_file: String,
     pub add_game_start_args: String,
     pub add_game_description: String,
-    pub add_game_installation_instructions: String,
+    pub add_game_additional_instructions: String,
     
     // Settings-Felder
     pub settings_player_name: String,
@@ -90,7 +90,21 @@ impl Default for DeckDropApp {
         let (_tx, rx) = mpsc::channel(1);
         let config = Config::load();
         let mut my_games = Vec::new();
+        
+        // 1. Lade Spiele aus dem Download-Pfad (Unterordner = Spiele)
+        if config.download_path.exists() {
+            my_games.extend(deckdrop_core::load_games_from_directory(&config.download_path));
+        }
+        
+        // 2. Lade Spiele aus den manuell hinzugefügten Pfaden (game_paths)
         for game_path in &config.game_paths {
+            // Check if the path itself is a game (has deckdrop.toml)
+            if deckdrop_core::check_game_config_exists(game_path) {
+                if let Ok(game_info) = deckdrop_core::GameInfo::load_from_path(game_path) {
+                    my_games.push((game_path.clone(), game_info));
+                }
+            }
+            // Also check subdirectories
             my_games.extend(deckdrop_core::load_games_from_directory(game_path));
         }
         
@@ -116,7 +130,7 @@ impl Default for DeckDropApp {
             add_game_start_file: String::new(),
             add_game_start_args: String::new(),
             add_game_description: String::new(),
-            add_game_installation_instructions: String::new(),
+            add_game_additional_instructions: String::new(),
             settings_player_name: config.player_name.clone(),
             settings_download_path: config.download_path.to_string_lossy().to_string(),
         }
@@ -141,12 +155,13 @@ pub enum Message {
     // My Games
     AddGame,
     AddGamePathChanged(String),
+    BrowseGamePath,
     AddGameNameChanged(String),
     AddGameVersionChanged(String),
     AddGameStartFileChanged(String),
     AddGameStartArgsChanged(String),
     AddGameDescriptionChanged(String),
-    AddGameInstallationInstructionsChanged(String),
+    AddGameAdditionalInstructionsChanged(String),
     SaveGame,
     CancelAddGame,
     
@@ -154,6 +169,7 @@ pub enum Message {
     OpenSettings,
     SettingsPlayerNameChanged(String),
     SettingsDownloadPathChanged(String),
+    BrowseDownloadPath,
     SaveSettings,
     CancelSettings,
     
@@ -175,7 +191,21 @@ impl DeckDropApp {
     fn new_with_network_rx(network_event_rx: Arc<std::sync::Mutex<mpsc::Receiver<DiscoveryEvent>>>) -> Self {
         let config = Config::load();
         let mut my_games = Vec::new();
+        
+        // 1. Lade Spiele aus dem Download-Pfad (Unterordner = Spiele)
+        if config.download_path.exists() {
+            my_games.extend(deckdrop_core::load_games_from_directory(&config.download_path));
+        }
+        
+        // 2. Lade Spiele aus den manuell hinzugefügten Pfaden (game_paths)
         for game_path in &config.game_paths {
+            // Check if the path itself is a game (has deckdrop.toml)
+            if deckdrop_core::check_game_config_exists(game_path) {
+                if let Ok(game_info) = deckdrop_core::GameInfo::load_from_path(game_path) {
+                    my_games.push((game_path.clone(), game_info));
+                }
+            }
+            // Also check subdirectories
             my_games.extend(deckdrop_core::load_games_from_directory(game_path));
         }
         
@@ -201,7 +231,7 @@ impl DeckDropApp {
             add_game_start_file: String::new(),
             add_game_start_args: String::new(),
             add_game_description: String::new(),
-            add_game_installation_instructions: String::new(),
+            add_game_additional_instructions: String::new(),
             settings_player_name: config.player_name.clone(),
             settings_download_path: config.download_path.to_string_lossy().to_string(),
         }
@@ -267,6 +297,14 @@ impl DeckDropApp {
             Message::AddGamePathChanged(path) => {
                 self.add_game_path = path;
             }
+            Message::BrowseGamePath => {
+                if let Some(path) = rfd::FileDialog::new()
+                    .set_title("Select Game Directory")
+                    .pick_folder()
+                {
+                    self.add_game_path = path.to_string_lossy().to_string();
+                }
+            }
             Message::AddGameNameChanged(name) => {
                 self.add_game_name = name;
             }
@@ -282,8 +320,8 @@ impl DeckDropApp {
             Message::AddGameDescriptionChanged(description) => {
                 self.add_game_description = description;
             }
-            Message::AddGameInstallationInstructionsChanged(instructions) => {
-                self.add_game_installation_instructions = instructions;
+            Message::AddGameAdditionalInstructionsChanged(instructions) => {
+                self.add_game_additional_instructions = instructions;
             }
             Message::SaveGame => {
                 // Validate required fields
@@ -306,7 +344,7 @@ impl DeckDropApp {
                     start_file: self.add_game_start_file.clone(),
                     start_args: if self.add_game_start_args.is_empty() { None } else { Some(self.add_game_start_args.clone()) },
                     description: if self.add_game_description.is_empty() { None } else { Some(self.add_game_description.clone()) },
-                    installation_instructions: if self.add_game_installation_instructions.is_empty() { None } else { Some(self.add_game_installation_instructions.clone()) },
+                    additional_instructions: if self.add_game_additional_instructions.is_empty() { None } else { Some(self.add_game_additional_instructions.clone()) },
                     creator_peer_id: self.config.peer_id.clone(),
                     hash: None,
                 };
@@ -340,8 +378,22 @@ impl DeckDropApp {
                 // Reload games list
                 self.config = config.clone();
                 self.my_games.clear();
-                for game_path in &self.config.game_paths {
-                    self.my_games.extend(deckdrop_core::load_games_from_directory(game_path));
+                
+                // 1. Lade Spiele aus dem Download-Pfad (Unterordner = Spiele)
+                if self.config.download_path.exists() {
+                    self.my_games.extend(deckdrop_core::load_games_from_directory(&self.config.download_path));
+                }
+                
+                // 2. Lade Spiele aus den manuell hinzugefügten Pfaden (game_paths)
+                for game_path_dir in &self.config.game_paths {
+                    // Check if the path itself is a game (has deckdrop.toml)
+                    if deckdrop_core::check_game_config_exists(game_path_dir) {
+                        if let Ok(game_info) = deckdrop_core::GameInfo::load_from_path(game_path_dir) {
+                            self.my_games.push((game_path_dir.clone(), game_info));
+                        }
+                    }
+                    // Also check subdirectories
+                    self.my_games.extend(deckdrop_core::load_games_from_directory(game_path_dir));
                 }
                 
                 // Close dialog and reset form
@@ -352,7 +404,7 @@ impl DeckDropApp {
                 self.add_game_start_file = String::new();
                 self.add_game_start_args = String::new();
                 self.add_game_description = String::new();
-                self.add_game_installation_instructions = String::new();
+                self.add_game_additional_instructions = String::new();
             }
             Message::CancelAddGame => {
                 self.show_add_game_dialog = false;
@@ -368,12 +420,18 @@ impl DeckDropApp {
             Message::SettingsDownloadPathChanged(path) => {
                 self.settings_download_path = path;
             }
+            Message::BrowseDownloadPath => {
+                if let Some(path) = rfd::FileDialog::new()
+                    .set_title("Select Download Directory")
+                    .pick_folder()
+                {
+                    self.settings_download_path = path.to_string_lossy().to_string();
+                }
+            }
             Message::SaveSettings => {
                 // TODO: Save settings
                 self.config.player_name = self.settings_player_name.clone();
-                if let Ok(path) = PathBuf::try_from(&self.settings_download_path) {
-                    self.config.download_path = path;
-                }
+                self.config.download_path = PathBuf::from(&self.settings_download_path);
                 if let Err(e) = self.config.save() {
                     eprintln!("Error saving settings: {}", e);
                 }
@@ -763,9 +821,15 @@ impl DeckDropApp {
             text_input("Player Name", &self.config.player_name)
                 .on_input(Message::SettingsPlayerNameChanged)
                 .padding(10),
-            text_input("Download Path", &self.config.download_path.to_string_lossy())
-                .on_input(Message::SettingsDownloadPathChanged)
-                .padding(10),
+            row![
+                text_input("Download Path", &self.config.download_path.to_string_lossy())
+                    .on_input(Message::SettingsDownloadPathChanged)
+                    .padding(10),
+                button("Browse...")
+                    .on_press(Message::BrowseDownloadPath)
+                    .padding(10),
+            ]
+            .spacing(10),
             row![
                 button("Save")
                     .on_press(Message::SaveSettings),
@@ -821,9 +885,15 @@ impl DeckDropApp {
                     .padding(10),
                 Space::with_height(10),
                 text("Download Path:").size(16),
-                text_input("Download Path", &self.settings_download_path)
-                    .on_input(Message::SettingsDownloadPathChanged)
-                    .padding(10),
+                row![
+                    text_input("Download Path", &self.settings_download_path)
+                        .on_input(Message::SettingsDownloadPathChanged)
+                        .padding(10),
+                    button("Browse...")
+                        .on_press(Message::BrowseDownloadPath)
+                        .padding(10),
+                ]
+                .spacing(10),
                 Space::with_height(20),
                 row![
                     button("Cancel")
@@ -847,53 +917,83 @@ impl DeckDropApp {
     /// Shows "Add Game" dialog
     fn view_add_game_dialog(&self) -> Element<Message> {
         container(
-            column![
-                text("Add Game").size(28),
-                Space::with_height(20),
-                text("Path:").size(16),
-                text_input("Path", &self.add_game_path)
-                    .on_input(Message::AddGamePathChanged)
-                    .padding(10),
-                text("Name:").size(16),
-                text_input("Name", &self.add_game_name)
-                    .on_input(Message::AddGameNameChanged)
-                    .padding(10),
-                text("Version:").size(16),
-                text_input("Version (default: 1.0)", &self.add_game_version)
-                    .on_input(Message::AddGameVersionChanged)
-                    .padding(10),
-                text("Start File:").size(16),
-                text_input("Start File (relative to game directory)", &self.add_game_start_file)
-                    .on_input(Message::AddGameStartFileChanged)
-                    .padding(10),
-                text("Start Args (optional):").size(16),
-                text_input("Start Args", &self.add_game_start_args)
-                    .on_input(Message::AddGameStartArgsChanged)
-                    .padding(10),
-                text("Description (optional):").size(16),
-                text_input("Description", &self.add_game_description)
-                    .on_input(Message::AddGameDescriptionChanged)
-                    .padding(10),
-                text("Installation Instructions (optional):").size(16),
-                text_input("Installation Instructions", &self.add_game_installation_instructions)
-                    .on_input(Message::AddGameInstallationInstructionsChanged)
-                    .padding(10),
-                Space::with_height(20),
-                row![
-                    button("Cancel")
-                        .on_press(Message::CancelAddGame),
-                    Space::with_width(Length::Fill),
-                    button("Save")
-                        .on_press(Message::SaveGame)
-                        .style(button::primary),
+            scrollable(
+                column![
+                    text("Add Game").size(28),
+                    Space::with_height(20),
+                    row![
+                        // Left column
+                        column![
+                            text("Path:").size(16),
+                            row![
+                                text_input("Path", &self.add_game_path)
+                                    .on_input(Message::AddGamePathChanged)
+                                    .padding(10),
+                                button("Browse...")
+                                    .on_press(Message::BrowseGamePath)
+                                    .padding(10),
+                            ]
+                            .spacing(10),
+                            Space::with_height(10),
+                            text("Name:").size(16),
+                            text_input("Name", &self.add_game_name)
+                                .on_input(Message::AddGameNameChanged)
+                                .padding(10),
+                            Space::with_height(10),
+                            text("Version:").size(16),
+                            text_input("Version (default: 1.0)", &self.add_game_version)
+                                .on_input(Message::AddGameVersionChanged)
+                                .padding(10),
+                            Space::with_height(10),
+                            text("Start Args (optional):").size(16),
+                            text_input("Start Args", &self.add_game_start_args)
+                                .on_input(Message::AddGameStartArgsChanged)
+                                .padding(10),
+                        ]
+                        .spacing(10)
+                        .width(Length::Fill),
+                        Space::with_width(20),
+                        // Right column
+                        column![
+                            text("Game Executable:").size(16),
+                            text_input("Relative to the game path", &self.add_game_start_file)
+                                .on_input(Message::AddGameStartFileChanged)
+                                .padding(10),
+                            Space::with_height(10),
+                            text("Description (optional):").size(16),
+                            text_input("Description", &self.add_game_description)
+                                .on_input(Message::AddGameDescriptionChanged)
+                                .padding(10),
+                            Space::with_height(10),
+                            text("Additional Instructions (optional):").size(16),
+                            text_input("Additional Instructions", &self.add_game_additional_instructions)
+                                .on_input(Message::AddGameAdditionalInstructionsChanged)
+                                .padding(10),
+                        ]
+                        .spacing(10)
+                        .width(Length::Fill),
+                    ]
+                    .spacing(20)
+                    .width(Length::Fill),
+                    Space::with_height(20),
+                    row![
+                        button("Cancel")
+                            .on_press(Message::CancelAddGame),
+                        Space::with_width(Length::Fill),
+                        button("Save")
+                            .on_press(Message::SaveGame)
+                            .style(button::primary),
+                    ]
+                    .width(Length::Fill),
                 ]
-                .width(Length::Fill),
-            ]
-            .spacing(10)
-            .padding(30)
+                .spacing(15)
+                .padding(30)
+            )
+            .width(Length::Fill)
+            .height(Length::Fill)
         )
-        .width(Length::Fixed(600.0))
-        .height(Length::Shrink)
+        .width(Length::Fill)
+        .height(Length::Fill)
         .style(container_box_style)
         .into()
     }

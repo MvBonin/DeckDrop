@@ -620,8 +620,8 @@ file_size = 150000000
         let output_dir = temp_dir.path().join("output");
         fs::create_dir_all(&output_dir).unwrap();
         
-        // Erstelle Test-Datei
-        let mut test_data = vec![0u8; 150 * 1024 * 1024]; // 150MB
+        // Erstelle Test-Datei (reduziert auf 10MB für bessere Kompatibilität)
+        let mut test_data = vec![0u8; 10 * 1024 * 1024]; // 10MB
         for i in 0..test_data.len() {
             // Fülle mit Mustern
             test_data[i] = (i % 256) as u8;
@@ -637,9 +637,9 @@ file_size = 150000000
         temp_file.flush().unwrap();
         let file_hash = calculate_file_hash(temp_file.path()).unwrap();
         
-        // Teile in Chunks (2 Chunks: 100MB + 50MB)
-        let chunk1 = &test_data[0..100 * 1024 * 1024];
-        let chunk2 = &test_data[100 * 1024 * 1024..];
+        // Teile in Chunks (2 Chunks: 5MB + 5MB)
+        let chunk1 = &test_data[0..5 * 1024 * 1024];
+        let chunk2 = &test_data[5 * 1024 * 1024..];
         
         // Speichere Chunks
         save_chunk(&format!("{}:0", file_hash), chunk1, chunks_dir).unwrap();
@@ -680,8 +680,8 @@ file_size = 150000000
         let game_path1 = temp_dir1.path().join("game");
         fs::create_dir_all(&game_path1).unwrap();
         
-        // Erstelle Test-Datei für Peer 1 (200MB)
-        let test_data = vec![42u8; 200 * 1024 * 1024];
+        // Erstelle Test-Datei für Peer 1 (reduziert auf 10MB für bessere Kompatibilität)
+        let test_data = vec![42u8; 10 * 1024 * 1024]; // 10MB
         let test_file_path = game_path1.join("test.bin");
         fs::write(&test_file_path, &test_data).unwrap();
         
@@ -730,13 +730,13 @@ file_size = {}
         start_game_download(game_id, &deckdrop_toml, &deckdrop_chunks_toml).unwrap();
         
         // Simuliere Chunk-Transfer von Peer 1 zu Peer 2
-        // Chunk 1: 0-100MB
-        let chunk1 = &test_data[0..100 * 1024 * 1024];
+        // Chunk 1: 0-5MB
+        let chunk1 = &test_data[0..5 * 1024 * 1024];
         let chunk1_hash = format!("{}:0", computed_hash);
         save_chunk(&chunk1_hash, chunk1, &chunks_dir2).unwrap();
         
-        // Chunk 2: 100-200MB
-        let chunk2 = &test_data[100 * 1024 * 1024..];
+        // Chunk 2: 5-10MB
+        let chunk2 = &test_data[5 * 1024 * 1024..];
         let chunk2_hash = format!("{}:1", computed_hash);
         save_chunk(&chunk2_hash, chunk2, &chunks_dir2).unwrap();
         

@@ -17,7 +17,7 @@ pub struct GameInfo {
     #[serde(default)]
     pub description: Option<String>,
     #[serde(default)]
-    pub installation_instructions: Option<String>,
+    pub additional_instructions: Option<String>,
     #[serde(default)]
     pub creator_peer_id: Option<String>,
     #[serde(default)]
@@ -54,7 +54,7 @@ impl Default for GameInfo {
             start_file: String::new(),
             start_args: None,
             description: None,
-            installation_instructions: None,
+            additional_instructions: None,
             creator_peer_id: None,
             hash: None,
         }
@@ -367,6 +367,7 @@ mod tests {
             start_file: "game.exe".to_string(),
             start_args: Some("--fullscreen".to_string()),
             description: Some("Ein Test-Spiel".to_string()),
+            additional_instructions: Some("Beim installieren nichts beachten".to_string()),
             creator_peer_id: Some("peer-123".to_string()),
             hash: None,
         };
@@ -384,6 +385,7 @@ mod tests {
         assert_eq!(deserialized.start_file, game_info.start_file);
         assert_eq!(deserialized.start_args, game_info.start_args);
         assert_eq!(deserialized.description, game_info.description);
+        assert_eq!(deserialized.additional_instructions, game_info.additional_instructions);
         assert_eq!(deserialized.creator_peer_id, game_info.creator_peer_id);
     }
 
@@ -397,6 +399,7 @@ mod tests {
             start_file: "test.exe".to_string(),
             start_args: None,
             description: None,
+            additional_instructions: None,
             creator_peer_id: None,
             hash: None,
         };

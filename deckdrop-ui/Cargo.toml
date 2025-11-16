@@ -19,4 +19,5 @@ toml = "0.8"
 directories = "5"
 libp2p = { version = "0.54", features = ["identify"] }
 async-channel = "2"
+rfd = "0.14"
 
