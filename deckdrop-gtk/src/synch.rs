@@ -287,12 +287,11 @@ pub fn get_manifest_path(game_id: &str) -> Result<PathBuf, Box<dyn std::error::E
 }
 
 /// Ermittelt den Chunks-Verzeichnis-Pfad für ein Spiel
+/// Chunks werden im Download-Ordner in einem "temp" Unterordner gespeichert
 pub fn get_chunks_dir(game_id: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let base_dir = directories::ProjectDirs::from("com", "deckdrop", "deckdrop")
-        .ok_or("Konnte Konfigurationsverzeichnis nicht bestimmen")?;
-    let config_dir = base_dir.config_dir();
-    let games_dir = config_dir.join("games").join(game_id);
-    Ok(games_dir.join("chunks"))
+    let config = crate::config::Config::load();
+    let download_path = config.download_path;
+    Ok(download_path.join("temp").join(game_id))
 }
 
 /// Startet den Download-Prozess für ein Spiel
@@ -335,10 +334,13 @@ pub fn start_game_download(
 }
 
 /// Fordert fehlende Chunks für ein Spiel an
+/// 
+/// `max_chunks_per_peer`: Maximale Anzahl gleichzeitiger Chunk-Downloads von einem Peer (default: 3)
 pub fn request_missing_chunks(
     game_id: &str,
     peer_ids: &[String],
     download_request_tx: &tokio::sync::mpsc::UnboundedSender<deckdrop_network::network::discovery::DownloadRequest>,
+    max_chunks_per_peer: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let manifest_path = get_manifest_path(game_id)?;
     let manifest = DownloadManifest::load(&manifest_path)?;
@@ -350,23 +352,49 @@ pub fn request_missing_chunks(
         return Ok(());
     }
     
-    println!("Fordere {} fehlende Chunks für Spiel {} an", missing_chunks.len(), game_id);
-    eprintln!("Fordere {} fehlende Chunks für Spiel {} an", missing_chunks.len(), game_id);
+    println!("Fordere {} fehlende Chunks für Spiel {} an (max {} pro Peer)", 
+        missing_chunks.len(), game_id, max_chunks_per_peer);
+    eprintln!("Fordere {} fehlende Chunks für Spiel {} an (max {} pro Peer)", 
+        missing_chunks.len(), game_id, max_chunks_per_peer);
     
-    // Verteile Chunks auf verfügbare Peers (Round-Robin)
-    for (i, chunk_hash) in missing_chunks.iter().enumerate() {
-        let peer_id = &peer_ids[i % peer_ids.len()];
+    // Verteile Chunks auf verfügbare Peers mit Begrenzung pro Peer
+    let mut peer_chunk_counts: HashMap<String, usize> = HashMap::new();
+    
+    for chunk_hash in missing_chunks.iter() {
+        // Finde Peer mit den wenigsten aktiven Downloads
+        let mut selected_peer = None;
+        let mut min_count = usize::MAX;
         
-        if let Err(e) = download_request_tx.send(
-            deckdrop_network::network::discovery::DownloadRequest::RequestChunk {
-                peer_id: peer_id.clone(),
-                chunk_hash: chunk_hash.clone(),
-                game_id: game_id.to_string(),
+        for peer_id in peer_ids {
+            let count = peer_chunk_counts.get(peer_id).copied().unwrap_or(0);
+            if count < max_chunks_per_peer && count < min_count {
+                min_count = count;
+                selected_peer = Some(peer_id.clone());
             }
-        ) {
-            eprintln!("Fehler beim Senden von Chunk-Request für {}: {}", chunk_hash, e);
+        }
+        
+        if let Some(peer_id) = selected_peer {
+            // Erhöhe Zähler für diesen Peer
+            *peer_chunk_counts.entry(peer_id.clone()).or_insert(0) += 1;
+            
+            if let Err(e) = download_request_tx.send(
+                deckdrop_network::network::discovery::DownloadRequest::RequestChunk {
+                    peer_id: peer_id.clone(),
+                    chunk_hash: chunk_hash.clone(),
+                    game_id: game_id.to_string(),
+                }
+            ) {
+                eprintln!("Fehler beim Senden von Chunk-Request für {}: {}", chunk_hash, e);
+                // Reduziere Zähler bei Fehler
+                if let Some(count) = peer_chunk_counts.get_mut(&peer_id) {
+                    *count = count.saturating_sub(1);
+                }
+            } else {
+                println!("Chunk-Request gesendet: {} von Peer {} ({} aktive Downloads)", 
+                    chunk_hash, peer_id, peer_chunk_counts.get(&peer_id).copied().unwrap_or(0));
+            }
         } else {
-            println!("Chunk-Request gesendet: {} von Peer {}", chunk_hash, peer_id);
+            eprintln!("Kein Peer verfügbar für Chunk {} (alle Peers haben max Downloads erreicht)", chunk_hash);
         }
     }
     
@@ -488,6 +516,14 @@ pub fn finalize_game_download(
         }
     }
     
+    // Lösche temporäre Chunks nach erfolgreichem Download
+    let chunks_dir = get_chunks_dir(game_id)?;
+    if chunks_dir.exists() {
+        std::fs::remove_dir_all(&chunks_dir)?;
+        println!("Temporäre Chunks gelöscht nach erfolgreichem Download: {}", chunks_dir.display());
+        eprintln!("Temporäre Chunks gelöscht nach erfolgreichem Download: {}", chunks_dir.display());
+    }
+    
     // Füge zur Bibliothek hinzu
     let mut config = crate::config::Config::load();
     config.add_game_path(&game_path)?;
@@ -510,7 +546,14 @@ pub fn cancel_game_download(game_id: &str) -> Result<(), Box<dyn std::error::Err
         let _ = manifest.save(&manifest_path);
     }
     
-    // Lösche alle Download-Daten
+    // Lösche temporäre Chunks im Download-Ordner
+    let chunks_dir = get_chunks_dir(game_id)?;
+    if chunks_dir.exists() {
+        std::fs::remove_dir_all(&chunks_dir)?;
+        println!("Temporäre Chunks gelöscht: {}", chunks_dir.display());
+    }
+    
+    // Lösche Manifest-Verzeichnis (enthält nur Metadaten, keine Chunks mehr)
     if manifest_dir.exists() {
         std::fs::remove_dir_all(manifest_dir)?;
     }

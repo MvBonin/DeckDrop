@@ -143,18 +143,15 @@ pub async fn run_discovery(
     let game_metadata_loader_clone = game_metadata_loader.clone();
     let chunk_loader_clone = chunk_loader.clone();
     
-    // Tracking für Chunk-Requests: request_id -> (chunk_hash, game_id)
-    // RequestId sollte Copy sein und als HashMap-Key verwendet werden können
-    use std::any::Any;
-    // Verwende einen Counter-basierten Ansatz für Request-Tracking
-    let mut chunk_request_counter: u64 = 0;
-    let pending_chunk_requests: Arc<tokio::sync::Mutex<HashMap<u64, (String, String)>>> = 
+    // Tracking für Chunk-Requests: request_id -> (chunk_hash, game_id, peer_id)
+    // OutboundRequestId ist der Typ, der von send_request zurückgegeben wird
+    use libp2p::request_response::OutboundRequestId;
+    let pending_chunk_requests: Arc<tokio::sync::Mutex<HashMap<OutboundRequestId, (String, String, String)>>> = 
         Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     let pending_chunk_requests_clone = pending_chunk_requests.clone();
     
-    // Tracking für Metadata-Requests: request_id -> game_id
-    let mut metadata_request_counter: u64 = 0;
-    let pending_metadata_requests: Arc<tokio::sync::Mutex<HashMap<u64, String>>> = 
+    // Tracking für Metadata-Requests: request_id -> (game_id, peer_id)
+    let pending_metadata_requests: Arc<tokio::sync::Mutex<HashMap<OutboundRequestId, (String, String)>>> = 
         Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     let pending_metadata_requests_clone = pending_metadata_requests.clone();
     
@@ -315,13 +312,16 @@ pub async fn run_discovery(
                             }
                             
                             let request = GameMetadataRequest { game_id: game_id.clone() };
-                            let _request_id = swarm.behaviour_mut().game_metadata.send_request(&peer_id_parsed, request);
+                            let request_id = swarm.behaviour_mut().game_metadata.send_request(&peer_id_parsed, request);
                             
-                            // TODO: Tracke Request-ID für bessere Zuordnung
-                            // Für jetzt: game_id wird aus der Response extrahiert
+                            // Tracke Request-ID für bessere Zuordnung
+                            {
+                                let mut pending = pending_metadata_requests_clone.lock().await;
+                                pending.insert(request_id, (game_id.clone(), peer_id.clone()));
+                            }
                             
-                            println!("GameMetadata Request gesendet an {} für game_id: {}", peer_id, game_id);
-                            eprintln!("GameMetadata Request gesendet an {} für game_id: {}", peer_id, game_id);
+                            println!("GameMetadata Request gesendet an {} für game_id: {} (RequestId: {:?})", peer_id, game_id, request_id);
+                            eprintln!("GameMetadata Request gesendet an {} für game_id: {} (RequestId: {:?})", peer_id, game_id, request_id);
                         }
                         DownloadRequest::RequestChunk { peer_id, chunk_hash, game_id } => {
                             let peer_id_parsed = match PeerId::from_str(&peer_id) {
@@ -339,13 +339,16 @@ pub async fn run_discovery(
                             }
                             
                             let request = ChunkRequest { chunk_hash: chunk_hash.clone() };
-                            let _request_id = swarm.behaviour_mut().chunks.send_request(&peer_id_parsed, request);
+                            let request_id = swarm.behaviour_mut().chunks.send_request(&peer_id_parsed, request);
                             
-                            // TODO: Tracke Request-ID für bessere Zuordnung
-                            // Für jetzt: chunk_hash wird direkt verwendet, game_id wird aus Manifest gesucht
+                            // Tracke Request-ID für bessere Zuordnung
+                            {
+                                let mut pending = pending_chunk_requests_clone.lock().await;
+                                pending.insert(request_id, (chunk_hash.clone(), game_id.clone(), peer_id.clone()));
+                            }
                             
-                            println!("Chunk Request gesendet an {} für hash: {}", peer_id, chunk_hash);
-                            eprintln!("Chunk Request gesendet an {} für hash: {}", peer_id, chunk_hash);
+                            println!("Chunk Request gesendet an {} für hash: {} (RequestId: {:?})", peer_id, chunk_hash, request_id);
+                            eprintln!("Chunk Request gesendet an {} für hash: {} (RequestId: {:?})", peer_id, chunk_hash, request_id);
                         }
                     }
                 }
@@ -552,21 +555,29 @@ pub async fn run_discovery(
                                         };
                                         let _ = swarm.behaviour_mut().game_metadata.send_response(channel, response);
                                     }
-                                    libp2p::request_response::Message::Response { response, .. } => {
-                                        // Wir haben Metadaten erhalten
+                                    libp2p::request_response::Message::Response { request_id, response, .. } => {
+                                        // Wir haben GameMetadata erhalten
                                         let peer_id_str = peer.to_string();
-                                        println!("GameMetadata Response erhalten von {}: {} Bytes deckdrop.toml, {} Bytes deckdrop_chunks.toml", 
-                                            peer_id_str, response.deckdrop_toml.len(), response.deckdrop_chunks_toml.len());
-                                        eprintln!("GameMetadata Response erhalten von {}: {} Bytes deckdrop.toml, {} Bytes deckdrop_chunks.toml", 
-                                            peer_id_str, response.deckdrop_toml.len(), response.deckdrop_chunks_toml.len());
                                         
-                                        // Extrahiere game_id aus deckdrop.toml
-                                        // Parse TOML manuell, da NetworkGameInfo nicht direkt aus TOML deserialisierbar ist
-                                        let game_id = response.deckdrop_toml.lines()
-                                            .find(|l| l.trim().starts_with("game_id"))
-                                            .and_then(|l| l.split('=').nth(1))
-                                            .map(|s| s.trim().trim_matches('"').trim_matches('\'').to_string())
-                                            .unwrap_or_else(|| "unknown".to_string());
+                                        // Hole game_id aus Request-Tracking
+                                        let game_id = {
+                                            let mut pending = pending_metadata_requests_clone.lock().await;
+                                            if let Some((tracked_game_id, _)) = pending.remove(&request_id) {
+                                                tracked_game_id
+                                            } else {
+                                                // Fallback: Extrahiere game_id aus deckdrop.toml
+                                                response.deckdrop_toml.lines()
+                                                    .find(|l| l.trim().starts_with("game_id"))
+                                                    .and_then(|l| l.split('=').nth(1))
+                                                    .map(|s| s.trim().trim_matches('"').trim_matches('\'').to_string())
+                                                    .unwrap_or_else(|| "unknown".to_string())
+                                            }
+                                        };
+                                        
+                                        println!("GameMetadata Response erhalten von {} für game_id {} (RequestId: {:?}): {} Bytes deckdrop.toml, {} Bytes deckdrop_chunks.toml", 
+                                            peer_id_str, game_id, request_id, response.deckdrop_toml.len(), response.deckdrop_chunks_toml.len());
+                                        eprintln!("GameMetadata Response erhalten von {} für game_id {} (RequestId: {:?}): {} Bytes deckdrop.toml, {} Bytes deckdrop_chunks.toml", 
+                                            peer_id_str, game_id, request_id, response.deckdrop_toml.len(), response.deckdrop_chunks_toml.len());
                                         
                                         let _ = event_tx_clone.send(DiscoveryEvent::GameMetadataReceived {
                                             peer_id: peer_id_str,
@@ -577,8 +588,18 @@ pub async fn run_discovery(
                                     }
                                 }
                             }
-                            libp2p::request_response::Event::OutboundFailure { peer, error, .. } => {
-                                eprintln!("GameMetadata OutboundFailure für {}: {:?}", peer, error);
+                            libp2p::request_response::Event::OutboundFailure { peer, request_id, error, .. } => {
+                                let peer_id_str = peer.to_string();
+                                
+                                // Hole Request-Informationen aus Tracking
+                                let (game_id, _) = {
+                                    let mut pending = pending_metadata_requests_clone.lock().await;
+                                    pending.remove(&request_id)
+                                        .unwrap_or_else(|| ("unknown".to_string(), peer_id_str.clone()))
+                                };
+                                
+                                eprintln!("GameMetadata OutboundFailure für {} (RequestId: {:?}): game_id={}, error={:?}", 
+                                    peer_id_str, request_id, game_id, error);
                             }
                             libp2p::request_response::Event::InboundFailure { peer, error, .. } => {
                                 eprintln!("GameMetadata InboundFailure für {}: {:?}", peer, error);
@@ -619,13 +640,21 @@ pub async fn run_discovery(
                                         };
                                         let _ = swarm.behaviour_mut().chunks.send_response(channel, response);
                                     }
-                                    libp2p::request_response::Message::Response { request_id: _, response, .. } => {
+                                    libp2p::request_response::Message::Response { request_id, response, .. } => {
                                         // Wir haben einen Chunk erhalten
                                         let peer_id_str = peer.to_string();
-                                        println!("Chunk Response erhalten von {}: {} Bytes für hash {}", 
-                                            peer_id_str, response.chunk_data.len(), response.chunk_hash);
-                                        eprintln!("Chunk Response erhalten von {}: {} Bytes für hash {}", 
-                                            peer_id_str, response.chunk_data.len(), response.chunk_hash);
+                                        
+                                        // Entferne Request aus Tracking
+                                        let (tracked_chunk_hash, game_id, _) = {
+                                            let mut pending = pending_chunk_requests_clone.lock().await;
+                                            pending.remove(&request_id)
+                                                .unwrap_or_else(|| (response.chunk_hash.clone(), "unknown".to_string(), peer_id_str.clone()))
+                                        };
+                                        
+                                        println!("Chunk Response erhalten von {} für hash {} (RequestId: {:?}, game_id: {})", 
+                                            peer_id_str, response.chunk_hash, request_id, game_id);
+                                        eprintln!("Chunk Response erhalten von {} für hash {} (RequestId: {:?}, game_id: {})", 
+                                            peer_id_str, response.chunk_hash, request_id, game_id);
                                         
                                         // Sende Event mit chunk_hash
                                         let event_tx_for_chunk = event_tx_clone.clone();
@@ -639,9 +668,28 @@ pub async fn run_discovery(
                                     }
                                 }
                             }
-                            libp2p::request_response::Event::OutboundFailure { peer, request_id: _, error, .. } => {
-                                eprintln!("Chunks OutboundFailure für {}: {:?}", peer, error);
-                                // TODO: Implementiere korrektes Request-ID-Tracking für Fehlerbehandlung
+                            libp2p::request_response::Event::OutboundFailure { peer, request_id, error, .. } => {
+                                let peer_id_str = peer.to_string();
+                                
+                                // Hole Request-Informationen aus Tracking
+                                let (chunk_hash, game_id, _) = {
+                                    let mut pending = pending_chunk_requests_clone.lock().await;
+                                    pending.remove(&request_id)
+                                        .unwrap_or_else(|| ("unknown".to_string(), "unknown".to_string(), peer_id_str.clone()))
+                                };
+                                
+                                eprintln!("Chunks OutboundFailure für {} (RequestId: {:?}): chunk_hash={}, game_id={}, error={:?}", 
+                                    peer_id_str, request_id, chunk_hash, game_id, error);
+                                
+                                // Sende ChunkRequestFailed Event
+                                let event_tx_for_failure = event_tx_clone.clone();
+                                tokio::spawn(async move {
+                                    let _ = event_tx_for_failure.send(DiscoveryEvent::ChunkRequestFailed {
+                                        peer_id: peer_id_str,
+                                        chunk_hash,
+                                        error: format!("{:?}", error),
+                                    }).await;
+                                });
                             }
                             libp2p::request_response::Event::InboundFailure { peer, error, .. } => {
                                 eprintln!("Chunks InboundFailure für {}: {:?}", peer, error);

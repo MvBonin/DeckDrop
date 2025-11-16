@@ -118,8 +118,8 @@ fn show_license_dialog(app: &Application) {
         .transient_for(&temp_window)
         .modal(true)
         .message_type(MessageType::Warning)
-        .text("Verantwortungserklärung")
-        .secondary_text("Use only for games you are legally allowed to share. Use on your own responsibility.")
+        .text("USE AT YOUR OWN RISK")
+        .secondary_text("Use only for games you are legally allowed to share. Use on your own responsibility. If you don't agree, please close the application.")
         .buttons(ButtonsType::OkCancel)
         .build();
     
@@ -603,11 +603,31 @@ fn build_ui(app: &Application) {
                     if let Err(e) = crate::synch::start_game_download(&game_id, &deckdrop_toml, &deckdrop_chunks_toml) {
                         eprintln!("Fehler beim Starten des Downloads: {}", e);
                     } else {
+                        // Hole verfügbare Peers für dieses Spiel aus network_games
+                        let peer_ids: Vec<String> = {
+                            let network_games_borrowed = network_games_clone.borrow();
+                            let mut peers = Vec::new();
+                            for (_unique_key, peer_games) in network_games_borrowed.iter() {
+                                if let Some((_, game_info)) = peer_games.first() {
+                                    if game_info.game_id == game_id {
+                                        peers.extend(peer_games.iter().map(|(pid, _)| pid.clone()));
+                                        break;
+                                    }
+                                }
+                            }
+                            // Falls keine Peers gefunden wurden, verwende den Peer, der die Metadaten gesendet hat
+                            if peers.is_empty() {
+                                peers.push(peer_id.clone());
+                            }
+                            peers
+                        };
+                        
                         // Nach erfolgreichem Manifest-Erstellen: Starte Chunk-Downloads
                         if let Err(e) = crate::synch::request_missing_chunks(
                             &game_id,
-                            &[peer_id.clone()],
+                            &peer_ids,
                             &download_request_tx_clone,
+                            3, // max_chunks_per_peer: 3 (hardcoded, später konfigurierbar)
                         ) {
                             eprintln!("Fehler beim Anfordern fehlender Chunks: {}", e);
                         }
@@ -700,7 +720,68 @@ fn build_ui(app: &Application) {
                 }
                 DiscoveryEvent::ChunkRequestFailed { peer_id, chunk_hash, error } => {
                     eprintln!("Chunk-Request fehlgeschlagen: {} von {}: {}", chunk_hash, peer_id, error);
-                    // TODO: Versuche anderen Peer
+                    
+                    // Finde game_id für diesen Chunk
+                    if let Ok(game_id) = crate::synch::find_game_id_for_chunk(&chunk_hash) {
+                        // Prüfe ob Download pausiert oder abgebrochen ist
+                        if let Ok(manifest_path) = crate::synch::get_manifest_path(&game_id) {
+                            if let Ok(manifest) = crate::synch::DownloadManifest::load(&manifest_path) {
+                                if manifest.overall_status == crate::synch::DownloadStatus::Paused ||
+                                   manifest.overall_status == crate::synch::DownloadStatus::Cancelled {
+                                    eprintln!("Download pausiert/abgebrochen, überspringe Retry für Chunk {}", chunk_hash);
+                                    continue;
+                                }
+                            }
+                        }
+                        
+                        // Hole verfügbare Peers für dieses Spiel aus network_games
+                        let alternative_peers: Vec<String> = {
+                            let network_games_borrowed = network_games_clone.borrow();
+                            let mut peers = Vec::new();
+                            for (_unique_key, peer_games) in network_games_borrowed.iter() {
+                                if let Some((_, game_info)) = peer_games.first() {
+                                    if game_info.game_id == game_id {
+                                        // Sammle alle Peers, die dieses Spiel haben, außer dem fehlgeschlagenen
+                                        for (pid, _) in peer_games.iter() {
+                                            if pid != &peer_id {
+                                                peers.push(pid.clone());
+                                            }
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                            peers
+                        };
+                        
+                        if !alternative_peers.is_empty() {
+                            // Wähle einen alternativen Peer (z.B. den ersten verfügbaren)
+                            let retry_peer = &alternative_peers[0];
+                            eprintln!("Retry Chunk-Request für {} mit alternativem Peer: {} (vorher: {})", 
+                                chunk_hash, retry_peer, peer_id);
+                            
+                            // Sende erneuten Request an alternativen Peer
+                            if let Err(e) = download_request_tx_clone.send(
+                                deckdrop_network::network::discovery::DownloadRequest::RequestChunk {
+                                    peer_id: retry_peer.clone(),
+                                    chunk_hash: chunk_hash.clone(),
+                                    game_id: game_id.clone(),
+                                }
+                            ) {
+                                eprintln!("Fehler beim Senden von Retry-Chunk-Request für {}: {}", chunk_hash, e);
+                            } else {
+                                println!("Retry Chunk-Request gesendet: {} von Peer {} (nach Fehler von {})", 
+                                    chunk_hash, retry_peer, peer_id);
+                            }
+                        } else {
+                            eprintln!("Keine alternativen Peers verfügbar für Chunk {} (game_id: {}). Chunk wird später erneut versucht, wenn neue Peers verfügbar werden.", 
+                                chunk_hash, game_id);
+                            // Der Chunk bleibt in der missing_chunks Liste und wird beim nächsten 
+                            // request_missing_chunks Aufruf erneut versucht
+                        }
+                    } else {
+                        eprintln!("Konnte game_id für fehlgeschlagenen Chunk {} nicht finden", chunk_hash);
+                    }
                 }
                 DiscoveryEvent::GamesListReceived { peer_id, games } => {
                     println!("=== GamesListReceived Event im GTK Thread ===");
@@ -1336,7 +1417,7 @@ fn create_download_ui(
                 };
                 
                 if !peer_ids.is_empty() {
-                    let _ = crate::synch::request_missing_chunks(&game_id_clone2, &peer_ids, &download_request_tx_clone2);
+                    let _ = crate::synch::request_missing_chunks(&game_id_clone2, &peer_ids, &download_request_tx_clone2, 3);
                 } else {
                     eprintln!("Keine verfügbaren Peers für Resume von Spiel {}", game_id_clone2);
                 }
