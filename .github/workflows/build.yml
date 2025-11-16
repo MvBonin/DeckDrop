@@ -58,9 +58,17 @@ jobs:
           cp AppDir/usr/share/applications/DeckDrop.desktop AppDir/DeckDrop.desktop
           cp AppDir/usr/share/applications/DeckDrop.desktop AppDir/deckdrop.desktop
 
-          # Copy icon if it exists
+          # Copy icon - appimagetool looks for it in AppDir root first
           if [ -f assets/deckdrop.png ]; then
+            # Copy to AppDir root (appimagetool checks here first)
+            cp assets/deckdrop.png AppDir/deckdrop.png
+            # Also copy to standard location
             cp assets/deckdrop.png AppDir/usr/share/icons/hicolor/256x256/apps/deckdrop.png
+          else
+            echo "Warning: assets/deckdrop.png not found, creating placeholder"
+            # Create a simple placeholder icon if missing
+            convert -size 256x256 xc:blue -pointsize 72 -fill white -gravity center -annotate +0+0 "DD" AppDir/deckdrop.png 2>/dev/null || \
+            echo "Note: ImageMagick not available, skipping placeholder icon"
           fi
 
           # Create AppRun script (required for AppImage)
