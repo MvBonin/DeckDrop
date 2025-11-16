@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
-/// Haupt-State der Anwendung
+/// Main application state
 #[derive(Debug, Clone)]
 pub struct DeckDropApp {
     // Tabs
@@ -44,7 +44,7 @@ pub struct DeckDropApp {
     pub show_settings: bool,
     pub show_add_game_dialog: bool,
     
-    // Formular-Felder für "Spiel hinzufügen"
+    // Form fields for "Add Game"
     pub add_game_path: String,
     pub add_game_name: String,
     pub add_game_version: String,
@@ -58,7 +58,7 @@ pub struct DeckDropApp {
     pub settings_download_path: String,
 }
 
-/// Tab-Auswahl
+/// Tab selection
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
     MyGames,
@@ -67,14 +67,14 @@ pub enum Tab {
     Settings,
 }
 
-/// Download-Status für UI
+/// Download status for UI
 #[derive(Debug, Clone)]
 pub struct DownloadState {
     pub manifest: DownloadManifest,
     pub progress_percent: f32,
 }
 
-/// Status-Informationen
+/// Status information
 #[derive(Debug, Clone)]
 pub struct StatusInfo {
     pub is_online: bool,
@@ -85,8 +85,8 @@ pub struct StatusInfo {
 
 impl Default for DeckDropApp {
     fn default() -> Self {
-        // Erstelle einen Dummy-Receiver für Default
-        // In main() wird dieser durch den echten Receiver ersetzt
+        // Create a dummy receiver for Default
+        // In main() this will be replaced by the real receiver
         let (_tx, rx) = mpsc::channel(1);
         let config = Config::load();
         let mut my_games = Vec::new();
@@ -123,7 +123,7 @@ impl Default for DeckDropApp {
     }
 }
 
-/// Messages für die Anwendung
+/// Messages for the application
 #[derive(Debug, Clone)]
 pub enum Message {
     // Tab-Navigation
@@ -138,7 +138,7 @@ pub enum Message {
     ResumeDownload(String), // game_id
     CancelDownload(String), // game_id
     
-    // Meine Spiele
+    // My Games
     AddGame,
     AddGamePathChanged(String),
     AddGameNameChanged(String),
@@ -160,10 +160,10 @@ pub enum Message {
     // License Dialog
     AcceptLicense,
     
-    // Periodische Updates
+    // Periodic updates
     Tick,
     
-    // Network Events (vom Network-Thread)
+    // Network Events (from Network thread)
     NetworkEventReceived(DiscoveryEvent),
 }
 
@@ -219,10 +219,10 @@ impl DeckDropApp {
                 self.handle_network_event(event);
             }
             Message::DownloadGame(game_id) => {
-                // Finde Peer für diesen Download
+                // Find peer for this download
                 if let Some(peers) = self.network_games.get(&game_id) {
                     if let Some((peer_id, _)) = peers.first() {
-                        // Starte Download über Network-Bridge
+                        // Start download via Network-Bridge
                         if let Some(tx) = crate::network_bridge::get_download_request_tx() {
                             let _ = tx.send(deckdrop_network::network::discovery::DownloadRequest::RequestGameMetadata {
                                 peer_id: peer_id.clone(),
@@ -233,32 +233,32 @@ impl DeckDropApp {
                 }
             }
             Message::PauseDownload(game_id) => {
-                // Pausiere Download
+                // Pause download
                 if let Some(download_state) = self.active_downloads.get_mut(&game_id) {
-                    // TODO: Pause-Funktionalität in synch.rs implementieren
-                    // Für jetzt: Status auf Paused setzen
+                    // TODO: Implement pause functionality in synch.rs
+                    // For now: Set status to Paused
                     download_state.manifest.overall_status = deckdrop_core::DownloadStatus::Paused;
                 }
             }
             Message::ResumeDownload(game_id) => {
-                // Setze Download fort
+                // Resume download
                 if let Some(download_state) = self.active_downloads.get_mut(&game_id) {
-                    // TODO: Resume-Funktionalität in synch.rs implementieren
-                    // Für jetzt: Status auf Downloading setzen
+                    // TODO: Implement resume functionality in synch.rs
+                    // For now: Set status to Downloading
                     download_state.manifest.overall_status = deckdrop_core::DownloadStatus::Downloading;
                 }
             }
             Message::CancelDownload(game_id) => {
-                // Breche Download ab
+                // Cancel download
                 if let Some(peers) = self.network_games.get(&game_id) {
                     if let Some((peer_id, _)) = peers.first() {
-                        // Breche Download ab (lokal)
+                        // Cancel download (local)
                         if let Err(e) = deckdrop_core::cancel_game_download(&game_id) {
-                            eprintln!("Fehler beim Abbrechen des Downloads für {}: {}", game_id, e);
+                            eprintln!("Error canceling download for {}: {}", game_id, e);
                         }
                     }
                 }
-                // Entferne aus aktiven Downloads
+                // Remove from active downloads
                 self.active_downloads.remove(&game_id);
             }
             Message::AddGame => {
@@ -369,13 +369,13 @@ impl DeckDropApp {
                 self.settings_download_path = path;
             }
             Message::SaveSettings => {
-                // TODO: Settings speichern
+                // TODO: Save settings
                 self.config.player_name = self.settings_player_name.clone();
                 if let Ok(path) = PathBuf::try_from(&self.settings_download_path) {
                     self.config.download_path = path;
                 }
                 if let Err(e) = self.config.save() {
-                    eprintln!("Fehler beim Speichern der Einstellungen: {}", e);
+                    eprintln!("Error saving settings: {}", e);
                 }
                 self.show_settings = false;
             }
@@ -384,13 +384,13 @@ impl DeckDropApp {
             }
             Message::AcceptLicense => {
                 self.show_license_dialog = false;
-                self.show_settings = true; // Öffne Settings nach License
+                self.show_settings = true; // Open Settings after License
             }
             Message::Tick => {
-                // Periodische Updates (z.B. Download-Progress aktualisieren)
+                // Periodic updates (e.g., update download progress)
                 self.update_download_progress();
                 
-                // Prüfe auf Network-Events (non-blocking) über globalen Zugriff
+                // Check for Network events (non-blocking) via global access
                 if let Some(rx) = crate::network_bridge::get_network_event_rx() {
                     if let Ok(mut rx) = rx.lock() {
                         while let Ok(event) = rx.try_recv() {
@@ -404,7 +404,7 @@ impl DeckDropApp {
     }
 
     pub fn view(&self) -> Element<Message> {
-        // Haupt-Layout
+        // Main layout
         let content = if self.show_license_dialog {
             self.view_license_dialog()
         } else if self.show_settings {
@@ -430,7 +430,7 @@ impl DeckDropApp {
 }
 
 impl DeckDropApp {
-    /// Behandelt Network-Events
+    /// Handles network events
     fn handle_network_event(&mut self, event: DiscoveryEvent) {
         match event {
             DiscoveryEvent::PeerFound(peer_info) => {
@@ -442,7 +442,7 @@ impl DeckDropApp {
             DiscoveryEvent::PeerLost(peer_id) => {
                 self.peers.retain(|p| p.id != peer_id);
                 self.status.peer_count = self.peers.len();
-                // Entferne auch Spiele dieses Peers
+                // Also remove games from this peer
                 self.network_games.retain(|_, games| {
                     games.retain(|(pid, _)| pid != &peer_id);
                     !games.is_empty()
@@ -458,15 +458,15 @@ impl DeckDropApp {
                 }
             }
             DiscoveryEvent::GameMetadataReceived { peer_id, game_id, deckdrop_toml, deckdrop_chunks_toml } => {
-                // Starte Download mit den empfangenen Metadaten
+                // Start download with received metadata
                 if let Err(e) = deckdrop_core::start_game_download(
                     &game_id,
                     &deckdrop_toml,
                     &deckdrop_chunks_toml,
                 ) {
-                    eprintln!("Fehler beim Starten des Downloads für {}: {}", game_id, e);
+                    eprintln!("Error starting download for {}: {}", game_id, e);
                 } else {
-                    // Lade Manifest für UI-Update
+                    // Load manifest for UI update
                     if let Ok(manifest_path) = deckdrop_core::get_manifest_path(&game_id) {
                         if let Ok(manifest) = deckdrop_core::DownloadManifest::load(&manifest_path) {
                             let progress_percent = manifest.progress.percentage as f32;
@@ -480,26 +480,26 @@ impl DeckDropApp {
                 }
             }
             DiscoveryEvent::ChunkReceived { peer_id, chunk_hash, chunk_data: _ } => {
-                // TODO: Chunk verarbeiten
-                println!("ChunkReceived: {} von {}", chunk_hash, peer_id);
+                // TODO: Process chunk
+                println!("ChunkReceived: {} from {}", chunk_hash, peer_id);
             }
             DiscoveryEvent::ChunkRequestFailed { peer_id, chunk_hash, error } => {
-                eprintln!("ChunkRequestFailed: {} von {}: {}", chunk_hash, peer_id, error);
+                eprintln!("ChunkRequestFailed: {} from {}: {}", chunk_hash, peer_id, error);
             }
         }
     }
     
-    /// Aktualisiert Download-Progress
+    /// Updates download progress
     fn update_download_progress(&mut self) {
-        // Prüfe alle Spiele im Netzwerk, ob sie Downloads haben
+        // Check all games in network if they have downloads
         for game_id in self.network_games.keys() {
             if let Ok(manifest_path) = deckdrop_core::get_manifest_path(game_id) {
                 if manifest_path.exists() {
                     if let Ok(manifest) = deckdrop_core::DownloadManifest::load(&manifest_path) {
-                        // Berechne Progress basierend auf progress.percentage
+                        // Calculate progress based on progress.percentage
                         let progress_percent = manifest.progress.percentage as f32;
                         
-                        // Aktualisiere oder füge Download-State hinzu
+                        // Update or add download state
                         self.active_downloads.insert(game_id.clone(), DownloadState {
                             manifest: manifest.clone(),
                             progress_percent,
@@ -509,7 +509,7 @@ impl DeckDropApp {
             }
         }
         
-        // Entferne Downloads, die nicht mehr existieren
+        // Remove downloads that no longer exist
         self.active_downloads.retain(|game_id, _| {
             if let Ok(manifest_path) = deckdrop_core::get_manifest_path(game_id) {
                 manifest_path.exists()
@@ -521,17 +521,17 @@ impl DeckDropApp {
         self.status.active_download_count = self.active_downloads.len();
     }
     
-    /// Zeigt Tabs
+    /// Shows tabs
     fn view_tabs(&self) -> Element<Message> {
         row![
-            button("Meine Spiele")
+            button("My Games")
                 .on_press(Message::TabChanged(Tab::MyGames))
                 .style(if self.current_tab == Tab::MyGames {
                     button::primary
                 } else {
                     button::secondary
                 }),
-            button("Spiele im Netzwerk")
+            button("Network Games")
                 .on_press(Message::TabChanged(Tab::NetworkGames))
                 .style(if self.current_tab == Tab::NetworkGames {
                     button::primary
@@ -545,7 +545,7 @@ impl DeckDropApp {
                 } else {
                     button::secondary
                 }),
-            button("Einstellungen")
+            button("Settings")
                 .on_press(Message::TabChanged(Tab::Settings))
                 .style(if self.current_tab == Tab::Settings {
                     button::primary
@@ -557,7 +557,7 @@ impl DeckDropApp {
         .into()
     }
     
-    /// Zeigt aktuellen Tab
+    /// Shows current tab
     fn view_current_tab(&self) -> Element<Message> {
         match self.current_tab {
             Tab::MyGames => self.view_my_games(),
@@ -567,26 +567,26 @@ impl DeckDropApp {
         }
     }
     
-    /// Zeigt "Meine Spiele" Tab
+    /// Shows "My Games" tab
     fn view_my_games(&self) -> Element<Message> {
         let mut games_column = Column::new()
             .spacing(10)
             .padding(10);
         
-        // Header mit "Spiel hinzufügen" Button
+        // Header with "Add Game" button
         games_column = games_column.push(
             row![
-                text("Meine Spiele").size(24),
+                text("My Games").size(24),
                 Space::with_width(Length::Fill),
-                button("+ Spiel hinzufügen")
+                button("+ Add Game")
                     .on_press(Message::AddGame),
             ]
         );
         
-        // Spiele-Liste
+        // Games list
         if self.my_games.is_empty() {
             games_column = games_column.push(
-                text("Keine Spiele vorhanden. Klicke auf '+ Spiel hinzufügen' um ein Spiel hinzuzufügen.")
+                text("No games available. Click '+ Add Game' to add a game.")
             );
         } else {
             for (game_path, game) in &self.my_games {
@@ -595,7 +595,7 @@ impl DeckDropApp {
                         column![
                             text(&game.name).size(18),
                             text(format!("Version: {}", game.version)).size(14),
-                            text(format!("Pfad: {}", game_path.display())).size(12),
+                            text(format!("Path: {}", game_path.display())).size(12),
                         ]
                         .spacing(5)
                         .padding(15)
@@ -612,19 +612,19 @@ impl DeckDropApp {
             .into()
     }
     
-    /// Zeigt "Spiele im Netzwerk" Tab
+    /// Shows "Network Games" tab
     fn view_network_games(&self) -> Element<Message> {
         let mut games_column = Column::new()
             .spacing(10)
             .padding(10);
         
         games_column = games_column.push(
-            text("Spiele im Netzwerk").size(24)
+            text("Network Games").size(24)
         );
         
         if self.network_games.is_empty() {
             games_column = games_column.push(
-                text("Keine Spiele im Netzwerk gefunden.")
+                text("No games found in network.")
             );
         } else {
             for (game_id, games) in &self.network_games {
@@ -637,7 +637,7 @@ impl DeckDropApp {
                             column![
                                 text(&game_info.name).size(18),
                                 text(format!("Version: {}", game_info.version)).size(14),
-                                text(format!("Von: {} Peer(s)", games.len())).size(12),
+                                text(format!("From: {} Peer(s)", games.len())).size(12),
                             ]
                             .width(Length::Fill),
                             if is_downloading {
@@ -660,7 +660,7 @@ impl DeckDropApp {
                                             .on_press(Message::ResumeDownload(game_id.clone()))
                                             .style(button::secondary)
                                     } else {
-                                        button("Download läuft...")
+                                        button("Downloading...")
                                             .style(button::secondary)
                                     },
                                     button("Cancel")
@@ -678,7 +678,7 @@ impl DeckDropApp {
                         .spacing(10),
                     ];
                     
-                    // Zeige Progress-Bar wenn Download aktiv
+                    // Show progress bar when download is active
                     if let Some(download_state) = download_state {
                         game_column = game_column.push(
                             column![
@@ -689,7 +689,7 @@ impl DeckDropApp {
                             .spacing(5)
                         );
                         
-                        // Zeige Status
+                        // Show status
                         let status_text = match download_state.manifest.overall_status {
                             deckdrop_core::DownloadStatus::Downloading => "Downloading...",
                             deckdrop_core::DownloadStatus::Paused => "Paused",
@@ -719,27 +719,27 @@ impl DeckDropApp {
             .into()
     }
     
-    /// Zeigt "Peers" Tab
+    /// Shows "Peers" tab
     fn view_peers(&self) -> Element<Message> {
         let mut peers_column = Column::new()
             .spacing(10)
             .padding(10);
         
         peers_column = peers_column.push(
-            text("Gefundene Peers").size(24)
+            text("Found Peers").size(24)
         );
         
         if self.peers.is_empty() {
             peers_column = peers_column.push(
-                text("Keine Peers gefunden.")
+                text("No peers found.")
             );
         } else {
             for peer in &self.peers {
                 peers_column = peers_column.push(
                     container(
                         column![
-                            text(format!("Peer-ID: {}", &peer.id[..16.min(peer.id.len())])).size(14),
-                            text(format!("Spiele: {}", peer.games_count.unwrap_or(0))).size(12),
+                            text(format!("Peer ID: {}", &peer.id[..16.min(peer.id.len())])).size(14),
+                            text(format!("Games: {}", peer.games_count.unwrap_or(0))).size(12),
                         ]
                         .spacing(5)
                         .padding(15)
@@ -756,18 +756,18 @@ impl DeckDropApp {
             .into()
     }
     
-    /// Zeigt "Einstellungen" Tab
+    /// Shows "Settings" tab
     fn view_settings_tab(&self) -> Element<Message> {
         column![
-            text("Einstellungen").size(24),
-            text_input("Spielername", &self.config.player_name)
+            text("Settings").size(24),
+            text_input("Player Name", &self.config.player_name)
                 .on_input(Message::SettingsPlayerNameChanged)
                 .padding(10),
-            text_input("Download-Pfad", &self.config.download_path.to_string_lossy())
+            text_input("Download Path", &self.config.download_path.to_string_lossy())
                 .on_input(Message::SettingsDownloadPathChanged)
                 .padding(10),
             row![
-                button("Speichern")
+                button("Save")
                     .on_press(Message::SaveSettings),
             ]
             .spacing(10),
@@ -777,26 +777,26 @@ impl DeckDropApp {
         .into()
     }
     
-    /// Zeigt License-Dialog
+    /// Shows license dialog
     fn view_license_dialog(&self) -> Element<Message> {
         container(
             column![
-                text("Willkommen bei DeckDrop").size(28),
+                text("Welcome to DeckDrop").size(28),
                 Space::with_height(20),
-                text("Bevor du DeckDrop nutzen kannst, musst du den Nutzungsbedingungen zustimmen.").size(16),
+                text("Before you can use DeckDrop, you must agree to the terms and conditions.").size(16),
                 Space::with_height(20),
                 scrollable(
-                    text("DeckDrop ist eine Peer-to-Peer-Spiele-Sharing-Plattform.\n\n\
-                          Durch die Nutzung von DeckDrop erklärst du dich damit einverstanden:\n\n\
-                          • Nur Spiele zu teilen, für die du die Rechte besitzt\n\
-                          • Keine illegalen Inhalte zu teilen\n\
-                          • Die Verantwortung für deine geteilten Inhalte zu übernehmen\n\n\
-                          DeckDrop übernimmt keine Haftung für geteilte Inhalte.")
+                    text("DeckDrop is a peer-to-peer game sharing platform.\n\n\
+                          By using DeckDrop, you agree to:\n\n\
+                          • Only share games for which you have the rights\n\
+                          • Not share illegal content\n\
+                          • Take responsibility for your shared content\n\n\
+                          DeckDrop assumes no liability for shared content.")
                         .size(14)
                 )
                 .height(Length::Fixed(200.0)),
                 Space::with_height(20),
-                button("Akzeptieren")
+                button("Accept")
                     .on_press(Message::AcceptLicense)
                     .style(button::primary),
             ]
@@ -809,27 +809,27 @@ impl DeckDropApp {
         .into()
     }
     
-    /// Zeigt Settings-Dialog
+    /// Shows settings dialog
     fn view_settings(&self) -> Element<Message> {
         container(
             column![
-                text("Einstellungen").size(28),
+                text("Settings").size(28),
                 Space::with_height(20),
-                text("Spielername:").size(16),
-                text_input("Spielername", &self.settings_player_name)
+                text("Player Name:").size(16),
+                text_input("Player Name", &self.settings_player_name)
                     .on_input(Message::SettingsPlayerNameChanged)
                     .padding(10),
                 Space::with_height(10),
-                text("Download-Pfad:").size(16),
-                text_input("Download-Pfad", &self.settings_download_path)
+                text("Download Path:").size(16),
+                text_input("Download Path", &self.settings_download_path)
                     .on_input(Message::SettingsDownloadPathChanged)
                     .padding(10),
                 Space::with_height(20),
                 row![
-                    button("Abbrechen")
+                    button("Cancel")
                         .on_press(Message::CancelSettings),
                     Space::with_width(Length::Fill),
-                    button("Speichern")
+                    button("Save")
                         .on_press(Message::SaveSettings)
                         .style(button::primary),
                 ]
@@ -899,7 +899,7 @@ impl DeckDropApp {
     }
 }
 
-/// Box-Style für Container
+/// Box style for container
 fn container_box_style(theme: &Theme) -> iced::widget::container::Style {
     use iced::widget::container;
     let palette = theme.palette();
