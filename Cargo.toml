@@ -1,6 +1,7 @@
 [workspace]
 members = [
-     "deckdrop-network",
-     "deckdrop-gtk",
+    "deckdrop-network",
+    "deckdrop-core",
+    "deckdrop-ui",
 ]
 resolver = "2"

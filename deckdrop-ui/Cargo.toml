@@ -1,0 +1,22 @@
+[package]
+name = "deckdrop-ui"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "deckdrop"
+path = "src/main.rs"
+
+[dependencies]
+deckdrop-core = { path = "../deckdrop-core" }
+deckdrop-network = { path = "../deckdrop-network" }
+iced = "0.13"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+directories = "5"
+libp2p = { version = "0.54", features = ["identify"] }
+async-channel = "2"
+
