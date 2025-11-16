@@ -77,7 +77,7 @@ impl DownloadManifest {
             let chunk_count = entry.chunk_count as usize;
             total_chunks += chunk_count;
             
-            // Generiere Chunk-Hashes dynamisch basierend auf Position
+            // Generiere Chunk-Hashes dynamisch basierend auf Position 
             // Format: "{file_hash}:{chunk_index}" für eindeutige Identifikation
             let chunk_hashes: Vec<String> = (0..chunk_count)
                 .map(|i| format!("{}:{}", entry.file_hash, i))
