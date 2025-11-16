@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=DeckDrop
+Comment=Local P2P game sharing for Steam Deck
+Exec=deckdrop
+Icon=deckdrop
+Terminal=false
+Categories=Game;Utility;
+StartupNotify=true
