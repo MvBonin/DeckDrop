@@ -1,6 +1,6 @@
 //! Network-Bridge: Verbindet Tokio Network-Thread mit Iced UI-Thread
 
-use deckdrop_network::network::discovery::{start_discovery, DiscoveryEvent, DownloadRequest, GamesLoader, GameMetadataLoader, ChunkLoader};
+use deckdrop_network::network::discovery::{start_discovery, DiscoveryEvent, DownloadRequest, GamesLoader, GameMetadataLoader, ChunkLoader, MetadataUpdate};
 use deckdrop_network::network::games::NetworkGameInfo;
 use deckdrop_core::{Config, GameInfo, check_game_config_exists, load_games_from_directory};
 use std::sync::Arc;
@@ -12,6 +12,7 @@ use libp2p::identity::Keypair;
 pub struct NetworkBridge {
     pub event_rx: mpsc::Receiver<DiscoveryEvent>,
     pub download_request_tx: tokio::sync::mpsc::UnboundedSender<DownloadRequest>,
+    pub metadata_update_tx: tokio::sync::mpsc::UnboundedSender<MetadataUpdate>,
 }
 
 /// Globaler Network Event Receiver (für einfachen Zugriff)
@@ -19,6 +20,9 @@ static NETWORK_EVENT_RX: std::sync::OnceLock<Arc<std::sync::Mutex<mpsc::Receiver
 
 /// Globaler Download Request Sender (für einfachen Zugriff)
 static DOWNLOAD_REQUEST_TX: std::sync::OnceLock<tokio::sync::mpsc::UnboundedSender<DownloadRequest>> = std::sync::OnceLock::new();
+
+/// Globaler Metadata Update Sender (für einfachen Zugriff)
+static METADATA_UPDATE_TX: std::sync::OnceLock<tokio::sync::mpsc::UnboundedSender<MetadataUpdate>> = std::sync::OnceLock::new();
 
 /// Setzt den globalen Network Event Receiver
 pub fn set_network_event_rx(rx: Arc<std::sync::Mutex<mpsc::Receiver<DiscoveryEvent>>>) {
@@ -40,6 +44,16 @@ pub fn get_download_request_tx() -> Option<tokio::sync::mpsc::UnboundedSender<Do
     DOWNLOAD_REQUEST_TX.get().cloned()
 }
 
+/// Setzt den globalen Metadata Update Sender
+pub fn set_metadata_update_tx(tx: tokio::sync::mpsc::UnboundedSender<MetadataUpdate>) {
+    let _ = METADATA_UPDATE_TX.set(tx);
+}
+
+/// Gibt den globalen Metadata Update Sender zurück
+pub fn get_metadata_update_tx() -> Option<tokio::sync::mpsc::UnboundedSender<MetadataUpdate>> {
+    METADATA_UPDATE_TX.get().cloned()
+}
+
 impl NetworkBridge {
     /// Startet den Network-Thread und gibt eine NetworkBridge zurück
     pub fn start() -> Self {
@@ -48,6 +62,10 @@ impl NetworkBridge {
         // Channel für Download-Requests (vom UI-Thread zum Network-Thread)
         let (download_request_tx, download_request_rx) = tokio::sync::mpsc::unbounded_channel::<DownloadRequest>();
         let download_request_tx_clone = download_request_tx.clone();
+        
+        // Channel für Metadata-Updates (vom UI-Thread zum Network-Thread)
+        let (metadata_update_tx, metadata_update_rx) = tokio::sync::mpsc::unbounded_channel::<MetadataUpdate>();
+        let metadata_update_tx_clone = metadata_update_tx.clone();
         
         // Lade Konfiguration
         let config = Config::load();
@@ -211,6 +229,7 @@ impl NetworkBridge {
                     game_metadata_loader,
                     chunk_loader,
                     Some(download_request_rx),
+                    Some(metadata_update_rx),
                 ).await;
                 
                 // Halte Runtime am Leben
@@ -223,6 +242,7 @@ impl NetworkBridge {
         Self {
             event_rx,
             download_request_tx: download_request_tx_clone,
+            metadata_update_tx: metadata_update_tx_clone,
         }
     }
 }

@@ -401,6 +401,42 @@ pub fn request_missing_chunks(
     Ok(())
 }
 
+/// Lädt alle aktiven Downloads aus dem Manifest-Verzeichnis
+pub fn load_active_downloads() -> Vec<(String, DownloadManifest)> {
+    let base_dir = match directories::ProjectDirs::from("com", "deckdrop", "deckdrop") {
+        Some(dir) => dir,
+        None => return Vec::new(),
+    };
+    let config_dir = base_dir.config_dir();
+    let games_dir = config_dir.join("games");
+    
+    if !games_dir.exists() {
+        return Vec::new();
+    }
+    
+    let mut downloads = Vec::new();
+    
+    // Durchsuche alle Spiel-Verzeichnisse
+    if let Ok(entries) = std::fs::read_dir(&games_dir) {
+        for entry in entries {
+            if let Ok(entry) = entry {
+                let manifest_path = entry.path().join("manifest.json");
+                
+                if manifest_path.exists() {
+                    if let Ok(manifest) = DownloadManifest::load(&manifest_path) {
+                        // Nur Downloads, die nicht abgebrochen sind
+                        if !matches!(manifest.overall_status, DownloadStatus::Cancelled) {
+                            downloads.push((manifest.game_id.clone(), manifest));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    downloads
+}
+
 /// Findet die game_id für einen Chunk durch Suche in allen Manifesten
 pub fn find_game_id_for_chunk(chunk_hash: &str) -> Result<String, Box<dyn std::error::Error>> {
     let base_dir = directories::ProjectDirs::from("com", "deckdrop", "deckdrop")

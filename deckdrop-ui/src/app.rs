@@ -69,6 +69,9 @@ pub struct DeckDropApp {
     // Settings-Felder
     pub settings_player_name: String,
     pub settings_download_path: String,
+    
+    // License Dialog fields
+    pub license_player_name: String,
 }
 
 /// Tab selection
@@ -133,7 +136,53 @@ impl Default for DeckDropApp {
                 my_games.len() - before_count, game_path.display());
         }
         
-        println!("[DEBUG] Total games loaded: {}", my_games.len());
+        // 3. Lade aktive Downloads aus Manifesten und füge sie zu my_games hinzu
+        let active_downloads_from_manifests = deckdrop_core::load_active_downloads();
+        let mut active_downloads = HashMap::new();
+        println!("[DEBUG] Loading {} active downloads from manifests", active_downloads_from_manifests.len());
+        for (game_id, manifest) in active_downloads_from_manifests {
+            // Versuche, die GameInfo aus dem Manifest-Verzeichnis zu laden
+            if let Ok(manifest_path) = deckdrop_core::get_manifest_path(&game_id) {
+                if let Some(manifest_dir) = manifest_path.parent() {
+                    if let Ok(game_info) = deckdrop_core::GameInfo::load_from_path(manifest_dir) {
+                        // Füge das Spiel nur hinzu, wenn es nicht bereits in my_games ist
+                        let game_path = PathBuf::from(&manifest.game_path);
+                        if !my_games.iter().any(|(path, _)| path == &game_path) {
+                            my_games.push((game_path.clone(), game_info));
+                            println!("[DEBUG] Added download game: {} (ID: {})", manifest.game_name, game_id);
+                        }
+                    }
+                }
+            }
+            // Initialisiere DownloadState für UI
+            let progress_percent = manifest.progress.percentage as f32;
+            active_downloads.insert(game_id.clone(), DownloadState {
+                manifest: manifest.clone(),
+                progress_percent,
+            });
+        }
+        
+        println!("[DEBUG] Total games loaded: {} (including {} downloads)", my_games.len(), active_downloads.len());
+        
+        // Deduplicate games by game_id before initializing integrity status
+        {
+            use std::collections::HashMap;
+            let mut seen_ids = HashMap::new();
+            let mut deduplicated = Vec::new();
+            
+            for (game_path, game_info) in &my_games {
+                let game_id = &game_info.game_id;
+                if !seen_ids.contains_key(game_id) {
+                    seen_ids.insert(game_id.clone(), game_path.clone());
+                    deduplicated.push((game_path.clone(), game_info.clone()));
+                } else {
+                    println!("[DEBUG] Duplicate game_id detected in Default::default(): {} (path: {}), keeping first occurrence", 
+                        game_id, game_path.display());
+                }
+            }
+            
+            my_games = deduplicated;
+        }
         
         let mut game_integrity_status = HashMap::new();
         // Initialize all games as "Checking" - get total file count immediately
@@ -182,7 +231,21 @@ impl Default for DeckDropApp {
                 active_download_count: 0,
             },
             _network_event_rx: Arc::new(std::sync::Mutex::new(rx)),
-            show_license_dialog: !Config::has_peer_id(),
+            show_license_dialog: {
+                // Show dialog if no peer ID exists OR if config doesn't exist or has default player name
+                let config_path = deckdrop_core::Config::config_path();
+                let should_show = if let Some(path) = config_path {
+                    if !path.exists() {
+                        true // Config doesn't exist, show dialog
+                    } else {
+                        // Config exists, check if player name is set (not default)
+                        config.player_name.is_empty() || config.player_name == "Player"
+                    }
+                } else {
+                    !Config::has_peer_id() // Fallback to peer ID check
+                };
+                should_show
+            },
             show_settings: false,
             show_add_game_dialog: false,
             add_game_path: String::new(),
@@ -194,6 +257,7 @@ impl Default for DeckDropApp {
             add_game_additional_instructions: String::new(),
             settings_player_name: config.player_name.clone(),
             settings_download_path: config.download_path.to_string_lossy().to_string(),
+            license_player_name: config.player_name.clone(),
         }
     }
 }
@@ -235,6 +299,7 @@ pub enum Message {
     CancelSettings,
     
     // License Dialog
+    LicensePlayerNameChanged(String),
     AcceptLicense,
     
     // Periodic updates
@@ -276,6 +341,50 @@ impl DeckDropApp {
             my_games.extend(deckdrop_core::load_games_from_directory(game_path));
         }
         
+        // 3. Lade aktive Downloads aus Manifesten und füge sie zu my_games hinzu
+        let active_downloads_from_manifests = deckdrop_core::load_active_downloads();
+        let mut active_downloads = HashMap::new();
+        for (game_id, manifest) in active_downloads_from_manifests {
+            // Versuche, die GameInfo aus dem Manifest-Verzeichnis zu laden
+            if let Ok(manifest_path) = deckdrop_core::get_manifest_path(&game_id) {
+                if let Some(manifest_dir) = manifest_path.parent() {
+                    if let Ok(game_info) = deckdrop_core::GameInfo::load_from_path(manifest_dir) {
+                        // Füge das Spiel nur hinzu, wenn es nicht bereits in my_games ist
+                        let game_path = PathBuf::from(&manifest.game_path);
+                        if !my_games.iter().any(|(path, _)| path == &game_path) {
+                            my_games.push((game_path.clone(), game_info));
+                        }
+                    }
+                }
+            }
+            // Initialisiere DownloadState für UI
+            let progress_percent = manifest.progress.percentage as f32;
+            active_downloads.insert(game_id.clone(), DownloadState {
+                manifest: manifest.clone(),
+                progress_percent,
+            });
+        }
+        
+        // Deduplicate games by game_id before initializing integrity status
+        {
+            use std::collections::HashMap;
+            let mut seen_ids = HashMap::new();
+            let mut deduplicated = Vec::new();
+            
+            for (game_path, game_info) in &my_games {
+                let game_id = &game_info.game_id;
+                if !seen_ids.contains_key(game_id) {
+                    seen_ids.insert(game_id.clone(), game_path.clone());
+                    deduplicated.push((game_path.clone(), game_info.clone()));
+                } else {
+                    println!("[DEBUG] Duplicate game_id detected in new_with_network_rx(): {} (path: {}), keeping first occurrence", 
+                        game_id, game_path.display());
+                }
+            }
+            
+            my_games = deduplicated;
+        }
+        
         let mut game_integrity_status = HashMap::new();
         // Initialize all games as "Checking" - get total file count immediately
         println!("[DEBUG] new_with_network_rx: Initializing integrity status for {} games", my_games.len());
@@ -312,7 +421,7 @@ impl DeckDropApp {
             my_games,
             network_games: HashMap::new(),
             peers: Vec::new(),
-            active_downloads: HashMap::new(),
+            active_downloads,
             game_integrity_status,
             integrity_check_start_time: HashMap::new(),
             integrity_check_progress: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -323,7 +432,21 @@ impl DeckDropApp {
                 active_download_count: 0,
             },
             _network_event_rx: network_event_rx,
-            show_license_dialog: !Config::has_peer_id(),
+            show_license_dialog: {
+                // Show dialog if no peer ID exists OR if config doesn't exist or has default player name
+                let config_path = deckdrop_core::Config::config_path();
+                let should_show = if let Some(path) = config_path {
+                    if !path.exists() {
+                        true // Config doesn't exist, show dialog
+                    } else {
+                        // Config exists, check if player name is set (not default)
+                        config.player_name.is_empty() || config.player_name == "Player"
+                    }
+                } else {
+                    !Config::has_peer_id() // Fallback to peer ID check
+                };
+                should_show
+            },
             show_settings: false,
             show_add_game_dialog: false,
             add_game_path: String::new(),
@@ -335,6 +458,7 @@ impl DeckDropApp {
             add_game_additional_instructions: String::new(),
             settings_player_name: config.player_name.clone(),
             settings_download_path: config.download_path.to_string_lossy().to_string(),
+            license_player_name: config.player_name.clone(),
         }
     }
 
@@ -342,6 +466,11 @@ impl DeckDropApp {
         match message {
             Message::TabChanged(tab) => {
                 self.current_tab = tab;
+                // Initialize settings fields when Settings tab is opened
+                if tab == Tab::Settings {
+                    self.settings_player_name = self.config.player_name.clone();
+                    self.settings_download_path = self.config.download_path.to_string_lossy().to_string();
+                }
             }
             Message::GameIntegrityChecked(game_path, status) => {
                 println!("[DEBUG] GameIntegrityChecked: {} -> {:?}", game_path.display(), status);
@@ -531,6 +660,9 @@ impl DeckDropApp {
                     self.my_games.extend(deckdrop_core::load_games_from_directory(game_path_dir));
                 }
                 
+                // Deduplicate games by game_id
+                self.deduplicate_games_by_id();
+                
                 // Initialize integrity status for all games as "Checking" - get total file count immediately
                 for (game_path, _) in &self.my_games {
                     let chunks_toml_path = game_path.join("deckdrop_chunks.toml");
@@ -564,6 +696,15 @@ impl DeckDropApp {
                 self.add_game_start_args = String::new();
                 self.add_game_description = String::new();
                 self.add_game_additional_instructions = String::new();
+                
+                // Send metadata update with new games count
+                if let Some(tx) = crate::network_bridge::get_metadata_update_tx() {
+                    let games_count = self.my_games.len() as u32;
+                    let _ = tx.send(deckdrop_network::network::discovery::MetadataUpdate {
+                        player_name: None, // Only update games count
+                        games_count: Some(games_count),
+                    });
+                }
             }
             Message::CancelAddGame => {
                 self.show_add_game_dialog = false;
@@ -588,20 +729,61 @@ impl DeckDropApp {
                 }
             }
             Message::SaveSettings => {
-                // TODO: Save settings
+                // Save settings
+                let player_name_changed = self.config.player_name != self.settings_player_name;
                 self.config.player_name = self.settings_player_name.clone();
                 self.config.download_path = PathBuf::from(&self.settings_download_path);
                 if let Err(e) = self.config.save() {
                     eprintln!("Error saving settings: {}", e);
                 }
+                
+                // Send metadata update if player name changed
+                if player_name_changed {
+                    if let Some(tx) = crate::network_bridge::get_metadata_update_tx() {
+                        let _ = tx.send(deckdrop_network::network::discovery::MetadataUpdate {
+                            player_name: Some(self.config.player_name.clone()),
+                            games_count: None, // Will be updated when games change
+                        });
+                    }
+                }
+                
                 self.show_settings = false;
             }
             Message::CancelSettings => {
                 self.show_settings = false;
             }
+            Message::LicensePlayerNameChanged(name) => {
+                self.license_player_name = name;
+            }
             Message::AcceptLicense => {
+                // Save player name to config
+                self.config.player_name = self.license_player_name.clone();
+                
+                // Generate and save peer ID if it doesn't exist
+                if !deckdrop_core::Config::has_peer_id() {
+                    if let Err(e) = self.config.generate_and_save_peer_id() {
+                        eprintln!("Error generating peer ID: {}", e);
+                    }
+                }
+                
+                // Save config with player name
+                if let Err(e) = self.config.save() {
+                    eprintln!("Error saving config: {}", e);
+                }
+                
+                // Update settings fields
+                self.settings_player_name = self.license_player_name.clone();
+                
+                // Send metadata update with new player name
+                if let Some(tx) = crate::network_bridge::get_metadata_update_tx() {
+                    let _ = tx.send(deckdrop_network::network::discovery::MetadataUpdate {
+                        player_name: Some(self.config.player_name.clone()),
+                        games_count: None, // Will be updated when games change
+                    });
+                }
+                
                 self.show_license_dialog = false;
-                self.show_settings = true; // Open Settings after License
+                // Don't open settings automatically anymore - user can open it from tab
             }
             Message::Tick => {
                 println!("[DEBUG] ===== TICK RECEIVED =====");
@@ -798,11 +980,40 @@ impl DeckDropApp {
 }
 
 impl DeckDropApp {
+    /// Deduplicates games in my_games based on game_id
+    fn deduplicate_games_by_id(&mut self) {
+        use std::collections::HashMap;
+        let mut seen_ids = HashMap::new();
+        let mut deduplicated = Vec::new();
+        
+        for (game_path, game_info) in &self.my_games {
+            let game_id = &game_info.game_id;
+            if !seen_ids.contains_key(game_id) {
+                seen_ids.insert(game_id.clone(), game_path.clone());
+                deduplicated.push((game_path.clone(), game_info.clone()));
+            } else {
+                // Game with this ID already exists, keep the first one
+                println!("[DEBUG] Duplicate game_id detected: {} (path: {}), keeping first occurrence", 
+                    game_id, game_path.display());
+            }
+        }
+        
+        self.my_games = deduplicated;
+    }
+    
     /// Handles network events
     fn handle_network_event(&mut self, event: DiscoveryEvent) {
         match event {
             DiscoveryEvent::PeerFound(peer_info) => {
-                if !self.peers.iter().any(|p| p.id == peer_info.id) {
+                // Find existing peer or add new one
+                if let Some(existing_peer) = self.peers.iter_mut().find(|p| p.id == peer_info.id) {
+                    // Update existing peer with new information
+                    existing_peer.player_name = peer_info.player_name.clone();
+                    existing_peer.games_count = peer_info.games_count;
+                    existing_peer.addr = peer_info.addr.clone();
+                    existing_peer.version = peer_info.version.clone();
+                } else {
+                    // Add new peer
                     self.peers.push(peer_info);
                     self.status.peer_count = self.peers.len();
                 }
@@ -859,19 +1070,180 @@ impl DeckDropApp {
     
     /// Updates download progress
     fn update_download_progress(&mut self) {
-        // Check all games in network if they have downloads
-        for game_id in self.network_games.keys() {
-            if let Ok(manifest_path) = deckdrop_core::get_manifest_path(game_id) {
-                if manifest_path.exists() {
-                    if let Ok(manifest) = deckdrop_core::DownloadManifest::load(&manifest_path) {
-                        // Calculate progress based on progress.percentage
-                        let progress_percent = manifest.progress.percentage as f32;
-                        
-                        // Update or add download state
-                        self.active_downloads.insert(game_id.clone(), DownloadState {
-                            manifest: manifest.clone(),
-                            progress_percent,
-                        });
+        // Load all active downloads from manifests (including those not in network_games)
+        let active_downloads_from_manifests = deckdrop_core::load_active_downloads();
+        
+        // Track which games need to be finalized (only finalize once)
+        let mut games_to_finalize = Vec::new();
+        
+        // Update active_downloads with all manifests
+        for (game_id, manifest) in active_downloads_from_manifests {
+            let progress_percent = manifest.progress.percentage as f32;
+            
+            // Check if this download is complete and needs finalization
+            if matches!(manifest.overall_status, deckdrop_core::DownloadStatus::Complete) {
+                // Mark for finalization (only if not already finalized)
+                let game_path = PathBuf::from(&manifest.game_path);
+                let already_in_my_games = self.my_games.iter().any(|(path, _)| {
+                    // Normalize paths for comparison
+                    path.canonicalize().ok().and_then(|p1| {
+                        game_path.canonicalize().ok().map(|p2| p1 == p2)
+                    }).unwrap_or(false) || path == &game_path
+                });
+                
+                if !already_in_my_games {
+                    games_to_finalize.push((game_id.clone(), manifest.clone()));
+                }
+            }
+            
+            // Update or add download state
+            self.active_downloads.insert(game_id.clone(), DownloadState {
+                manifest: manifest.clone(),
+                progress_percent,
+            });
+        }
+        
+        // Finalize downloads that need it (only once)
+        for (game_id, manifest) in games_to_finalize {
+            // Finalize the download
+            if let Err(e) = deckdrop_core::finalize_game_download(&game_id, &manifest) {
+                eprintln!("Error finalizing download for {}: {}", game_id, e);
+            } else {
+                // Reload games list to include the finalized game
+                let config = deckdrop_core::Config::load();
+                self.my_games.clear();
+                
+                // Reload games from download path
+                if config.download_path.exists() {
+                    self.my_games.extend(deckdrop_core::load_games_from_directory(&config.download_path));
+                }
+                
+                // Reload games from game_paths
+                for game_path in &config.game_paths {
+                    if deckdrop_core::check_game_config_exists(game_path) {
+                        if let Ok(game_info) = deckdrop_core::GameInfo::load_from_path(game_path) {
+                            self.my_games.push((game_path.clone(), game_info));
+                        }
+                    }
+                    self.my_games.extend(deckdrop_core::load_games_from_directory(game_path));
+                }
+                
+                // Deduplicate games by game_id
+                self.deduplicate_games_by_id();
+                
+                // Initialize integrity status for all games
+                for (game_path, _) in &self.my_games {
+                    if !self.game_integrity_status.contains_key(game_path) {
+                        let chunks_toml_path = game_path.join("deckdrop_chunks.toml");
+                        let total = if chunks_toml_path.exists() {
+                            if let Ok(content) = std::fs::read_to_string(&chunks_toml_path) {
+                                if let Ok(parsed) = toml::from_str::<toml::Value>(&content) {
+                                    if let Some(files) = parsed.get("file").and_then(|f| f.as_array()) {
+                                        files.len()
+                                    } else {
+                                        0
+                                    }
+                                } else {
+                                    0
+                                }
+                            } else {
+                                0
+                            }
+                        } else {
+                            0
+                        };
+                        self.game_integrity_status.insert(game_path.clone(), GameIntegrityStatus::Checking { current: 0, total });
+                    }
+                }
+            }
+        }
+        
+        // Add downloading games to my_games if not already present (only for active downloads)
+        for (game_id, download_state) in &self.active_downloads {
+            // Only add if download is not complete (complete downloads are handled above)
+            if !matches!(download_state.manifest.overall_status, deckdrop_core::DownloadStatus::Complete) {
+                let game_path = PathBuf::from(&download_state.manifest.game_path);
+                
+                // Check if game is already in my_games (by game_id, not just path)
+                let already_exists = self.my_games.iter().any(|(_, game_info)| {
+                    game_info.game_id == download_state.manifest.game_id
+                });
+                
+                if !already_exists {
+                    if let Ok(manifest_path) = deckdrop_core::get_manifest_path(game_id) {
+                        if let Some(manifest_dir) = manifest_path.parent() {
+                            if let Ok(game_info) = deckdrop_core::GameInfo::load_from_path(manifest_dir) {
+                                self.my_games.push((game_path.clone(), game_info));
+                                
+                                // Initialize integrity status for downloading game (only if not already set)
+                                if !self.game_integrity_status.contains_key(&game_path) {
+                                    let chunks_toml_path = game_path.join("deckdrop_chunks.toml");
+                                    let total = if chunks_toml_path.exists() {
+                                        if let Ok(content) = std::fs::read_to_string(&chunks_toml_path) {
+                                            if let Ok(parsed) = toml::from_str::<toml::Value>(&content) {
+                                                if let Some(files) = parsed.get("file").and_then(|f| f.as_array()) {
+                                                    files.len()
+                                                } else {
+                                                    0
+                                                }
+                                            } else {
+                                                0
+                                            }
+                                        } else {
+                                            0
+                                        }
+                                    } else {
+                                        0
+                                    };
+                                    self.game_integrity_status.insert(game_path, GameIntegrityStatus::Checking { current: 0, total });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Resume downloads if host is available
+        let games_to_resume: Vec<String> = self.active_downloads
+            .iter()
+            .filter(|(_, download_state)| {
+                matches!(download_state.manifest.overall_status, deckdrop_core::DownloadStatus::Pending | deckdrop_core::DownloadStatus::Paused)
+            })
+            .filter_map(|(game_id, _)| {
+                // Check if peers are available for this game
+                if let Some(peers) = self.network_games.get(game_id) {
+                    if !peers.is_empty() {
+                        Some(game_id.clone())
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            })
+            .collect();
+        
+        for game_id in games_to_resume {
+            // Get peer IDs
+            if let Some(peers) = self.network_games.get(&game_id) {
+                let peer_ids: Vec<String> = peers.iter().map(|(peer_id, _)| peer_id.clone()).collect();
+                
+                // Request missing chunks to resume download
+                if let Some(tx) = crate::network_bridge::get_download_request_tx() {
+                    if let Err(e) = deckdrop_core::request_missing_chunks(&game_id, &peer_ids, &tx, 3) {
+                        eprintln!("Error resuming download for {}: {}", game_id, e);
+                    } else {
+                        // Update status to Downloading
+                        if let Some(ds) = self.active_downloads.get_mut(&game_id) {
+                            ds.manifest.overall_status = deckdrop_core::DownloadStatus::Downloading;
+                            
+                            // Save updated manifest
+                            if let Ok(manifest_path) = deckdrop_core::get_manifest_path(&game_id) {
+                                let _ = ds.manifest.save(&manifest_path);
+                            }
+                        }
+                        println!("Resumed download for game: {}", game_id);
                     }
                 }
             }
@@ -958,41 +1330,98 @@ impl DeckDropApp {
             );
         } else {
             for (game_path, game) in &self.my_games {
+                // Check if this game is currently downloading
+                let download_state = self.active_downloads.values().find(|ds| {
+                    PathBuf::from(&ds.manifest.game_path) == *game_path
+                });
+                
                 let integrity_status = self.game_integrity_status.get(game_path)
                     .unwrap_or(&GameIntegrityStatus::Checking { current: 0, total: 0 });
                 
-                let (status_text, status_color) = match integrity_status {
-                    GameIntegrityStatus::Checking { current, total } => {
-                        if *total > 0 {
-                            (format!("Checking {}/{}...", *current + 1, *total), Color::from_rgba(0.7, 0.7, 0.7, 1.0))
-                        } else {
-                            ("Checking...".to_string(), Color::from_rgba(0.7, 0.7, 0.7, 1.0))
+                let mut game_column = column![
+                    text(&game.name).size(18),
+                    text(format!("Version: {}", game.version)).size(14),
+                    text(format!("Path: {}", game_path.display())).size(12),
+                ];
+                
+                // Show download status if downloading
+                if let Some(ds) = download_state {
+                    let download_status_text = match ds.manifest.overall_status {
+                        deckdrop_core::DownloadStatus::Downloading => {
+                            format!("Downloading... {:.1}%", ds.progress_percent)
                         }
+                        deckdrop_core::DownloadStatus::Paused => "Paused".to_string(),
+                        deckdrop_core::DownloadStatus::Pending => "Waiting for host...".to_string(),
+                        deckdrop_core::DownloadStatus::Complete => "Download complete".to_string(),
+                        deckdrop_core::DownloadStatus::Error(ref e) => format!("Download error: {}", e),
+                        deckdrop_core::DownloadStatus::Cancelled => "Cancelled".to_string(),
+                    };
+                    
+                    let download_status_color = match ds.manifest.overall_status {
+                        deckdrop_core::DownloadStatus::Downloading => Color::from_rgba(0.0, 0.7, 1.0, 1.0),
+                        deckdrop_core::DownloadStatus::Paused => Color::from_rgba(1.0, 0.7, 0.0, 1.0),
+                        deckdrop_core::DownloadStatus::Pending => Color::from_rgba(0.7, 0.7, 0.7, 1.0),
+                        deckdrop_core::DownloadStatus::Complete => Color::from_rgba(0.0, 1.0, 0.0, 1.0),
+                        deckdrop_core::DownloadStatus::Error(_) => Color::from_rgba(1.0, 0.0, 0.0, 1.0),
+                        deckdrop_core::DownloadStatus::Cancelled => Color::from_rgba(0.7, 0.7, 0.7, 1.0),
+                    };
+                    
+                    game_column = game_column.push(
+                        text(download_status_text.clone())
+                            .size(11)
+                            .style(move |_theme: &Theme| {
+                                iced::widget::text::Style {
+                                    color: Some(download_status_color),
+                                }
+                            })
+                    );
+                    
+                    // Show progress bar for active downloads
+                    if matches!(ds.manifest.overall_status, deckdrop_core::DownloadStatus::Downloading) {
+                        game_column = game_column.push(
+                            progress_bar(0.0..=100.0, ds.progress_percent)
+                                .width(Length::Fill)
+                        );
                     }
-                    GameIntegrityStatus::Intact => ("Game files intact".to_string(), Color::from_rgba(0.0, 1.0, 0.0, 1.0)),
-                    GameIntegrityStatus::Changed => ("Game files have changed".to_string(), Color::from_rgba(1.0, 0.7, 0.0, 1.0)),
-                    GameIntegrityStatus::Error(_) => ("Error checking integrity".to_string(), Color::from_rgba(1.0, 0.0, 0.0, 1.0)),
+                }
+                
+                // Show integrity status (only if not downloading or download is complete)
+                let show_integrity = if let Some(ds) = download_state {
+                    matches!(ds.manifest.overall_status, deckdrop_core::DownloadStatus::Complete)
+                } else {
+                    true
                 };
                 
+                if show_integrity {
+                    let (status_text, status_color) = match integrity_status {
+                        GameIntegrityStatus::Checking { current, total } => {
+                            if *total > 0 {
+                                (format!("Checking {}/{}...", *current + 1, *total), Color::from_rgba(0.7, 0.7, 0.7, 1.0))
+                            } else {
+                                ("Checking...".to_string(), Color::from_rgba(0.7, 0.7, 0.7, 1.0))
+                            }
+                        }
+                        GameIntegrityStatus::Intact => ("Game files intact".to_string(), Color::from_rgba(0.0, 1.0, 0.0, 1.0)),
+                        GameIntegrityStatus::Changed => ("Game files have changed".to_string(), Color::from_rgba(1.0, 0.7, 0.0, 1.0)),
+                        GameIntegrityStatus::Error(_) => ("Error checking integrity".to_string(), Color::from_rgba(1.0, 0.0, 0.0, 1.0)),
+                    };
+                    
+                    game_column = game_column.push(
+                        text(status_text.clone())
+                            .size(11)
+                            .style(move |_theme: &Theme| {
+                                iced::widget::text::Style {
+                                    color: Some(status_color),
+                                }
+                            })
+                    );
+                }
+                
                 games_column = games_column.push(
-                    container(
-                        column![
-                            text(&game.name).size(18),
-                            text(format!("Version: {}", game.version)).size(14),
-                            text(format!("Path: {}", game_path.display())).size(12),
-                            text(status_text.clone())
-                                .size(11)
-                                .style(move |_theme: &Theme| {
-                                    iced::widget::text::Style {
-                                        color: Some(status_color),
-                                    }
-                                }),
-                        ]
-                        .spacing(5)
+                    container(game_column)
+                        .style(container_box_style)
+                        .width(Length::Fill)
                         .padding(15)
-                    )
-                    .style(container_box_style)
-                    .width(Length::Fill)
                 );
             }
         }
@@ -1126,11 +1555,32 @@ impl DeckDropApp {
             );
         } else {
             for peer in &self.peers {
+                // Calculate actual games count from network_games
+                let actual_games_count = self.network_games
+                    .values()
+                    .filter(|games| games.iter().any(|(peer_id, _)| peer_id == &peer.id))
+                    .count();
+                
+                // Use games_count from peer_info if available, otherwise use actual count
+                let games_count = peer.games_count.unwrap_or(actual_games_count as u32);
+                
+                // Get player name or use default
+                let player_name = peer.player_name.as_ref()
+                    .map(|n| n.as_str())
+                    .unwrap_or("Unknown");
+                
+                // Get version or use default
+                let version = peer.version.as_ref()
+                    .map(|v| v.as_str())
+                    .unwrap_or("Unknown");
+                
                 peers_column = peers_column.push(
                     container(
                         column![
-                            text(format!("Peer ID: {}", &peer.id[..16.min(peer.id.len())])).size(14),
-                            text(format!("Games: {}", peer.games_count.unwrap_or(0))).size(12),
+                            text(format!("Player: {}", player_name)).size(16),
+                            text(format!("Peer ID: {}", &peer.id[..16.min(peer.id.len())])).size(12),
+                            text(format!("Games: {}", games_count)).size(12),
+                            text(format!("Version: {}", version)).size(12),
                         ]
                         .spacing(5)
                         .padding(15)
@@ -1149,9 +1599,10 @@ impl DeckDropApp {
     
     /// Shows "Settings" tab
     fn view_settings_tab(&self) -> Element<Message> {
+        let version = env!("CARGO_PKG_VERSION");
         column![
             text("Settings").size(24),
-            text_input("Player Name", &self.config.player_name)
+            text_input("Player Name", &self.settings_player_name)
                 .on_input(Message::SettingsPlayerNameChanged)
                 .padding(10),
             row![
@@ -1163,6 +1614,7 @@ impl DeckDropApp {
                     .padding(10),
             ]
             .spacing(10),
+            text(format!("Version: {}", version)).size(12),
             row![
                 button("Save")
                     .on_press(Message::SaveSettings),
@@ -1181,6 +1633,11 @@ impl DeckDropApp {
                 text("Welcome to DeckDrop").size(28),
                 Space::with_height(20),
                 text("Before you can use DeckDrop, you must agree to the terms and conditions.").size(16),
+                Space::with_height(20),
+                text("Player Name:").size(16),
+                text_input("Enter your player name", &self.license_player_name)
+                    .on_input(Message::LicensePlayerNameChanged)
+                    .padding(10),
                 Space::with_height(20),
                 scrollable(
                     text("DeckDrop is a peer-to-peer game sharing platform.\n\n\

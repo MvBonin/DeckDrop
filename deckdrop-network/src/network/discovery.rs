@@ -4,7 +4,6 @@ use libp2p::{
     swarm::SwarmEvent, PeerId,
 };
 use std::str::FromStr;
-use futures::StreamExt;
 use std::net::IpAddr;
 use std::collections::HashMap;
 use std::time::Duration;
@@ -76,6 +75,13 @@ pub type GameMetadataLoader = Arc<dyn Fn(&str) -> Option<(String, String)> + Sen
 /// Callback-Typ zum Laden eines Chunks
 pub type ChunkLoader = Arc<dyn Fn(&str) -> Option<Vec<u8>> + Send + Sync>;
 
+/// Metadaten-Updates für Player Name und Games Count
+#[derive(Debug, Clone)]
+pub struct MetadataUpdate {
+    pub player_name: Option<String>,
+    pub games_count: Option<u32>,
+}
+
 // Wrapper function for GTK integration
 pub async fn start_discovery(
     event_tx: tokio::sync::mpsc::Sender<DiscoveryEvent>, 
@@ -86,6 +92,7 @@ pub async fn start_discovery(
     game_metadata_loader: Option<GameMetadataLoader>,
     chunk_loader: Option<ChunkLoader>,
     download_request_rx: Option<tokio::sync::mpsc::UnboundedReceiver<DownloadRequest>>,
+    metadata_update_rx: Option<tokio::sync::mpsc::UnboundedReceiver<MetadataUpdate>>,
 ) -> tokio::task::JoinHandle<()> {
     let (sender, mut receiver) = crate::network::channel::new_peer_channel();
     let event_tx_for_lost = event_tx.clone();
@@ -116,7 +123,7 @@ pub async fn start_discovery(
     tokio::spawn(async move {
         println!("run_discovery Task gestartet");
         eprintln!("run_discovery Task gestartet");
-        let result = run_discovery(sender, None, event_tx_for_lost, player_name_clone, games_count_clone, keypair, games_loader, game_metadata_loader, chunk_loader, download_request_rx).await;
+        let result = run_discovery(sender, None, event_tx_for_lost, player_name_clone, games_count_clone, keypair, games_loader, game_metadata_loader, chunk_loader, download_request_rx, metadata_update_rx).await;
         println!("run_discovery beendet: {:?}", result);
         eprintln!("run_discovery beendet: {:?}", result);
     })
@@ -133,7 +140,13 @@ pub async fn run_discovery(
     game_metadata_loader: Option<GameMetadataLoader>,
     chunk_loader: Option<ChunkLoader>,
     mut download_request_rx: Option<tokio::sync::mpsc::UnboundedReceiver<DownloadRequest>>,
+    mut metadata_update_rx: Option<tokio::sync::mpsc::UnboundedReceiver<MetadataUpdate>>,
 ) {
+    // Speichere Metadaten in Arc<Mutex> für dynamische Updates
+    let metadata: Arc<tokio::sync::Mutex<(Option<String>, Option<u32>)>> = 
+        Arc::new(tokio::sync::Mutex::new((our_player_name.clone(), our_games_count)));
+    let metadata_clone = metadata.clone();
+    
     // Map to track peer info by peer ID for handshake updates
     let peer_info_map: Arc<tokio::sync::Mutex<HashMap<String, PeerInfo>>> = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     let peer_info_map_clone = peer_info_map.clone();
@@ -200,19 +213,25 @@ pub async fn run_discovery(
         }
     };
 
+    // Helper function to create agent_version from metadata
+    let version = env!("CARGO_PKG_VERSION");
+    let create_agent_version = |player_name: &Option<String>, games_count: &Option<u32>| {
+        if player_name.is_some() || games_count.is_some() {
+            let metadata = serde_json::json!({
+                "player_name": player_name.as_ref().unwrap_or(&"Unknown".to_string()),
+                "games_count": games_count.unwrap_or(0),
+                "version": version
+            });
+            let json_str = serde_json::to_string(&metadata).unwrap_or_else(|_| "{}".to_string());
+            format!("deckdrop/{}", json_str)
+        } else {
+            format!("deckdrop/{}", version)
+        }
+    };
+    
     // Create identify behaviour with custom protocol name and agent version
     // Agent version kann Metadaten enthalten (z.B. JSON mit player_name und games_count)
-    let agent_version = if our_player_name.is_some() || our_games_count.is_some() {
-        let metadata = serde_json::json!({
-            "player_name": our_player_name.as_ref().unwrap_or(&"Unknown".to_string()),
-            "games_count": our_games_count.unwrap_or(0)
-        });
-        // Verwende to_string() für kompakte JSON-Darstellung (ohne Leerzeichen)
-        let json_str = serde_json::to_string(&metadata).unwrap_or_else(|_| "{}".to_string());
-        format!("deckdrop/{}", json_str)
-    } else {
-        "deckdrop/1.0.0".to_string()
-    };
+    let agent_version = create_agent_version(&our_player_name, &our_games_count);
     
     println!("Setting agent_version to: {}", agent_version);
     eprintln!("Setting agent_version to: {}", agent_version);
@@ -286,6 +305,40 @@ pub async fn run_discovery(
     
     loop {
         tokio::select! {
+            // Handle Metadata Updates
+            update = async {
+                if let Some(ref mut rx) = metadata_update_rx {
+                    rx.recv().await
+                } else {
+                    futures::future::pending().await
+                }
+            } => {
+                if let Some(update) = update {
+                    println!("Received metadata update: player_name={:?}, games_count={:?}", 
+                        update.player_name, update.games_count);
+                    eprintln!("Received metadata update: player_name={:?}, games_count={:?}", 
+                        update.player_name, update.games_count);
+                    
+                    // Update metadata
+                    let (new_player_name, new_games_count) = {
+                        let mut meta = metadata_clone.lock().await;
+                        if let Some(ref name) = update.player_name {
+                            meta.0 = Some(name.clone());
+                        }
+                        if let Some(count) = update.games_count {
+                            meta.1 = Some(count);
+                        }
+                        (meta.0.clone(), meta.1)
+                    };
+                    
+                    // Note: libp2p Identify verwendet die agent_version nur beim Erstellen des Identify-Behaviours
+                    // Um Updates zu senden, müssten wir den Swarm neu erstellen, was sehr kompliziert ist
+                    // Für jetzt: Wir speichern die Metadaten, aber sie werden erst beim nächsten App-Start gesendet
+                    // TODO: Implementiere korrekte Lösung zum Neuerstellen des Swarms mit neuen Metadaten
+                    println!("Metadata updated. Note: New metadata will not be sent until swarm is restarted (libp2p Identify limitation).");
+                    eprintln!("Metadata updated. Note: New metadata will not be sent until swarm is restarted (libp2p Identify limitation).");
+                }
+            }
             // Handle Download Requests vom GTK-Thread
             request = async {
                 if let Some(ref mut rx) = download_request_rx {
@@ -371,10 +424,11 @@ pub async fn run_discovery(
                                 eprintln!("Received identify info from {}: protocol={}, agent={}", 
                                     peer_id, info.protocol_version, info.agent_version);
                                 
-                                // Extract player name and games count from agent_version
-                                // Format: "deckdrop/{\"player_name\":\"...\",\"games_count\":...}"
+                                // Extract player name, games count, and version from agent_version
+                                // Format: "deckdrop/{\"player_name\":\"...\",\"games_count\":...,\"version\":\"...\"}"
                                 let mut player_name = None;
                                 let mut games_count = None;
+                                let mut version = None;
                                 
                                 println!("Received agent_version: {}", info.agent_version);
                                 eprintln!("Received agent_version: {}", info.agent_version);
@@ -395,6 +449,10 @@ pub async fn run_discovery(
                                         if let Some(count) = metadata.get("games_count").and_then(|v| v.as_u64()) {
                                             games_count = Some(count as u32);
                                             println!("Extracted games_count: {}", count);
+                                        }
+                                        if let Some(ver) = metadata.get("version").and_then(|v| v.as_str()) {
+                                            version = Some(ver.to_string());
+                                            println!("Extracted version: {}", ver);
                                         }
                                     } else {
                                         eprintln!("Failed to parse JSON from agent_version: {}", json_str);
@@ -418,6 +476,12 @@ pub async fn run_discovery(
                                     if let Some(count) = games_count {
                                         if peer_info.games_count != Some(count) {
                                             peer_info.games_count = Some(count);
+                                            updated = true;
+                                        }
+                                    }
+                                    if let Some(ver) = version {
+                                        if peer_info.version.as_ref() != Some(&ver) {
+                                            peer_info.version = Some(ver);
                                             updated = true;
                                         }
                                     }
@@ -445,6 +509,7 @@ pub async fn run_discovery(
                                         addr: None,
                                         player_name,
                                         games_count,
+                                        version,
                                     };
                                     
                                     // Versuche Adresse aus der Map zu holen (falls bereits vorhanden)

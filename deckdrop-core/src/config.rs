@@ -377,7 +377,7 @@ impl Config {
     }
 
     /// Gibt den Pfad zur Konfigurationsdatei zurück
-    fn config_path() -> Option<PathBuf> {
+    pub fn config_path() -> Option<PathBuf> {
         let base_dir = directories::ProjectDirs::from("com", "deckdrop", "deckdrop")?;
         let config_dir = base_dir.config_dir();
         

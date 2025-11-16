@@ -8,6 +8,7 @@ pub struct PeerInfo {
     pub addr: Option<String>,
     pub player_name: Option<String>,
     pub games_count: Option<u32>,
+    pub version: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -23,6 +24,7 @@ impl From<(PeerId, Option<IpAddr>)> for PeerInfo {
             addr: addr.map(|ip| ip.to_string()),
             player_name: None, // Will be populated via handshake
             games_count: None, // Will be populated via handshake
+            version: None, // Will be populated via identify
         }
     }
 }
