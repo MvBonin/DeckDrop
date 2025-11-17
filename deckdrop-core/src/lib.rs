@@ -21,5 +21,6 @@ pub use synch::{
     finalize_game_download, cancel_game_download,
     get_manifest_path, get_chunks_dir, find_game_id_for_chunk,
     check_and_reconstruct_files, load_active_downloads,
+    save_chunk,
 };
 

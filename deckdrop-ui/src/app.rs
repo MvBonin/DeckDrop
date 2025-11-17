@@ -9,7 +9,7 @@ use deckdrop_core::{Config, GameInfo, DownloadManifest, DownloadStatus};
 use deckdrop_network::network::discovery::DiscoveryEvent;
 use deckdrop_network::network::games::NetworkGameInfo;
 use deckdrop_network::network::peer::PeerInfo;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -670,17 +670,42 @@ impl DeckDropApp {
             Message::PauseDownload(game_id) => {
                 // Pause download
                 if let Some(download_state) = self.active_downloads.get_mut(&game_id) {
-                    // TODO: Implement pause functionality in synch.rs
-                    // For now: Set status to Paused
                     download_state.manifest.overall_status = deckdrop_core::DownloadStatus::Paused;
+                    
+                    // Save manifest to disk
+                    if let Ok(manifest_path) = deckdrop_core::get_manifest_path(&game_id) {
+                        if let Err(e) = download_state.manifest.save(&manifest_path) {
+                            eprintln!("Error saving manifest when pausing download for {}: {}", game_id, e);
+                        }
+                    }
                 }
             }
             Message::ResumeDownload(game_id) => {
                 // Resume download
                 if let Some(download_state) = self.active_downloads.get_mut(&game_id) {
-                    // TODO: Implement resume functionality in synch.rs
-                    // For now: Set status to Downloading
                     download_state.manifest.overall_status = deckdrop_core::DownloadStatus::Downloading;
+                    
+                    // Save manifest to disk
+                    if let Ok(manifest_path) = deckdrop_core::get_manifest_path(&game_id) {
+                        if let Err(e) = download_state.manifest.save(&manifest_path) {
+                            eprintln!("Error saving manifest when resuming download for {}: {}", game_id, e);
+                        }
+                    }
+                    
+                    // Request missing chunks to resume download
+                    if let Some(peers) = self.network_games.get(&game_id) {
+                        let peer_ids: Vec<String> = peers.iter()
+                            .map(|(pid, _)| pid.clone())
+                            .collect();
+                        
+                        if !peer_ids.is_empty() {
+                            if let Some(tx) = crate::network_bridge::get_download_request_tx() {
+                                if let Err(e) = deckdrop_core::request_missing_chunks(&game_id, &peer_ids, &tx, 3) {
+                                    eprintln!("Error requesting missing chunks when resuming download for {}: {}", game_id, e);
+                                }
+                            }
+                        }
+                    }
                 }
             }
             Message::CancelDownload(game_id) => {
@@ -1237,7 +1262,7 @@ impl DeckDropApp {
                         .push((peer_id.clone(), game));
                 }
             }
-            DiscoveryEvent::GameMetadataReceived { peer_id: _, game_id, deckdrop_toml, deckdrop_chunks_toml } => {
+            DiscoveryEvent::GameMetadataReceived { peer_id, game_id, deckdrop_toml, deckdrop_chunks_toml } => {
                 // Start download with received metadata
                 if let Err(e) = deckdrop_core::start_game_download(
                     &game_id,
@@ -1255,13 +1280,94 @@ impl DeckDropApp {
                                 manifest,
                                 progress_percent,
                             });
+                            
+                            // Request missing chunks to start download
+                            if let Some(peers) = self.network_games.get(&game_id) {
+                                let peer_ids: Vec<String> = peers.iter()
+                                    .map(|(pid, _)| pid.clone())
+                                    .collect();
+                                // Falls keine Peers gefunden wurden, verwende den Peer, der die Metadaten gesendet hat
+                                let peer_ids = if peer_ids.is_empty() {
+                                    vec![peer_id.clone()]
+                                } else {
+                                    peer_ids
+                                };
+                                
+                                if let Some(tx) = crate::network_bridge::get_download_request_tx() {
+                                    if let Err(e) = deckdrop_core::request_missing_chunks(&game_id, &peer_ids, &tx, 3) {
+                                        eprintln!("Error requesting missing chunks for {}: {}", game_id, e);
+                                    }
+                                }
+                            } else {
+                                // Fallback: Use the peer that sent the metadata
+                                if let Some(tx) = crate::network_bridge::get_download_request_tx() {
+                                    if let Err(e) = deckdrop_core::request_missing_chunks(&game_id, &[peer_id.clone()], &tx, 3) {
+                                        eprintln!("Error requesting missing chunks for {}: {}", game_id, e);
+                                    }
+                                }
+                            }
                         }
                     }
                 }
             }
-            DiscoveryEvent::ChunkReceived { peer_id, chunk_hash, chunk_data: _ } => {
-                // TODO: Process chunk
-                println!("ChunkReceived: {} from {}", chunk_hash, peer_id);
+            DiscoveryEvent::ChunkReceived { peer_id, chunk_hash, chunk_data } => {
+                // Finde game_id aus chunk_hash (durch Manifest-Suche)
+                if let Ok(game_id) = deckdrop_core::find_game_id_for_chunk(&chunk_hash) {
+                    // Prüfe ob Download pausiert ist
+                    if let Ok(manifest_path) = deckdrop_core::get_manifest_path(&game_id) {
+                        if let Ok(manifest) = deckdrop_core::DownloadManifest::load(&manifest_path) {
+                            // Überspringe wenn pausiert
+                            if !matches!(manifest.overall_status, deckdrop_core::DownloadStatus::Paused) {
+                                // Speichere Chunk
+                                if let Ok(chunks_dir) = deckdrop_core::get_chunks_dir(&game_id) {
+                                    if deckdrop_core::save_chunk(&chunk_hash, &chunk_data, &chunks_dir).is_ok() {
+                                        // Aktualisiere Manifest
+                                        if let Ok(mut manifest) = deckdrop_core::DownloadManifest::load(&manifest_path) {
+                                            manifest.mark_chunk_downloaded(&chunk_hash);
+                                            
+                                            if manifest.save(&manifest_path).is_ok() {
+                                                // Aktualisiere UI-Status (wird beim nächsten Tick gelesen)
+                                                // Das Manifest wird in update_download_progress() gelesen
+                                                
+                                                // Prüfe ob Dateien komplett sind und rekonstruiere sie
+                                                if let Err(e) = deckdrop_core::check_and_reconstruct_files(&game_id, &manifest) {
+                                                    eprintln!("Fehler beim Rekonstruieren von Dateien: {}", e);
+                                                }
+                                                
+                                                // Prüfe ob noch weitere Chunks fehlen und fordere sie an
+                                                if matches!(manifest.overall_status, deckdrop_core::DownloadStatus::Downloading) {
+                                                    if let Some(peers) = self.network_games.get(&game_id) {
+                                                        let peer_ids: Vec<String> = peers.iter()
+                                                            .map(|(pid, _)| pid.clone())
+                                                            .collect();
+                                                        if !peer_ids.is_empty() {
+                                                            if let Some(tx) = crate::network_bridge::get_download_request_tx() {
+                                                                // Request weitere fehlende Chunks (max 3 pro Peer)
+                                                                if let Err(e) = deckdrop_core::request_missing_chunks(&game_id, &peer_ids, &tx, 3) {
+                                                                    eprintln!("Fehler beim Anfordern weiterer Chunks für {}: {}", game_id, e);
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                
+                                                // Prüfe ob Spiel komplett ist (wird in update_download_progress() behandelt)
+                                            } else {
+                                                eprintln!("Fehler beim Speichern des Manifests für Chunk {}", chunk_hash);
+                                            }
+                                        }
+                                    } else {
+                                        eprintln!("Fehler beim Speichern des Chunks {}: {}", chunk_hash, peer_id);
+                                    }
+                                }
+                            } else {
+                                println!("Download pausiert, überspringe Chunk {}", chunk_hash);
+                            }
+                        }
+                    }
+                } else {
+                    eprintln!("Konnte game_id für Chunk {} nicht finden", chunk_hash);
+                }
             }
             DiscoveryEvent::ChunkRequestFailed { peer_id, chunk_hash, error } => {
                 eprintln!("ChunkRequestFailed: {} from {}: {}", chunk_hash, peer_id, error);
@@ -1407,11 +1513,11 @@ impl DeckDropApp {
             }
         }
         
-        // Resume downloads if host is available
+        // Resume downloads if host is available (only Pending, not Paused - paused downloads should be resumed manually)
         let games_to_resume: Vec<String> = self.active_downloads
             .iter()
             .filter(|(_, download_state)| {
-                matches!(download_state.manifest.overall_status, deckdrop_core::DownloadStatus::Pending | deckdrop_core::DownloadStatus::Paused)
+                matches!(download_state.manifest.overall_status, deckdrop_core::DownloadStatus::Pending)
             })
             .filter_map(|(game_id, _)| {
                 // Check if peers are available for this game
@@ -1542,9 +1648,49 @@ impl DeckDropApp {
                     .unwrap_or(&GameIntegrityStatus::Checking { current: 0, total: 0 });
                 
                 let mut game_column = column![
-                    text(&game.name).size(scale_text(16.0)),
-                    text(format!("Version: {}", game.version)).size(scale_text(12.0)),
-                    text(format!("Path: {}", game_path.display())).size(scale_text(10.0)),
+                    row![
+                        column![
+                            text(&game.name).size(scale_text(16.0)),
+                            text(format!("Version: {}", game.version)).size(scale_text(12.0)),
+                            text(format!("Path: {}", game_path.display())).size(scale_text(10.0)),
+                        ]
+                        .width(Length::Fill),
+                        // Download control buttons (only show if download is active and not complete)
+                        if let Some(ds) = download_state {
+                            let game_id = ds.manifest.game_id.clone();
+                            let show_buttons = !matches!(ds.manifest.overall_status, deckdrop_core::DownloadStatus::Complete);
+                            
+                            if show_buttons {
+                                let (can_pause, can_resume) = (
+                                    matches!(ds.manifest.overall_status, deckdrop_core::DownloadStatus::Downloading),
+                                    matches!(ds.manifest.overall_status, deckdrop_core::DownloadStatus::Paused),
+                                );
+                                
+                                column![
+                                    if can_pause {
+                                        button("Pause")
+                                            .on_press(Message::PauseDownload(game_id.clone()))
+                                            .style(button::secondary)
+                                    } else if can_resume {
+                                        button("Resume")
+                                            .on_press(Message::ResumeDownload(game_id.clone()))
+                                            .style(button::secondary)
+                                    } else {
+                                        button("Downloading...")
+                                            .style(button::secondary)
+                                    },
+                                    button("Cancel")
+                                        .on_press(Message::CancelDownload(game_id.clone())),
+                                ]
+                                .spacing(scale(4.0))
+                            } else {
+                                column![].spacing(scale(4.0))
+                            }
+                        } else {
+                            column![].spacing(scale(4.0))
+                        },
+                    ]
+                    .spacing(scale(8.0)),
                 ];
                 
                 // Show download status if downloading
@@ -1665,7 +1811,13 @@ impl DeckDropApp {
                             column![
                                 text(&game_info.name).size(scale_text(16.0)),
                                 text(format!("Version: {}", game_info.version)).size(scale_text(12.0)),
-                                text(format!("From: {} Peer(s)", games.len())).size(scale_text(10.0)),
+                                text(format!("From: {} Peer(s)", {
+                                    // Zähle eindeutige Peer-IDs
+                                    let unique_peers: std::collections::HashSet<_> = games.iter()
+                                        .map(|(peer_id, _)| peer_id)
+                                        .collect();
+                                    unique_peers.len()
+                                })).size(scale_text(10.0)),
                             ]
                             .width(Length::Fill),
                             if is_downloading {
