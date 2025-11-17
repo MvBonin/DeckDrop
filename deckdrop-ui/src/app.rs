@@ -55,6 +55,7 @@ pub struct DeckDropApp {
     
     // Downloads
     pub active_downloads: HashMap<String, DownloadState>, // game_id -> DownloadState
+    pub last_download_update: std::time::Instant, // Zeitpunkt der letzten Download-Update (für Throttling)
     
     // Chunk processing tracking (to prevent duplicate processing and enable parallel processing)
     pub processing_chunks: Arc<std::sync::Mutex<HashSet<String>>>, // chunk_hash -> in_progress
@@ -122,9 +123,10 @@ pub struct DownloadState {
     pub progress_percent: f32,
     pub downloading_chunks_count: usize, // Anzahl der aktuell heruntergeladenen Chunks
     pub peer_count: usize, // Anzahl der Peers für diesen Download
-    pub download_speed_bytes_per_sec: f64, // Download-Geschwindigkeit in Bytes/Sekunde
+    pub download_speed_bytes_per_sec: f64, // Download-Geschwindigkeit in Bytes/Sekunde (gleitender Durchschnitt)
     pub last_update_time: std::time::Instant, // Zeitpunkt der letzten Aktualisierung
     pub last_downloaded_chunks: usize, // Anzahl der heruntergeladenen Chunks bei letzter Aktualisierung
+    pub speed_samples: Vec<(std::time::Instant, usize)>, // Zeitstempel und heruntergeladene Chunks für Geschwindigkeitsberechnung
 }
 
 /// Status information
@@ -208,6 +210,7 @@ impl Default for DeckDropApp {
                 download_speed_bytes_per_sec: 0.0,
                 last_update_time: std::time::Instant::now(),
                 last_downloaded_chunks: manifest.progress.downloaded_chunks,
+                speed_samples: Vec::new(),
             });
         }
         
@@ -283,6 +286,7 @@ impl Default for DeckDropApp {
             integrity_check_start_time: HashMap::new(),
             integrity_check_progress: Arc::new(std::sync::Mutex::new(HashMap::new())),
             integrity_check_results: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            last_download_update: std::time::Instant::now(),
             config: config.clone(),
             status: StatusInfo {
                 is_online: true,
@@ -435,6 +439,7 @@ impl DeckDropApp {
                 download_speed_bytes_per_sec: 0.0,
                 last_update_time: std::time::Instant::now(),
                 last_downloaded_chunks: manifest.progress.downloaded_chunks,
+                speed_samples: Vec::new(),
             });
         }
         
@@ -508,6 +513,7 @@ impl DeckDropApp {
             integrity_check_start_time: HashMap::new(),
             integrity_check_progress: Arc::new(std::sync::Mutex::new(HashMap::new())),
             integrity_check_results: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            last_download_update: std::time::Instant::now(),
             config: config.clone(),
             status: StatusInfo {
                 is_online: true,
@@ -1012,10 +1018,16 @@ impl DeckDropApp {
             }
             Message::Tick => {
                 // Periodic updates (e.g., update download progress)
-                self.update_download_progress();
+                // Throttle download updates to every 500ms for better performance
+                if self.last_download_update.elapsed().as_millis() >= 500 {
+                    self.update_download_progress();
+                    self.last_download_update = std::time::Instant::now();
+                }
                 
-                // Update upload statistics
-                self.update_upload_stats();
+                // Update upload statistics (less frequently)
+                if self.last_download_update.elapsed().as_millis() >= 1000 {
+                    self.update_upload_stats();
+                }
                 
                 // Check for Network events (non-blocking) via global access
                 if let Some(rx) = crate::network_bridge::get_network_event_rx() {
@@ -1406,6 +1418,7 @@ impl DeckDropApp {
                                 download_speed_bytes_per_sec: 0.0,
                                 last_update_time: std::time::Instant::now(),
                                 last_downloaded_chunks: downloaded_chunks,
+                                speed_samples: Vec::new(),
                             });
                             
                             // Request missing chunks to start download
@@ -1702,27 +1715,49 @@ impl DeckDropApp {
                 })
                 .unwrap_or(0);
             
-            // Berechne Download-Geschwindigkeit
-            let (download_speed_bytes_per_sec, last_update_time, last_downloaded_chunks) = {
+            // Berechne Download-Geschwindigkeit mit gleitendem Durchschnitt
+            let (download_speed_bytes_per_sec, last_update_time, last_downloaded_chunks, speed_samples) = {
                 let existing_state = self.active_downloads.get(&game_id);
                 if let Some(existing) = existing_state {
-                    let elapsed = existing.last_update_time.elapsed().as_secs_f64();
-                    let chunks_downloaded = manifest.progress.downloaded_chunks.saturating_sub(existing.last_downloaded_chunks);
+                    let now = std::time::Instant::now();
+                    let mut samples = existing.speed_samples.clone();
                     
-                    // Chunk-Größe: 100MB = 100 * 1024 * 1024 Bytes
-                    const CHUNK_SIZE_BYTES: u64 = 100 * 1024 * 1024;
-                    let bytes_downloaded = (chunks_downloaded as u64) * CHUNK_SIZE_BYTES;
+                    // Füge neuen Sample hinzu, wenn sich die Anzahl der Chunks geändert hat
+                    if manifest.progress.downloaded_chunks != existing.last_downloaded_chunks {
+                        samples.push((now, manifest.progress.downloaded_chunks));
+                    }
                     
-                    let speed = if elapsed > 0.0 {
-                        bytes_downloaded as f64 / elapsed
+                    // Entferne Samples, die älter als 5 Sekunden sind
+                    let cutoff_time = now.checked_sub(std::time::Duration::from_secs(5)).unwrap_or(now);
+                    samples.retain(|(time, _)| *time > cutoff_time);
+                    
+                    // Berechne Geschwindigkeit basierend auf dem ältesten und neuesten Sample
+                    let speed = if samples.len() >= 2 {
+                        let (oldest_time, oldest_chunks) = samples.first().unwrap();
+                        let (newest_time, newest_chunks) = samples.last().unwrap();
+                        
+                        let elapsed = newest_time.duration_since(*oldest_time).as_secs_f64();
+                        let chunks_downloaded = newest_chunks.saturating_sub(*oldest_chunks);
+                        
+                        // Chunk-Größe: 100MB = 100 * 1024 * 1024 Bytes
+                        const CHUNK_SIZE_BYTES: u64 = 100 * 1024 * 1024;
+                        let bytes_downloaded = (chunks_downloaded as u64) * CHUNK_SIZE_BYTES;
+                        
+                        if elapsed > 0.5 { // Mindestens 0.5 Sekunden für stabile Berechnung
+                            bytes_downloaded as f64 / elapsed
+                        } else {
+                            // Verwende vorherige Geschwindigkeit, wenn Zeitfenster zu kurz
+                            existing.download_speed_bytes_per_sec
+                        }
                     } else {
-                        0.0
+                        // Nicht genug Samples - verwende vorherige Geschwindigkeit
+                        existing.download_speed_bytes_per_sec
                     };
                     
-                    (speed, std::time::Instant::now(), manifest.progress.downloaded_chunks)
+                    (speed, now, manifest.progress.downloaded_chunks, samples)
                 } else {
                     // Erste Aktualisierung - noch keine Geschwindigkeit
-                    (0.0, std::time::Instant::now(), manifest.progress.downloaded_chunks)
+                    (0.0, std::time::Instant::now(), manifest.progress.downloaded_chunks, Vec::new())
                 }
             };
             
@@ -1735,6 +1770,7 @@ impl DeckDropApp {
                 download_speed_bytes_per_sec,
                 last_update_time,
                 last_downloaded_chunks,
+                speed_samples: speed_samples,
             });
         }
         
