@@ -14,6 +14,21 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
+/// UI scaling factor for different screen sizes
+/// Smaller values = more compact UI (better for Steam Deck)
+/// Larger values = more spacious UI (better for desktop)
+const UI_SCALE: f32 = 0.75;
+
+/// Scale a size value based on UI_SCALE
+fn scale(size: f32) -> f32 {
+    size * UI_SCALE
+}
+
+/// Scale a size value for text (slightly different scaling)
+fn scale_text(size: f32) -> f32 {
+    (size * UI_SCALE).max(10.0) // Minimum 10px for readability
+}
+
 /// Game integrity status
 #[derive(Debug, Clone, PartialEq)]
 pub enum GameIntegrityStatus {
@@ -1152,14 +1167,14 @@ impl DeckDropApp {
                 self.view_tabs(),
                 self.view_current_tab(),
             ]
-            .spacing(10)
+            .spacing(scale(8.0))
             .into()
         };
         
         container(content)
             .width(Length::Fill)
             .height(Length::Fill)
-            .padding(20)
+            .padding(scale(15.0))
             .into()
     }
 
@@ -1481,7 +1496,7 @@ impl DeckDropApp {
                     button::secondary
                 }),
         ]
-        .spacing(10)
+        .spacing(scale(8.0))
         .into()
     }
     
@@ -1498,13 +1513,13 @@ impl DeckDropApp {
     /// Shows "My Games" tab
     fn view_my_games(&self) -> Element<Message> {
         let mut games_column = Column::new()
-            .spacing(10)
-            .padding(10);
+            .spacing(scale(8.0))
+            .padding(scale(8.0));
         
         // Header with "Add Game" button
         games_column = games_column.push(
             row![
-                text("My Games").size(24),
+                text("My Games").size(scale_text(20.0)),
                 Space::with_width(Length::Fill),
                 button("+ Add Game")
                     .on_press(Message::AddGame),
@@ -1527,9 +1542,9 @@ impl DeckDropApp {
                     .unwrap_or(&GameIntegrityStatus::Checking { current: 0, total: 0 });
                 
                 let mut game_column = column![
-                    text(&game.name).size(18),
-                    text(format!("Version: {}", game.version)).size(14),
-                    text(format!("Path: {}", game_path.display())).size(12),
+                    text(&game.name).size(scale_text(16.0)),
+                    text(format!("Version: {}", game.version)).size(scale_text(12.0)),
+                    text(format!("Path: {}", game_path.display())).size(scale_text(10.0)),
                 ];
                 
                 // Show download status if downloading
@@ -1556,7 +1571,7 @@ impl DeckDropApp {
                     
                     game_column = game_column.push(
                         text(download_status_text.clone())
-                            .size(11)
+                            .size(scale_text(10.0))
                             .style(move |_theme: &Theme| {
                                 iced::widget::text::Style {
                                     color: Some(download_status_color),
@@ -1601,7 +1616,7 @@ impl DeckDropApp {
                     
                     game_column = game_column.push(
                         text(status_text.clone())
-                            .size(11)
+                            .size(scale_text(10.0))
                             .style(move |_theme: &Theme| {
                                 iced::widget::text::Style {
                                     color: Some(status_color),
@@ -1614,7 +1629,7 @@ impl DeckDropApp {
                     container(game_column)
                         .style(container_box_style)
                         .width(Length::Fill)
-                        .padding(15)
+                        .padding(scale(12.0))
                 );
             }
         }
@@ -1628,11 +1643,11 @@ impl DeckDropApp {
     /// Shows "Network Games" tab
     fn view_network_games(&self) -> Element<Message> {
         let mut games_column = Column::new()
-            .spacing(10)
-            .padding(10);
+            .spacing(scale(8.0))
+            .padding(scale(8.0));
         
         games_column = games_column.push(
-            text("Network Games").size(24)
+            text("Network Games").size(scale_text(20.0))
         );
         
         if self.network_games.is_empty() {
@@ -1648,9 +1663,9 @@ impl DeckDropApp {
                     let mut game_column = column![
                         row![
                             column![
-                                text(&game_info.name).size(18),
-                                text(format!("Version: {}", game_info.version)).size(14),
-                                text(format!("From: {} Peer(s)", games.len())).size(12),
+                                text(&game_info.name).size(scale_text(16.0)),
+                                text(format!("Version: {}", game_info.version)).size(scale_text(12.0)),
+                                text(format!("From: {} Peer(s)", games.len())).size(scale_text(10.0)),
                             ]
                             .width(Length::Fill),
                             if is_downloading {
@@ -1679,7 +1694,7 @@ impl DeckDropApp {
                                     button("Cancel")
                                         .on_press(Message::CancelDownload(game_id.clone())),
                                 ]
-                                .spacing(5)
+                                .spacing(scale(4.0))
                             } else {
                                 column![
                                     button("Get this game")
@@ -1688,18 +1703,18 @@ impl DeckDropApp {
                                 ]
                             },
                         ]
-                        .spacing(10),
+                        .spacing(scale(8.0)),
                     ];
                     
                     // Show progress bar when download is active
                     if let Some(download_state) = download_state {
                         game_column = game_column.push(
                             column![
-                                text(format!("Progress: {:.1}%", download_state.progress_percent)).size(12),
+                                text(format!("Progress: {:.1}%", download_state.progress_percent)).size(scale_text(10.0)),
                                 progress_bar(0.0..=100.0, download_state.progress_percent)
                                     .width(Length::Fill),
                             ]
-                            .spacing(5)
+                            .spacing(scale(4.0))
                         );
                         
                         // Show status
@@ -1712,7 +1727,7 @@ impl DeckDropApp {
                             deckdrop_core::DownloadStatus::Cancelled => "Cancelled",
                         };
                         game_column = game_column.push(
-                            text(status_text).size(12)
+                            text(status_text).size(scale_text(10.0))
                         );
                     }
                     
@@ -1720,7 +1735,7 @@ impl DeckDropApp {
                         container(game_column)
                             .style(container_box_style)
                             .width(Length::Fill)
-                            .padding(15)
+                            .padding(scale(12.0))
                     );
                 }
             }
@@ -1735,11 +1750,11 @@ impl DeckDropApp {
     /// Shows "Peers" tab
     fn view_peers(&self) -> Element<Message> {
         let mut peers_column = Column::new()
-            .spacing(10)
-            .padding(10);
+            .spacing(scale(8.0))
+            .padding(scale(8.0));
         
         peers_column = peers_column.push(
-            text("Found Peers").size(24)
+            text("Found Peers").size(scale_text(20.0))
         );
         
         if self.peers.is_empty() {
@@ -1770,13 +1785,13 @@ impl DeckDropApp {
                 peers_column = peers_column.push(
                     container(
                         column![
-                            text(format!("Player: {}", player_name)).size(16),
-                            text(format!("Peer ID: {}", &peer.id[..16.min(peer.id.len())])).size(12),
-                            text(format!("Games: {}", games_count)).size(12),
-                            text(format!("Version: {}", version)).size(12),
+                            text(format!("Player: {}", player_name)).size(scale_text(14.0)),
+                            text(format!("Peer ID: {}", &peer.id[..16.min(peer.id.len())])).size(scale_text(10.0)),
+                            text(format!("Games: {}", games_count)).size(scale_text(10.0)),
+                            text(format!("Version: {}", version)).size(scale_text(10.0)),
                         ]
                         .spacing(5)
-                        .padding(15)
+                        .padding(scale(12.0))
                     )
                     .style(container_box_style)
                     .width(Length::Fill)
@@ -1794,25 +1809,25 @@ impl DeckDropApp {
     fn view_settings_tab(&self) -> Element<Message> {
         let version = env!("CARGO_PKG_VERSION");
         column![
-            text("Settings").size(24),
+            text("Settings").size(scale_text(20.0)),
             text_input("Player Name", &self.settings_player_name)
                 .on_input(Message::SettingsPlayerNameChanged)
-                .padding(10),
+                .padding(scale(8.0)),
             row![
                 text_input("Download Path", &self.config.download_path.to_string_lossy())
                     .on_input(Message::SettingsDownloadPathChanged)
-                    .padding(10),
+                    .padding(scale(8.0)),
                 button("Browse...")
                     .on_press(Message::BrowseDownloadPath)
-                    .padding(10),
+                    .padding(scale(8.0)),
             ]
-            .spacing(10),
-            text(format!("Version: {}", version)).size(12),
+            .spacing(scale(8.0)),
+            text(format!("Version: {}", version)).size(scale_text(10.0)),
             row![
                 button("Save")
                     .on_press(Message::SaveSettings),
             ]
-            .spacing(10),
+            .spacing(scale(8.0)),
         ]
         .spacing(15)
         .padding(20)
@@ -1823,15 +1838,15 @@ impl DeckDropApp {
     fn view_license_dialog(&self) -> Element<Message> {
         container(
             column![
-                text("Welcome to DeckDrop").size(28),
-                Space::with_height(20),
-                text("Before you can use DeckDrop, you must agree to the terms and conditions.").size(16),
-                Space::with_height(20),
-                text("Player Name:").size(16),
+                text("Welcome to DeckDrop").size(scale_text(24.0)),
+                Space::with_height(Length::Fixed(scale(15.0))),
+                text("Before you can use DeckDrop, you must agree to the terms and conditions.").size(scale_text(14.0)),
+                Space::with_height(Length::Fixed(scale(15.0))),
+                text("Player Name:").size(scale_text(14.0)),
                 text_input("Enter your player name", &self.license_player_name)
                     .on_input(Message::LicensePlayerNameChanged)
-                    .padding(10),
-                Space::with_height(20),
+                    .padding(scale(8.0)),
+                Space::with_height(Length::Fixed(scale(15.0))),
                 scrollable(
                     text("DeckDrop is a peer-to-peer game sharing platform.\n\n\
                           By using DeckDrop, you agree to:\n\n\
@@ -1839,18 +1854,18 @@ impl DeckDropApp {
                           • Not share illegal content\n\
                           • Take responsibility for your shared content\n\n\
                           DeckDrop assumes no liability for shared content.")
-                        .size(14)
+                        .size(scale_text(12.0))
                 )
-                .height(Length::Fixed(200.0)),
-                Space::with_height(20),
+                .height(Length::Fixed(scale(150.0))),
+                Space::with_height(Length::Fixed(scale(15.0))),
                 button("Accept")
                     .on_press(Message::AcceptLicense)
                     .style(button::primary),
             ]
-            .spacing(15)
-            .padding(30)
+            .spacing(scale(12.0))
+            .padding(scale(20.0))
         )
-        .width(Length::Fixed(600.0))
+        .width(Length::Fixed(scale(500.0)))
         .height(Length::Shrink)
         .style(container_box_style)
         .into()
@@ -1860,14 +1875,14 @@ impl DeckDropApp {
     fn view_settings(&self) -> Element<Message> {
         container(
             column![
-                text("Settings").size(28),
-                Space::with_height(20),
-                text("Player Name:").size(16),
+                text("Settings").size(scale_text(24.0)),
+                Space::with_height(Length::Fixed(scale(15.0))),
+                text("Player Name:").size(scale_text(14.0)),
                 text_input("Player Name", &self.settings_player_name)
                     .on_input(Message::SettingsPlayerNameChanged)
                     .padding(10),
-                Space::with_height(10),
-                text("Download Path:").size(16),
+                Space::with_height(Length::Fixed(scale(8.0))),
+                text("Download Path:").size(scale_text(14.0)),
                 row![
                     text_input("Download Path", &self.settings_download_path)
                         .on_input(Message::SettingsDownloadPathChanged)
@@ -1876,7 +1891,7 @@ impl DeckDropApp {
                         .on_press(Message::BrowseDownloadPath)
                         .padding(10),
                 ]
-                .spacing(10),
+                .spacing(scale(8.0)),
                 Space::with_height(20),
                 row![
                     button("Cancel")
@@ -1902,81 +1917,81 @@ impl DeckDropApp {
         container(
             scrollable(
                 column![
-                    text("Add Game").size(28),
-                    Space::with_height(20),
+                    text("Add Game").size(scale_text(24.0)),
+                    Space::with_height(Length::Fixed(scale(15.0))),
                     row![
                         // Left column
                         column![
-                            text("Path:").size(16),
+                            text("Path:").size(scale_text(14.0)),
                             row![
                                 text_input("Path", &self.add_game_path)
                                     .on_input(Message::AddGamePathChanged)
-                                    .padding(10),
+                                    .padding(scale(8.0)),
                                 button("Browse...")
                                     .on_press(Message::BrowseGamePath)
-                                    .padding(10),
+                                    .padding(scale(8.0)),
                             ]
-                            .spacing(10),
-                            Space::with_height(10),
-                            text("Name:").size(16),
+                            .spacing(scale(8.0)),
+                            Space::with_height(Length::Fixed(scale(8.0))),
+                            text("Name:").size(scale_text(14.0)),
                             text_input("Name", &self.add_game_name)
                                 .on_input(Message::AddGameNameChanged)
-                                .padding(10),
-                            Space::with_height(10),
-                            text("Version:").size(16),
+                                .padding(scale(8.0)),
+                            Space::with_height(Length::Fixed(scale(8.0))),
+                            text("Version:").size(scale_text(14.0)),
                             text_input("Version (default: 1.0)", &self.add_game_version)
                                 .on_input(Message::AddGameVersionChanged)
-                                .padding(10),
-                            Space::with_height(10),
-                            text("Start Args (optional):").size(16),
+                                .padding(scale(8.0)),
+                            Space::with_height(Length::Fixed(scale(8.0))),
+                            text("Start Args (optional):").size(scale_text(14.0)),
                             text_input("Start Args", &self.add_game_start_args)
                                 .on_input(Message::AddGameStartArgsChanged)
-                                .padding(10),
+                                .padding(scale(8.0)),
                         ]
-                        .spacing(10)
+                        .spacing(scale(8.0))
                         .width(Length::Fill),
-                        Space::with_width(20),
+                        Space::with_width(Length::Fixed(scale(15.0))),
                         // Right column
                         column![
-                            text("Game Executable:").size(16),
+                            text("Game Executable:").size(scale_text(14.0)),
                             text_input("Relative to the game path", &self.add_game_start_file)
                                 .on_input(Message::AddGameStartFileChanged)
-                                .padding(10),
+                                .padding(scale(8.0)),
                             // Progress bar for chunk generation
                             if let Some((current, total, file_name)) = &self.add_game_progress {
                                 if *total > 0 {
                                     let progress = *current as f32 / *total as f32;
                                     column![
-                                        Space::with_height(10),
-                                        text(format!("Generiere Chunks: {}/{}", current, total)).size(14),
-                                        text(format!("Datei: {}", file_name)).size(12),
+                                        Space::with_height(Length::Fixed(scale(8.0))),
+                                        text(format!("Generiere Chunks: {}/{}", current, total)).size(scale_text(12.0)),
+                                        text(format!("Datei: {}", file_name)).size(scale_text(10.0)),
                                         progress_bar(0.0..=1.0, progress)
-                                            .height(Length::Fixed(20.0)),
+                                            .height(Length::Fixed(scale(15.0))),
                                     ]
-                                    .spacing(5)
+                                    .spacing(scale(4.0))
                                 } else {
                                     column![].spacing(0)
                                 }
                             } else {
                                 column![].spacing(0)
                             },
-                            Space::with_height(10),
-                            text("Description (optional):").size(16),
+                            Space::with_height(Length::Fixed(scale(8.0))),
+                            text("Description (optional):").size(scale_text(14.0)),
                             text_input("Description", &self.add_game_description)
                                 .on_input(Message::AddGameDescriptionChanged)
-                                .padding(10),
-                            Space::with_height(10),
-                            text("Additional Instructions (optional):").size(16),
+                                .padding(scale(8.0)),
+                            Space::with_height(Length::Fixed(scale(8.0))),
+                            text("Additional Instructions (optional):").size(scale_text(14.0)),
                             text_input("Additional Instructions", &self.add_game_additional_instructions)
                                 .on_input(Message::AddGameAdditionalInstructionsChanged)
-                                .padding(10),
+                                .padding(scale(8.0)),
                         ]
-                        .spacing(10)
+                        .spacing(scale(8.0))
                         .width(Length::Fill),
                     ]
-                    .spacing(20)
+                    .spacing(scale(15.0))
                     .width(Length::Fill),
-                    Space::with_height(20),
+                    Space::with_height(Length::Fixed(scale(15.0))),
                     row![
                         button("Cancel")
                             .on_press(Message::CancelAddGame),
@@ -1992,8 +2007,8 @@ impl DeckDropApp {
                     ]
                     .width(Length::Fill),
                 ]
-                .spacing(15)
-                .padding(30)
+                .spacing(scale(12.0))
+                .padding(scale(20.0))
             )
             .width(Length::Fill)
             .height(Length::Fill)
