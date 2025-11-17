@@ -824,5 +824,10 @@ file_size = {}
         assert_eq!(integrity_result.failed_files.len(), 0);
         
         println!("✓ Test erfolgreich: Zwei Peers haben Chunks ausgetauscht und Datei rekonstruiert!");
+        
+        // Aufräumen: Lösche Test-Spiel (Manifest und Chunks-Verzeichnis)
+        let _ = cancel_game_download(game_id);
+        
+        // TempDir wird automatisch gelöscht wenn es out of scope geht
     }
 }

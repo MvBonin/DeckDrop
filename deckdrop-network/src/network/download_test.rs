@@ -120,6 +120,7 @@ file_size = {}
             Some(game_metadata_loader),
             Some(chunk_loader),
             Some(download_request_rx1),
+            None,
         ).await;
         
         let _handle2 = start_discovery(
@@ -131,6 +132,7 @@ file_size = {}
             None,
             None,
             Some(download_request_rx2_to_swarm),
+            None,
         ).await;
         
         // Verwende download_request_tx2_to_swarm für Requests vom Test

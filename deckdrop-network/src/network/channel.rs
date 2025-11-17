@@ -25,6 +25,7 @@ mod tests {
             addr: Some("192.168.1.100".to_string()),
             player_name: Some("ChannelTest".to_string()),
             games_count: Some(5),
+            version: None,
         };
         
         let _ = sender.send(test_peer.clone());
@@ -47,6 +48,7 @@ mod tests {
             addr: Some("192.168.1.101".to_string()),
             player_name: Some("MultiReceiver".to_string()),
             games_count: Some(8),
+            version: None,
         };
         
         // Send one message
@@ -73,6 +75,7 @@ mod tests {
                 addr: Some(format!("192.168.1.{}", 100 + i)),
                 player_name: None,
                 games_count: None,
+                version: None,
             };
             let _ = sender.send(peer);
         }
@@ -110,6 +113,7 @@ mod tests {
                     addr: Some(format!("192.168.1.{}", 200 + i)),
                     player_name: None,
                     games_count: None,
+                    version: None,
                 };
                 let _ = sender1.send(peer);
                 sleep(Duration::from_millis(10)).await;
@@ -123,6 +127,7 @@ mod tests {
                     addr: Some(format!("192.168.1.{}", 300 + i)),
                     player_name: None,
                     games_count: None,
+                    version: None,
                 };
                 let _ = sender2.send(peer);
                 sleep(Duration::from_millis(10)).await;
@@ -168,6 +173,7 @@ mod tests {
             addr: Some("192.168.1.100".to_string()),
             player_name: None,
             games_count: None,
+            version: None,
         };
         
         let _ = sender.send(test_peer.clone());
@@ -197,6 +203,7 @@ mod tests {
                 addr: Some(format!("192.168.1.{}", i)),
                 player_name: None,
                 games_count: None,
+                version: None,
             };
             let _ = sender.send(peer);
         }
@@ -247,6 +254,7 @@ mod tests {
                 addr: Some(format!("192.168.1.{}", i % 255)),
                 player_name: None,
                 games_count: None,
+                version: None,
             };
             let _ = sender.send(peer);
             
@@ -302,6 +310,7 @@ mod tests {
             addr: Some("192.168.1.200".to_string()),
             player_name: None,
             games_count: None,
+            version: None,
         };
         
         let _ = sender.send(test_peer.clone());
@@ -324,6 +333,7 @@ mod tests {
                 id: format!("order-peer-{}", i),
                 addr: Some(format!("192.168.1.{}", 100 + i)),
                 player_name: None,
+                version: None,
             })
             .collect();
         
@@ -349,6 +359,7 @@ mod tests {
                 addr: Some(format!("192.168.1.{}", i)),
                 player_name: None,
                 games_count: None,
+                version: None,
             };
             let _ = sender.send(peer);
         }
@@ -371,6 +382,7 @@ mod tests {
             addr: Some("192.168.1.1".to_string()),
             player_name: None,
             games_count: None,
+            version: None,
         };
         let _ = sender.send(peer1.clone());
         
@@ -383,6 +395,7 @@ mod tests {
             addr: Some("192.168.1.2".to_string()),
             player_name: None,
             games_count: None,
+            version: None,
         };
         let _ = sender.send(peer2.clone());
         

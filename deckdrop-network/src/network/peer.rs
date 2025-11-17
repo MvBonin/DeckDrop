@@ -40,6 +40,7 @@ mod tests {
             addr: Some("192.168.1.100:8080".to_string()),
             player_name: Some("TestPlayer".to_string()),
             games_count: Some(10),
+            version: None,
         };
         
         assert_eq!(peer.id, "test-peer-123");
@@ -54,6 +55,7 @@ mod tests {
             addr: None,
             player_name: None,
             games_count: None,
+            version: None,
         };
         
         assert_eq!(peer.id, "test-peer-456");
@@ -68,6 +70,7 @@ mod tests {
             addr: Some("10.0.0.1:9000".to_string()),
             player_name: Some("SerialPlayer".to_string()),
             games_count: Some(5),
+            version: None,
         };
         
         let serialized = serde_json::to_string(&peer).unwrap();
@@ -124,6 +127,7 @@ mod tests {
             addr: None,
             player_name: None,
             games_count: None,
+            version: None,
         };
         
         let serialized = serde_json::to_string(&peer).unwrap();
@@ -143,6 +147,7 @@ mod tests {
             addr: Some("192.168.1.50".to_string()),
             player_name: None,
             games_count: None,
+            version: None,
         };
         
         let serialized = serde_json::to_string(&peer).unwrap();
@@ -161,6 +166,7 @@ mod tests {
             addr: Some("192.168.1.200".to_string()),
             player_name: Some("ClonePlayer".to_string()),
             games_count: Some(20),
+            version: None,
         };
         
         let cloned = peer.clone();
@@ -178,6 +184,7 @@ mod tests {
             addr: Some("192.168.1.201".to_string()),
             player_name: Some("DebugPlayer".to_string()),
             games_count: Some(15),
+            version: None,
         };
         
         // Should not panic when formatting
@@ -192,6 +199,7 @@ mod tests {
             addr: Some("".to_string()),
             player_name: Some("".to_string()),
             games_count: Some(0),
+            version: None,
         };
         
         assert_eq!(peer.id, "");
@@ -211,6 +219,7 @@ mod tests {
             addr: Some(long_addr.clone()),
             player_name: Some(long_name.clone()),
             games_count: Some(100),
+            version: None,
         };
         
         assert_eq!(peer.id, long_id);
@@ -226,6 +235,7 @@ mod tests {
             addr: Some("10.20.30.40".to_string()),
             player_name: Some("RoundTripPlayer".to_string()),
             games_count: Some(25),
+            version: None,
         };
         
         // Serialize

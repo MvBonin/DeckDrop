@@ -977,6 +977,7 @@ mod tests {
             addr: Some("192.168.1.100".to_string()),
             player_name: Some("DiscoveryTest".to_string()),
             games_count: Some(10),
+            version: None,
         };
         
         // Send peer through channel
@@ -999,6 +1000,7 @@ mod tests {
             addr: Some("192.168.1.101".to_string()),
             player_name: None,
             games_count: None,
+            version: None,
         };
         
         let peer2 = PeerInfo {
@@ -1006,6 +1008,7 @@ mod tests {
             addr: Some("192.168.1.102".to_string()),
             player_name: None,
             games_count: None,
+            version: None,
         };
         
         // Send to different channels
@@ -1117,6 +1120,7 @@ mod tests {
             addr: Some("192.168.1.100".to_string()),
             player_name: None,
             games_count: None,
+            version: None,
         };
         
         // Simuliere identify-Update
@@ -1146,6 +1150,7 @@ mod tests {
             addr: Some("192.168.1.100".to_string()),
             player_name: Some("OldName".to_string()),
             games_count: Some(10),
+            version: None,
         };
         
         let new_peer = PeerInfo {
@@ -1153,6 +1158,7 @@ mod tests {
             addr: Some("192.168.1.100".to_string()),
             player_name: Some("NewName".to_string()),
             games_count: Some(20),
+            version: None,
         };
         
         let needs_update = existing_peer.player_name != new_peer.player_name 
@@ -1169,6 +1175,7 @@ mod tests {
             addr: Some("192.168.1.100".to_string()),
             player_name: Some("TestPlayer".to_string()),
             games_count: Some(42),
+            version: None,
         };
         
         let new_peer = PeerInfo {
@@ -1176,6 +1183,7 @@ mod tests {
             addr: Some("192.168.1.100".to_string()),
             player_name: Some("TestPlayer".to_string()),
             games_count: Some(42),
+            version: None,
         };
         
         let needs_update = existing_peer.player_name != new_peer.player_name 
@@ -1285,11 +1293,13 @@ mod tests {
             None,
             None,
             None,
+            None,
         ).await;
         let _handle2 = start_discovery(
             event_tx2,
             player_name2.clone(),
             games_count2,
+            None,
             None,
             None,
             None,
@@ -1384,6 +1394,7 @@ mod tests {
             addr: Some("192.168.1.103".to_string()),
             player_name: None,
             games_count: None,
+            version: None,
         };
         
         // Send peer
@@ -1411,6 +1422,7 @@ mod tests {
                 addr: Some("192.168.1.201".to_string()),
                 player_name: None,
                 games_count: None,
+                version: None,
             };
             let _ = sender1.send(peer);
             sleep(Duration::from_millis(50)).await;
@@ -1422,6 +1434,7 @@ mod tests {
                 addr: Some("192.168.1.202".to_string()),
                 player_name: None,
                 games_count: None,
+                version: None,
             };
             let _ = sender2.send(peer);
             sleep(Duration::from_millis(50)).await;
@@ -1452,11 +1465,11 @@ mod tests {
         
         // Start two discovery instances in separate tasks
         let handle1 = tokio::spawn(async move {
-            run_discovery(sender1, None, event_tx1, None, None, None, None, None, None, None).await;
+            run_discovery(sender1, None, event_tx1, None, None, None, None, None, None, None, None).await;
         });
         
         let handle2 = tokio::spawn(async move {
-            run_discovery(_sender2, None, event_tx2, None, None, None, None, None, None, None).await;
+            run_discovery(_sender2, None, event_tx2, None, None, None, None, None, None, None, None).await;
         });
         
         // Wait a bit for discovery to start
@@ -1600,6 +1613,7 @@ mod tests {
             addr: Some("192.168.1.100".to_string()),
             player_name: None,
             games_count: None,
+            version: None,
         };
         
         // Test PeerFound variant
@@ -1648,6 +1662,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         ).await;
         
         // Verify handle was returned
@@ -1691,6 +1706,7 @@ mod tests {
                 addr: Some(format!("192.168.1.{}", 100 + i)),
                 player_name: None,
                 games_count: None,
+                version: None,
             };
             let _ = sender.send(peer);
         }
@@ -1735,11 +1751,13 @@ mod tests {
             None,
             None,
             None,
+            None,
         ).await;
         let handle2 = start_discovery(
             event_tx2,
             player_name2.clone(),
             games_count2,
+            None,
             None,
             None,
             None,

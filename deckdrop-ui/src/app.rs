@@ -34,6 +34,7 @@ pub struct DeckDropApp {
     pub game_integrity_status: HashMap<PathBuf, GameIntegrityStatus>, // game_path -> status
     pub integrity_check_start_time: HashMap<PathBuf, std::time::Instant>, // game_path -> start time for progress tracking
     pub integrity_check_progress: Arc<std::sync::Mutex<HashMap<PathBuf, usize>>>, // game_path -> current progress (for real-time updates)
+    pub integrity_check_results: Arc<std::sync::Mutex<HashMap<PathBuf, GameIntegrityStatus>>>, // game_path -> final result (for completed checks)
     pub network_games: HashMap<String, Vec<(String, NetworkGameInfo)>>, // game_id -> [(peer_id, game_info)]
     pub peers: Vec<PeerInfo>,
     
@@ -65,6 +66,11 @@ pub struct DeckDropApp {
     pub add_game_start_args: String,
     pub add_game_description: String,
     pub add_game_additional_instructions: String,
+    
+    // Progress for adding game (chunk generation)
+    pub add_game_progress: Option<(usize, usize, String)>, // current, total, current_file
+    pub add_game_progress_tracker: Arc<std::sync::Mutex<Option<(usize, usize, String)>>>, // Shared state for thread updates
+    pub add_game_generating: Option<PathBuf>, // Path of game being generated
     
     // Settings-Felder
     pub settings_player_name: String,
@@ -120,6 +126,7 @@ impl Default for DeckDropApp {
         }
         
         // 2. Lade Spiele aus den manuell hinzugefügten Pfaden (game_paths)
+        // Nur das Verzeichnis selbst prüfen, NICHT rekursiv Unterverzeichnisse
         for game_path in &config.game_paths {
             println!("[DEBUG] Loading games from game_path: {}", game_path.display());
             // Check if the path itself is a game (has deckdrop.toml)
@@ -129,11 +136,8 @@ impl Default for DeckDropApp {
                     println!("[DEBUG] Added game from path: {}", game_path.display());
                 }
             }
-            // Also check subdirectories
-            let before_count = my_games.len();
-            my_games.extend(deckdrop_core::load_games_from_directory(game_path));
-            println!("[DEBUG] Added {} games from subdirectories of {}", 
-                my_games.len() - before_count, game_path.display());
+            // KEINE rekursive Suche in Unterverzeichnissen für game_paths
+            // Nur download_path wird rekursiv durchsucht
         }
         
         // 3. Lade aktive Downloads aus Manifesten und füge sie zu my_games hinzu
@@ -224,6 +228,7 @@ impl Default for DeckDropApp {
             game_integrity_status,
             integrity_check_start_time: HashMap::new(),
             integrity_check_progress: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            integrity_check_results: Arc::new(std::sync::Mutex::new(HashMap::new())),
             config: config.clone(),
             status: StatusInfo {
                 is_online: true,
@@ -255,6 +260,9 @@ impl Default for DeckDropApp {
             add_game_start_args: String::new(),
             add_game_description: String::new(),
             add_game_additional_instructions: String::new(),
+            add_game_progress: None,
+            add_game_progress_tracker: Arc::new(std::sync::Mutex::new(None)),
+            add_game_generating: None,
             settings_player_name: config.player_name.clone(),
             settings_download_path: config.download_path.to_string_lossy().to_string(),
             license_player_name: config.player_name.clone(),
@@ -313,6 +321,10 @@ pub enum Message {
     
     // Progress update for integrity checks
     UpdateIntegrityProgress(PathBuf, usize), // game_path, current
+    
+    // Progress update for adding games (chunk generation)
+    UpdateAddGameProgress(usize, usize, String), // current, total, current_file
+    AddGameChunksGenerated(PathBuf, Result<String, String>), // game_path, hash_result
 }
 
 impl DeckDropApp {
@@ -330,6 +342,7 @@ impl DeckDropApp {
         }
         
         // 2. Lade Spiele aus den manuell hinzugefügten Pfaden (game_paths)
+        // Nur das Verzeichnis selbst prüfen, NICHT rekursiv Unterverzeichnisse
         for game_path in &config.game_paths {
             // Check if the path itself is a game (has deckdrop.toml)
             if deckdrop_core::check_game_config_exists(game_path) {
@@ -337,8 +350,8 @@ impl DeckDropApp {
                     my_games.push((game_path.clone(), game_info));
                 }
             }
-            // Also check subdirectories
-            my_games.extend(deckdrop_core::load_games_from_directory(game_path));
+            // KEINE rekursive Suche in Unterverzeichnissen für game_paths
+            // Nur download_path wird rekursiv durchsucht
         }
         
         // 3. Lade aktive Downloads aus Manifesten und füge sie zu my_games hinzu
@@ -425,6 +438,7 @@ impl DeckDropApp {
             game_integrity_status,
             integrity_check_start_time: HashMap::new(),
             integrity_check_progress: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            integrity_check_results: Arc::new(std::sync::Mutex::new(HashMap::new())),
             config: config.clone(),
             status: StatusInfo {
                 is_online: true,
@@ -456,6 +470,9 @@ impl DeckDropApp {
             add_game_start_args: String::new(),
             add_game_description: String::new(),
             add_game_additional_instructions: String::new(),
+            add_game_progress: None,
+            add_game_progress_tracker: Arc::new(std::sync::Mutex::new(None)),
+            add_game_generating: None,
             settings_player_name: config.player_name.clone(),
             settings_download_path: config.download_path.to_string_lossy().to_string(),
             license_player_name: config.player_name.clone(),
@@ -473,37 +490,122 @@ impl DeckDropApp {
                 }
             }
             Message::GameIntegrityChecked(game_path, status) => {
-                println!("[DEBUG] GameIntegrityChecked: {} -> {:?}", game_path.display(), status);
                 self.game_integrity_status.insert(game_path.clone(), status);
                 // Remove start time when check is complete
                 self.integrity_check_start_time.remove(&game_path);
-                println!("[DEBUG] Status updated and start time removed");
+            }
+            Message::UpdateAddGameProgress(current, total, file_name) => {
+                self.add_game_progress = Some((current, total, file_name));
+            }
+            Message::AddGameChunksGenerated(game_path, hash_result) => {
+                // Chunk generation complete
+                self.add_game_generating = None;
+                self.add_game_progress = None;
+                if let Ok(mut tracker) = self.add_game_progress_tracker.lock() {
+                    *tracker = None;
+                }
+                
+                let mut game_info = GameInfo {
+                    game_id: deckdrop_core::game::generate_game_id(),
+                    name: self.add_game_name.clone(),
+                    version: if self.add_game_version.is_empty() { "1.0".to_string() } else { self.add_game_version.clone() },
+                    start_file: self.add_game_start_file.clone(),
+                    start_args: if self.add_game_start_args.is_empty() { None } else { Some(self.add_game_start_args.clone()) },
+                    description: if self.add_game_description.is_empty() { None } else { Some(self.add_game_description.clone()) },
+                    additional_instructions: if self.add_game_additional_instructions.is_empty() { None } else { Some(self.add_game_additional_instructions.clone()) },
+                    creator_peer_id: self.config.peer_id.clone(),
+                    hash: hash_result.ok(),
+                };
+                
+                // Save GameInfo
+                if let Err(e) = game_info.save_to_path_with_hash(&game_path, game_info.hash.clone()) {
+                    eprintln!("Error saving game: {}", e);
+                    return Task::none();
+                }
+                
+                // Add game path to config
+                let mut config = deckdrop_core::Config::load();
+                if let Err(e) = config.add_game_path(&game_path) {
+                    eprintln!("Error adding game path to config: {}", e);
+                }
+                
+                // Reload games list
+                self.config = config.clone();
+                self.my_games.clear();
+                self.game_integrity_status.clear();
+                
+                // 1. Lade Spiele aus dem Download-Pfad (Unterordner = Spiele)
+                if self.config.download_path.exists() {
+                    self.my_games.extend(deckdrop_core::load_games_from_directory(&self.config.download_path));
+                }
+                
+                // 2. Lade Spiele aus den manuell hinzugefügten Pfaden (game_paths)
+                // Nur das Verzeichnis selbst prüfen, NICHT rekursiv Unterverzeichnisse
+                for game_path_dir in &self.config.game_paths {
+                    // Check if the path itself is a game (has deckdrop.toml)
+                    if deckdrop_core::check_game_config_exists(game_path_dir) {
+                        if let Ok(game_info) = deckdrop_core::GameInfo::load_from_path(game_path_dir) {
+                            self.my_games.push((game_path_dir.clone(), game_info));
+                        }
+                    }
+                    // KEINE rekursive Suche in Unterverzeichnissen für game_paths
+                    // Nur download_path wird rekursiv durchsucht
+                }
+                
+                // Deduplicate games by game_id
+                self.deduplicate_games_by_id();
+                
+                // Initialize integrity status for all games as "Checking" - get total file count immediately
+                for (game_path, _) in &self.my_games {
+                    let chunks_toml_path = game_path.join("deckdrop_chunks.toml");
+                    let total = if chunks_toml_path.exists() {
+                        if let Ok(content) = std::fs::read_to_string(&chunks_toml_path) {
+                            if let Ok(parsed) = toml::from_str::<toml::Value>(&content) {
+                                if let Some(files) = parsed.get("file").and_then(|f| f.as_array()) {
+                                    files.len()
+                                } else {
+                                    0
+                                }
+                            } else {
+                                0
+                            }
+                        } else {
+                            0
+                        }
+                    } else {
+                        0
+                    };
+                    self.game_integrity_status.insert(game_path.clone(), GameIntegrityStatus::Checking { current: 0, total });
+                    // Don't set start time here - it will be set when the check actually starts
+                }
+                
+                // Close dialog and reset form
+                self.show_add_game_dialog = false;
+                self.add_game_path = String::new();
+                self.add_game_name = String::new();
+                self.add_game_version = String::new();
+                self.add_game_start_file = String::new();
+                self.add_game_start_args = String::new();
+                self.add_game_description = String::new();
+                self.add_game_additional_instructions = String::new();
+                
+                // Send metadata update with new games count
+                if let Some(tx) = crate::network_bridge::get_metadata_update_tx() {
+                    let games_count = self.my_games.len() as u32;
+                    let _ = tx.send(deckdrop_network::network::discovery::MetadataUpdate {
+                        player_name: None, // Only update games count
+                        games_count: Some(games_count),
+                    });
+                }
             }
             Message::UpdateIntegrityProgress(game_path, current) => {
-                println!("[DEBUG] UpdateIntegrityProgress: {} -> current={}", game_path.display(), current);
                 // Update progress for a checking game
                 if let Some(status) = self.game_integrity_status.get_mut(&game_path) {
                     if let GameIntegrityStatus::Checking { total, .. } = status {
-                        println!("[DEBUG] Updating status: {} -> Checking {{ current: {}, total: {} }}", 
-                            game_path.display(), current, total);
                         *status = GameIntegrityStatus::Checking { current, total: *total };
-                        // Return a task to continue checking for more updates
-                        // This ensures the UI keeps updating
-                        return Task::perform(
-                            async move {
-                                use futures_timer::Delay;
-                                use std::time::Duration;
-                                Delay::new(Duration::from_millis(50)).await;
-                                Message::Tick
-                            },
-                            |msg| msg
-                        );
-                    } else {
-                        println!("[DEBUG] Status is not Checking, ignoring update");
                     }
-                } else {
-                    println!("[DEBUG] Game path not found in integrity_status");
                 }
+                // Don't create additional Tick tasks - the subscription already handles this
             }
             Message::NetworkEvent(event) => {
                 self.handle_network_event(event);
@@ -565,7 +667,76 @@ impl DeckDropApp {
                     .set_title("Select Game Directory")
                     .pick_folder()
                 {
-                    self.add_game_path = path.to_string_lossy().to_string();
+                    let game_path = PathBuf::from(&path);
+                    
+                    // Prüfe ob dies bereits ein vollständiges DeckDrop-Spiel ist
+                    if deckdrop_core::check_complete_deckdrop_game_exists(&game_path) {
+                        // Lade das Spiel direkt
+                        if let Ok(game_info) = deckdrop_core::GameInfo::load_from_path(&game_path) {
+                            // Füge Spielpfad zur Config hinzu (falls noch nicht vorhanden)
+                            let mut config = deckdrop_core::Config::load();
+                            if !config.game_paths.contains(&game_path) {
+                                if let Err(e) = config.add_game_path(&game_path) {
+                                    eprintln!("Error adding game path to config: {}", e);
+                                } else {
+                                    self.config = config.clone();
+                                }
+                            }
+                            
+                            // Füge Spiel zu my_games hinzu (wenn noch nicht vorhanden)
+                            let game_exists = self.my_games.iter()
+                                .any(|(p, _)| p == &game_path);
+                            if !game_exists {
+                                self.my_games.push((game_path.clone(), game_info));
+                                
+                                // Initialisiere Integrity-Status
+                                let chunks_toml_path = game_path.join("deckdrop_chunks.toml");
+                                let total = if chunks_toml_path.exists() {
+                                    if let Ok(content) = std::fs::read_to_string(&chunks_toml_path) {
+                                        if let Ok(parsed) = toml::from_str::<toml::Value>(&content) {
+                                            if let Some(files) = parsed.get("file").and_then(|f| f.as_array()) {
+                                                files.len()
+                                            } else {
+                                                0
+                                            }
+                                        } else {
+                                            0
+                                        }
+                                    } else {
+                                        0
+                                    }
+                                } else {
+                                    0
+                                };
+                                self.game_integrity_status.insert(game_path.clone(), GameIntegrityStatus::Checking { current: 0, total });
+                                
+                                // Dedupliziere Spiele nach game_id
+                                self.deduplicate_games_by_id();
+                                
+                                // Sende Metadata-Update
+                                if let Some(tx) = crate::network_bridge::get_metadata_update_tx() {
+                                    let games_count = self.my_games.len() as u32;
+                                    let _ = tx.send(deckdrop_network::network::discovery::MetadataUpdate {
+                                        player_name: None,
+                                        games_count: Some(games_count),
+                                    });
+                                }
+                            }
+                            
+                            // Schließe Dialog und setze Form zurück
+                            self.show_add_game_dialog = false;
+                            self.add_game_path = String::new();
+                            self.add_game_name = String::new();
+                            self.add_game_version = String::new();
+                            self.add_game_start_file = String::new();
+                            self.add_game_start_args = String::new();
+                            self.add_game_description = String::new();
+                            self.add_game_additional_instructions = String::new();
+                        }
+                    } else {
+                        // Normales Verhalten: Pfad setzen
+                        self.add_game_path = path.to_string_lossy().to_string();
+                    }
                 }
             }
             Message::AddGameNameChanged(name) => {
@@ -599,8 +770,8 @@ impl DeckDropApp {
                     return Task::none();
                 }
                 
-                // Create GameInfo
-                let mut game_info = GameInfo {
+                // Store game info for later use
+                let game_info = GameInfo {
                     game_id: deckdrop_core::game::generate_game_id(),
                     name: self.add_game_name.clone(),
                     version: if self.add_game_version.is_empty() { "1.0".to_string() } else { self.add_game_version.clone() },
@@ -612,99 +783,26 @@ impl DeckDropApp {
                     hash: None,
                 };
                 
-                // Generate chunks.toml
-                if let Err(e) = deckdrop_core::generate_chunks_toml(&game_path, None::<fn(usize, usize, &str)>) {
-                    eprintln!("Error generating chunks.toml: {}", e);
-                    return Task::none();
-                }
+                // Start chunk generation in background thread
+                let game_path_clone = game_path.clone();
+                let game_info_clone = game_info.clone();
+                let progress_tracker = self.add_game_progress_tracker.clone();
                 
-                // Load chunks.toml to get hash
-                let chunks_toml_path = game_path.join("deckdrop_chunks.toml");
-                if chunks_toml_path.exists() {
-                    if let Ok(hash) = deckdrop_core::gamechecker::calculate_file_hash(&chunks_toml_path) {
-                        game_info.hash = Some(format!("blake3:{}", hash));
-                    }
-                }
+                // Initialize progress
+                self.add_game_progress = Some((0, 0, String::new()));
+                self.add_game_generating = Some(game_path.clone());
                 
-                // Save GameInfo
-                if let Err(e) = game_info.save_to_path_with_hash(&game_path, game_info.hash.clone()) {
-                    eprintln!("Error saving game: {}", e);
-                    return Task::none();
-                }
-                
-                // Add game path to config
-                let mut config = deckdrop_core::Config::load();
-                if let Err(e) = config.add_game_path(&game_path) {
-                    eprintln!("Error adding game path to config: {}", e);
-                }
-                
-                // Reload games list
-                self.config = config.clone();
-                self.my_games.clear();
-                self.game_integrity_status.clear();
-                
-                // 1. Lade Spiele aus dem Download-Pfad (Unterordner = Spiele)
-                if self.config.download_path.exists() {
-                    self.my_games.extend(deckdrop_core::load_games_from_directory(&self.config.download_path));
-                }
-                
-                // 2. Lade Spiele aus den manuell hinzugefügten Pfaden (game_paths)
-                for game_path_dir in &self.config.game_paths {
-                    // Check if the path itself is a game (has deckdrop.toml)
-                    if deckdrop_core::check_game_config_exists(game_path_dir) {
-                        if let Ok(game_info) = deckdrop_core::GameInfo::load_from_path(game_path_dir) {
-                            self.my_games.push((game_path_dir.clone(), game_info));
+                // Spawn thread for chunk generation
+                std::thread::spawn(move || {
+                    let _ = deckdrop_core::generate_chunks_toml(&game_path_clone, Some(move |current: usize, total: usize, file_name: &str| {
+                        if let Ok(mut tracker) = progress_tracker.lock() {
+                            *tracker = Some((current, total, file_name.to_string()));
                         }
-                    }
-                    // Also check subdirectories
-                    self.my_games.extend(deckdrop_core::load_games_from_directory(game_path_dir));
-                }
+                    }));
+                });
                 
-                // Deduplicate games by game_id
-                self.deduplicate_games_by_id();
-                
-                // Initialize integrity status for all games as "Checking" - get total file count immediately
-                for (game_path, _) in &self.my_games {
-                    let chunks_toml_path = game_path.join("deckdrop_chunks.toml");
-                    let total = if chunks_toml_path.exists() {
-                        if let Ok(content) = std::fs::read_to_string(&chunks_toml_path) {
-                            if let Ok(parsed) = toml::from_str::<toml::Value>(&content) {
-                                if let Some(files) = parsed.get("file").and_then(|f| f.as_array()) {
-                                    files.len()
-                                } else {
-                                    0
-                                }
-                            } else {
-                                0
-                            }
-                        } else {
-                            0
-                        }
-                    } else {
-                        0
-                    };
-                    self.game_integrity_status.insert(game_path.clone(), GameIntegrityStatus::Checking { current: 0, total });
-                    // Don't set start time here - it will be set when the check actually starts
-                }
-                
-                // Close dialog and reset form
-                self.show_add_game_dialog = false;
-                self.add_game_path = String::new();
-                self.add_game_name = String::new();
-                self.add_game_version = String::new();
-                self.add_game_start_file = String::new();
-                self.add_game_start_args = String::new();
-                self.add_game_description = String::new();
-                self.add_game_additional_instructions = String::new();
-                
-                // Send metadata update with new games count
-                if let Some(tx) = crate::network_bridge::get_metadata_update_tx() {
-                    let games_count = self.my_games.len() as u32;
-                    let _ = tx.send(deckdrop_network::network::discovery::MetadataUpdate {
-                        player_name: None, // Only update games count
-                        games_count: Some(games_count),
-                    });
-                }
+                // Return immediately - progress will be updated via Tick
+                return Task::none();
             }
             Message::CancelAddGame => {
                 self.show_add_game_dialog = false;
@@ -786,10 +884,6 @@ impl DeckDropApp {
                 // Don't open settings automatically anymore - user can open it from tab
             }
             Message::Tick => {
-                println!("[DEBUG] ===== TICK RECEIVED =====");
-                println!("[DEBUG] Total games in integrity_status: {}", self.game_integrity_status.len());
-                println!("[DEBUG] Total games in my_games: {}", self.my_games.len());
-                
                 // Periodic updates (e.g., update download progress)
                 self.update_download_progress();
                 
@@ -802,35 +896,116 @@ impl DeckDropApp {
                     }
                 }
                 
-                // FIRST: Check if we need to start an integrity check (before updating progress)
-                // This ensures the check starts immediately, not after simulated progress
-                println!("[DEBUG] Filtering games to check (before progress update)...");
-                let games_to_check: Vec<PathBuf> = self.game_integrity_status
-                    .iter()
-                    .filter(|(path, status)| {
-                        if let GameIntegrityStatus::Checking { current, total } = status {
-                            let should_check = *total > 0 && *current == 0;
-                            println!("[DEBUG] Game {}: current={}, total={}, should_check={}", 
-                                path.display(), current, total, should_check);
-                            should_check
-                        } else {
-                            println!("[DEBUG] Game {}: status is not Checking", path.display());
-                            false
+                // Check for add game progress updates
+                if let Some(game_path) = &self.add_game_generating {
+                    if let Ok(tracker) = self.add_game_progress_tracker.lock() {
+                        if let Some(progress) = tracker.as_ref() {
+                            self.add_game_progress = Some(progress.clone());
+                            
+                            // Check if chunks.toml was created (generation complete)
+                            let chunks_toml_path = game_path.join("deckdrop_chunks.toml");
+                            if chunks_toml_path.exists() && progress.1 > 0 && progress.0 >= progress.1 {
+                                // Generation complete - trigger completion message
+                                let game_path_clone = game_path.clone();
+                                return Task::perform(async move {
+                                    use futures_timer::Delay;
+                                    use std::time::Duration;
+                                    Delay::new(Duration::from_millis(100)).await;
+                                    let hash_result = deckdrop_core::gamechecker::calculate_file_hash(&chunks_toml_path)
+                                        .map(|h| format!("blake3:{}", h))
+                                        .map_err(|e| e.to_string());
+                                    (game_path_clone, hash_result)
+                                }, |(path, result)| Message::AddGameChunksGenerated(path, result));
+                            }
                         }
-                    })
-                    .map(|(path, _)| path.clone())
-                    .collect();
-                
-                println!("[DEBUG] Games to check: {} (games with current=0 and total>0)", games_to_check.len());
-                for game_path in &games_to_check {
-                    println!("[DEBUG]   - {}", game_path.display());
+                    }
                 }
+                
+                // Update progress from tracker FIRST - before checking if we need to start new checks
+                // This ensures progress is updated immediately when available
+                // Only lock once and process all updates quickly
+                let progress_updates: Vec<(PathBuf, usize)> = {
+                    if let Ok(progress) = self.integrity_check_progress.lock() {
+                        progress.iter()
+                            .map(|(path, current)| (path.clone(), *current))
+                            .collect()
+                    } else {
+                        Vec::new()
+                    }
+                };
+                
+                // Apply progress updates without holding the lock
+                for (game_path, current_progress) in progress_updates {
+                    if let Some(status) = self.game_integrity_status.get_mut(&game_path) {
+                        if let GameIntegrityStatus::Checking { current: old_current, total } = status {
+                            // Only update if progress has actually changed
+                            if current_progress != *old_current && current_progress <= *total {
+                                *status = GameIntegrityStatus::Checking { current: current_progress, total: *total };
+                            }
+                        }
+                    }
+                }
+                
+                // Check for completed checks in results tracker
+                let completed_checks: Vec<(PathBuf, GameIntegrityStatus)> = {
+                    if let Ok(mut results) = self.integrity_check_results.lock() {
+                        results.drain().collect()
+                    } else {
+                        Vec::new()
+                    }
+                };
+                
+                // Apply completed checks without holding the lock
+                for (game_path, final_status) in completed_checks {
+                    if let Some(current_status) = self.game_integrity_status.get_mut(&game_path) {
+                        // Only update if still checking
+                        if matches!(current_status, GameIntegrityStatus::Checking { .. }) {
+                            *current_status = final_status;
+                            // Remove start time
+                            self.integrity_check_start_time.remove(&game_path);
+                        }
+                    }
+                }
+                
+                // THEN: Check if we need to start an integrity check
+                // This ensures the check starts immediately, not after simulated progress
+                // Only check games that:
+                // 1. Have status Checking with current == 0
+                // 2. Are NOT already in the progress tracker (check already running)
+                // 3. Do NOT have a start_time set (check already started)
+                let games_to_check: Vec<PathBuf> = {
+                    let progress_tracker_locked = self.integrity_check_progress.lock().ok();
+                    self.game_integrity_status
+                        .iter()
+                        .filter(|(path, status)| {
+                            if let GameIntegrityStatus::Checking { current, total } = status {
+                                // Must have total > 0 and current == 0
+                                if *total > 0 && *current == 0 {
+                                    // Check if already in progress tracker
+                                    let in_progress = if let Some(ref progress) = progress_tracker_locked {
+                                        progress.contains_key(*path)
+                                    } else {
+                                        false
+                                    };
+                                    // Check if start_time is already set
+                                    let already_started = self.integrity_check_start_time.contains_key(*path);
+                                    // Only start if not already running
+                                    !in_progress && !already_started
+                                } else {
+                                    false
+                                }
+                            } else {
+                                false
+                            }
+                        })
+                        .map(|(path, _)| path.clone())
+                        .collect()
+                };
                 
                 // If we have games to check, start the check immediately
                 if !games_to_check.is_empty() {
                     // Start integrity check for first game that needs checking
                     let game_path = games_to_check[0].clone();
-                    println!("[DEBUG] Starting integrity check for: {}", game_path.display());
                     
                     // Get the total file count (should already be set during initialization)
                     let total = if let Some(GameIntegrityStatus::Checking { total, .. }) = self.game_integrity_status.get(&game_path) {
@@ -839,115 +1014,89 @@ impl DeckDropApp {
                         0
                     };
                     
-                    println!("[DEBUG] Total files to check: {}", total);
-                    
-                    // Set start time for progress tracking
+                    // Set start time for progress tracking (marks that check has started)
                     self.integrity_check_start_time.insert(game_path.clone(), std::time::Instant::now());
-                    println!("[DEBUG] Start time set for: {}", game_path.display());
                     
-                    // Start the actual integrity check with progress tracking
+                    // Start the actual integrity check with progress tracking in a separate thread
+                    // This prevents blocking the UI thread
                     let game_path_for_check = game_path.clone();
                     let progress_tracker = self.integrity_check_progress.clone();
-                    return Task::perform(
-                        {
-                            let game_path_clone = game_path_for_check.clone();
-                            let progress_tracker_clone = progress_tracker.clone();
-                            async move {
-                                println!("[DEBUG] Starting async integrity check for: {}", game_path_clone.display());
-                                // Perform light check (fast, checks for file changes)
-                                let result = deckdrop_core::light_check_game(&game_path_clone);
-                                println!("[DEBUG] Light check result: {:?}", result.is_ok());
-                                match result {
-                                    Ok(light_result) => {
-                                        println!("[DEBUG] Light check: missing_files={}, extra_files={}", 
-                                            light_result.missing_files.len(), light_result.extra_files.len());
-                                        if light_result.missing_files.is_empty() && light_result.extra_files.is_empty() {
-                                            // All files match, do full integrity check with progress
-                                            println!("[DEBUG] Starting full integrity check with progress");
-                                            match deckdrop_core::verify_game_integrity_with_progress(
-                                                &game_path_clone,
-                                                Some(|current, total| {
-                                                    // Update progress in shared tracker
-                                                    if let Ok(mut progress) = progress_tracker_clone.lock() {
-                                                        progress.insert(game_path_clone.clone(), current);
-                                                        println!("[DEBUG] Progress update: {}/{}", current, total);
-                                                    }
-                                                })
-                                            ) {
-                                                Ok(integrity_result) => {
-                                                    println!("[DEBUG] Integrity check complete: failed_files={}, missing_files={}", 
-                                                        integrity_result.failed_files.len(), integrity_result.missing_files.len());
-                                                    // Clear progress tracker
-                                                    if let Ok(mut progress) = progress_tracker_clone.lock() {
-                                                        progress.remove(&game_path_clone);
-                                                    }
-                                                    if integrity_result.failed_files.is_empty() && integrity_result.missing_files.is_empty() {
-                                                        (game_path_clone, GameIntegrityStatus::Intact)
-                                                    } else {
-                                                        (game_path_clone, GameIntegrityStatus::Changed)
-                                                    }
-                                                }
-                                                Err(e) => {
-                                                    println!("[DEBUG] Integrity check error: {}", e);
-                                                    // Clear progress tracker
-                                                    if let Ok(mut progress) = progress_tracker_clone.lock() {
-                                                        progress.remove(&game_path_clone);
-                                                    }
-                                                    (game_path_clone, GameIntegrityStatus::Changed)
+                    
+                    // Spawn the integrity check in a separate thread
+                    let results_tracker = self.integrity_check_results.clone();
+                    // Add to progress tracker immediately to mark as started
+                    if let Ok(mut progress) = self.integrity_check_progress.lock() {
+                        progress.insert(game_path_for_check.clone(), 0);
+                    }
+                    std::thread::spawn(move || {
+                        // Perform light check (fast, checks for file changes)
+                        let result = deckdrop_core::light_check_game(&game_path_for_check);
+                        match result {
+                            Ok(light_result) => {
+                                if light_result.missing_files.is_empty() && light_result.extra_files.is_empty() {
+                                    // All files match, do full integrity check with progress
+                                    let integrity_result = deckdrop_core::verify_game_integrity_with_progress(
+                                        &game_path_for_check,
+                                        Some({
+                                            let progress_tracker = progress_tracker.clone();
+                                            let game_path = game_path_for_check.clone();
+                                            move |current, total| {
+                                                // Update progress in shared tracker
+                                                if let Ok(mut progress) = progress_tracker.lock() {
+                                                    progress.insert(game_path.clone(), current);
                                                 }
                                             }
-                                        } else {
-                                            // Clear progress tracker
-                                            if let Ok(mut progress) = progress_tracker_clone.lock() {
-                                                progress.remove(&game_path_clone);
+                                        })
+                                    );
+                                    
+                                    // Determine final status
+                                    let final_status = match integrity_result {
+                                        Ok(result) => {
+                                            if result.failed_files.is_empty() && result.missing_files.is_empty() {
+                                                GameIntegrityStatus::Intact
+                                            } else {
+                                                GameIntegrityStatus::Changed
                                             }
-                                            (game_path_clone, GameIntegrityStatus::Changed)
                                         }
+                                        Err(_) => GameIntegrityStatus::Changed,
+                                    };
+                                    
+                                    // Store result and clear progress tracker
+                                    if let Ok(mut results) = results_tracker.lock() {
+                                        results.insert(game_path_for_check.clone(), final_status);
                                     }
-                                    Err(e) => {
-                                        println!("[DEBUG] Light check error: {}", e);
-                                        // Clear progress tracker
-                                        if let Ok(mut progress) = progress_tracker_clone.lock() {
-                                            progress.remove(&game_path_clone);
-                                        }
-                                        (game_path_clone, GameIntegrityStatus::Error(e.to_string()))
+                                    // Clear progress tracker - this signals that the check is complete
+                                    if let Ok(mut progress) = progress_tracker.lock() {
+                                        progress.remove(&game_path_for_check);
+                                    }
+                                } else {
+                                    // Files changed - store result and clear progress tracker
+                                    if let Ok(mut results) = results_tracker.lock() {
+                                        results.insert(game_path_for_check.clone(), GameIntegrityStatus::Changed);
+                                    }
+                                    if let Ok(mut progress) = progress_tracker.lock() {
+                                        progress.remove(&game_path_for_check);
                                     }
                                 }
                             }
-                        },
-                        |(path, status)| {
-                            println!("[DEBUG] Integrity check complete: {} -> {:?}", path.display(), status);
-                            Message::GameIntegrityChecked(path, status)
-                        }
-                    );
-                }
-                
-                // Update progress from tracker for games that are currently checking
-                let mut progress_updates = Vec::new();
-                if let Ok(progress) = self.integrity_check_progress.lock() {
-                    for (game_path, current_progress) in progress.iter() {
-                        if let Some(GameIntegrityStatus::Checking { total, .. }) = self.game_integrity_status.get(game_path) {
-                            if *current_progress > 0 && *current_progress <= *total {
-                                progress_updates.push((game_path.clone(), *current_progress));
+                            Err(e) => {
+                                // Error - store result and clear progress tracker
+                                if let Ok(mut results) = results_tracker.lock() {
+                                    results.insert(game_path_for_check.clone(), GameIntegrityStatus::Error(e.to_string()));
+                                }
+                                if let Ok(mut progress) = progress_tracker.lock() {
+                                    progress.remove(&game_path_for_check);
+                                }
                             }
                         }
-                    }
+                    });
+                    
+                    // Return immediately - progress will be updated via Tick
+                    return Task::none();
                 }
                 
-                // Send progress updates as messages to trigger UI re-render
-                if !progress_updates.is_empty() {
-                    println!("[DEBUG] Sending {} progress updates from tracker", progress_updates.len());
-                    let (game_path, current) = progress_updates[0].clone();
-                    return Task::perform(
-                        async move {
-                            use futures_timer::Delay;
-                            use std::time::Duration;
-                            Delay::new(Duration::from_millis(10)).await;
-                            (game_path, current)
-                        },
-                        |(path, current)| Message::UpdateIntegrityProgress(path, current)
-                    );
-                }
+                // Don't create additional Tick tasks - the subscription in main.rs already sends Ticks every 100ms
+                // This prevents task cascades that slow down the application
             }
         }
         Task::none()
@@ -1119,13 +1268,15 @@ impl DeckDropApp {
                 }
                 
                 // Reload games from game_paths
+                // Nur das Verzeichnis selbst prüfen, NICHT rekursiv Unterverzeichnisse
                 for game_path in &config.game_paths {
                     if deckdrop_core::check_game_config_exists(game_path) {
                         if let Ok(game_info) = deckdrop_core::GameInfo::load_from_path(game_path) {
                             self.my_games.push((game_path.clone(), game_info));
                         }
                     }
-                    self.my_games.extend(deckdrop_core::load_games_from_directory(game_path));
+                    // KEINE rekursive Suche in Unterverzeichnissen für game_paths
+                    // Nur download_path wird rekursiv durchsucht
                 }
                 
                 // Deduplicate games by game_id
@@ -1396,7 +1547,12 @@ impl DeckDropApp {
                     let (status_text, status_color) = match integrity_status {
                         GameIntegrityStatus::Checking { current, total } => {
                             if *total > 0 {
-                                (format!("Checking {}/{}...", *current + 1, *total), Color::from_rgba(0.7, 0.7, 0.7, 1.0))
+                                // Show current/total, but if current is 0, show "Starting..."
+                                if *current == 0 {
+                                    (format!("Checking... ({}/{})", *current, *total), Color::from_rgba(0.7, 0.7, 0.7, 1.0))
+                                } else {
+                                    (format!("Checking {}/{}...", *current, *total), Color::from_rgba(0.7, 0.7, 0.7, 1.0))
+                                }
                             } else {
                                 ("Checking...".to_string(), Color::from_rgba(0.7, 0.7, 0.7, 1.0))
                             }
@@ -1749,6 +1905,24 @@ impl DeckDropApp {
                             text_input("Relative to the game path", &self.add_game_start_file)
                                 .on_input(Message::AddGameStartFileChanged)
                                 .padding(10),
+                            // Progress bar for chunk generation
+                            if let Some((current, total, file_name)) = &self.add_game_progress {
+                                if *total > 0 {
+                                    let progress = *current as f32 / *total as f32;
+                                    column![
+                                        Space::with_height(10),
+                                        text(format!("Generiere Chunks: {}/{}", current, total)).size(14),
+                                        text(format!("Datei: {}", file_name)).size(12),
+                                        progress_bar(0.0..=1.0, progress)
+                                            .height(Length::Fixed(20.0)),
+                                    ]
+                                    .spacing(5)
+                                } else {
+                                    column![].spacing(0)
+                                }
+                            } else {
+                                column![].spacing(0)
+                            },
                             Space::with_height(10),
                             text("Description (optional):").size(16),
                             text_input("Description", &self.add_game_description)

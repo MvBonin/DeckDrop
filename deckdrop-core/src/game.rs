@@ -266,6 +266,14 @@ pub fn check_game_config_exists(game_path: &Path) -> bool {
     toml_path.exists()
 }
 
+/// Prüft, ob im angegebenen Spielpfad ein vollständiges DeckDrop-Spiel existiert
+/// (sowohl deckdrop.toml als auch deckdrop_chunks.toml müssen vorhanden sein)
+pub fn check_complete_deckdrop_game_exists(game_path: &Path) -> bool {
+    let toml_path = game_path.join("deckdrop.toml");
+    let chunks_toml_path = game_path.join("deckdrop_chunks.toml");
+    toml_path.exists() && chunks_toml_path.exists()
+}
+
 /// Lädt alle Spiele aus einem Spiele-Verzeichnis
 pub fn load_games_from_directory(games_dir: &Path) -> Vec<(PathBuf, GameInfo)> {
     let mut games = Vec::new();

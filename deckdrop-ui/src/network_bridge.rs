@@ -72,16 +72,15 @@ impl NetworkBridge {
         let player_name = Some(config.player_name.clone());
         
         // Berechne games_count
+        // Nur das Verzeichnis selbst prüfen, NICHT rekursiv Unterverzeichnisse für game_paths
         let games_count = {
             let mut count = 0u32;
             for game_path in &config.game_paths {
                 if check_game_config_exists(game_path) {
                     count += 1;
                 }
-                if game_path.is_dir() {
-                    let additional_games = load_games_from_directory(game_path);
-                    count += additional_games.len() as u32;
-                }
+                // KEINE rekursive Suche in Unterverzeichnissen für game_paths
+                // Nur download_path wird rekursiv durchsucht
             }
             Some(count)
         };
@@ -95,6 +94,7 @@ impl NetworkBridge {
                 let config = Config::load();
                 let mut network_games = Vec::new();
                 
+                // Nur das Verzeichnis selbst prüfen, NICHT rekursiv Unterverzeichnisse für game_paths
                 for game_path in &config.game_paths {
                     if check_game_config_exists(game_path) {
                         if let Ok(game_info) = GameInfo::load_from_path(game_path) {
@@ -109,20 +109,8 @@ impl NetworkBridge {
                             });
                         }
                     }
-                    if game_path.is_dir() {
-                        let additional_games = load_games_from_directory(game_path);
-                        for (_path, game_info) in additional_games {
-                            network_games.push(NetworkGameInfo {
-                                game_id: game_info.game_id,
-                                name: game_info.name,
-                                version: game_info.version,
-                                start_file: game_info.start_file,
-                                start_args: game_info.start_args,
-                                description: game_info.description,
-                                creator_peer_id: game_info.creator_peer_id,
-                            });
-                        }
-                    }
+                    // KEINE rekursive Suche in Unterverzeichnissen für game_paths
+                    // Nur download_path wird rekursiv durchsucht
                 }
                 network_games
             }))
@@ -131,6 +119,7 @@ impl NetworkBridge {
         let game_metadata_loader: Option<GameMetadataLoader> = {
             Some(Arc::new(move |game_id: &str| {
                 let config = Config::load();
+                // Nur das Verzeichnis selbst prüfen, NICHT rekursiv Unterverzeichnisse für game_paths
                 for game_path in &config.game_paths {
                     if check_game_config_exists(game_path) {
                         if let Ok(game_info) = GameInfo::load_from_path(game_path) {
@@ -143,18 +132,8 @@ impl NetworkBridge {
                             }
                         }
                     }
-                    if game_path.is_dir() {
-                        let additional_games = load_games_from_directory(game_path);
-                        for (path, game_info) in additional_games {
-                            if game_info.game_id == game_id {
-                                let toml_path = path.join("deckdrop.toml");
-                                let deckdrop_toml = std::fs::read_to_string(&toml_path).ok()?;
-                                let chunks_toml_path = path.join("deckdrop_chunks.toml");
-                                let deckdrop_chunks_toml = std::fs::read_to_string(&chunks_toml_path).ok()?;
-                                return Some((deckdrop_toml, deckdrop_chunks_toml));
-                            }
-                        }
-                    }
+                    // KEINE rekursive Suche in Unterverzeichnissen für game_paths
+                    // Nur download_path wird rekursiv durchsucht
                 }
                 None
             }))
