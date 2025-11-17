@@ -168,6 +168,15 @@ pub async fn run_discovery(
         Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     let pending_metadata_requests_clone = pending_metadata_requests.clone();
     
+    // Tracking für Peer-Adressen: peer_id -> Multiaddr (für Reconnects)
+    let peer_addrs: Arc<tokio::sync::Mutex<HashMap<String, libp2p::Multiaddr>>> = 
+        Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let peer_addrs_clone = peer_addrs.clone();
+    
+    // Channel für Reconnect-Anfragen
+    let (reconnect_tx, mut reconnect_rx) = tokio::sync::mpsc::unbounded_channel::<libp2p::Multiaddr>();
+    let reconnect_tx_clone = reconnect_tx.clone();
+    
     // Handshake wird jetzt über identify Protokoll gehandhabt
     // Channel nicht mehr benötigt, aber behalten für Kompatibilität
     let (_handshake_tx, mut handshake_rx) = tokio::sync::mpsc::unbounded_channel::<(PeerId, Option<String>, Option<u32>)>();
@@ -253,17 +262,23 @@ pub async fn run_discovery(
     };
     
     // Use the same identity for the swarm
+    // Konfiguriere yamux mit KeepAlive, um Verbindungen am Leben zu halten
+    let mut yamux_config = libp2p::yamux::Config::default();
+    yamux_config.set_max_buffer_size(16 * 1024 * 1024); // 16MB Buffer für große Chunks
+    yamux_config.set_receive_window_size(16 * 1024 * 1024);
+    
     let mut swarm = libp2p::SwarmBuilder::with_existing_identity(id_keys)
         .with_tokio()
         .with_tcp(
             libp2p::tcp::Config::default(),
             libp2p::noise::Config::new,
-            libp2p::yamux::Config::default,
+            move || yamux_config.clone(),
         )
         .unwrap()
         .with_behaviour(|_| behaviour)
         .unwrap()
-        .with_swarm_config(|c| c.with_idle_connection_timeout(std::time::Duration::from_secs(60)))
+        // Erhöhe idle_connection_timeout auf 5 Minuten und deaktiviere KeepAlive-Timeout nicht
+        .with_swarm_config(|c| c.with_idle_connection_timeout(std::time::Duration::from_secs(300)))
         .build();
 
     println!("Swarm created, starting discovery loop...");
@@ -305,6 +320,16 @@ pub async fn run_discovery(
     
     loop {
         tokio::select! {
+            // Handle Reconnect-Anfragen
+            Some(addr) = reconnect_rx.recv() => {
+                println!("Reconnect-Anfrage erhalten für {}", addr);
+                eprintln!("Reconnect-Anfrage erhalten für {}", addr);
+                if let Err(e) = swarm.dial(addr) {
+                    eprintln!("Reconnect fehlgeschlagen: {}", e);
+                } else {
+                    println!("Reconnect initiiert");
+                }
+            }
             // Handle Metadata Updates
             update = async {
                 if let Some(ref mut rx) = metadata_update_rx {
@@ -785,19 +810,31 @@ pub async fn run_discovery(
                                 map.insert(peer_id.to_string(), peer_info.clone());
                             }
                             
+                            // Speichere auch die vollständige Multiaddr für Reconnects
+                            {
+                                let mut addrs = peer_addrs_clone.lock().await;
+                                addrs.insert(peer_id.to_string(), addr.clone());
+                            }
+                            
                             println!("Discovered peer: {} at {:?}", peer_info.id, peer_info.addr);
                             eprintln!("Discovered peer: {} at {:?}", peer_info.id, peer_info.addr);
                             
                             // WICHTIG: Baue Verbindung auf, damit identify funktionieren kann!
-                            // libp2p sollte das automatisch tun, aber wir stellen sicher, dass wir dialen
-                            println!("Attempting to dial peer {} at {}", peer_id, addr);
-                            eprintln!("Attempting to dial peer {} at {}", peer_id, addr);
-                            // Versuche Verbindung aufzubauen
-                            let addr_clone = addr.clone();
-                            if let Err(e) = swarm.dial(addr_clone) {
-                                eprintln!("Failed to dial {}: {}", addr, e);
+                            // Prüfe zuerst, ob bereits eine Verbindung besteht
+                            let already_connected = swarm.connected_peers().any(|p| p == &peer_id);
+                            
+                            if !already_connected {
+                                println!("Attempting to dial peer {} at {}", peer_id, addr);
+                                eprintln!("Attempting to dial peer {} at {}", peer_id, addr);
+                                // Versuche Verbindung aufzubauen
+                                let addr_clone = addr.clone();
+                                if let Err(e) = swarm.dial(addr_clone) {
+                                    eprintln!("Failed to dial {}: {}", addr, e);
+                                } else {
+                                    println!("Dial initiated for {}", peer_id);
+                                }
                             } else {
-                                println!("Dial initiated for {}", peer_id);
+                                println!("Peer {} bereits verbunden, überspringe Dial", peer_id);
                             }
                             
                             println!("Sende PeerInfo über sender: {} at {:?}", peer_info.id, peer_info.addr);
@@ -817,12 +854,18 @@ pub async fn run_discovery(
                                     println!("Peer expired: {}", peer_id);
                                     eprintln!("Peer expired: {}", peer_id);
                                     
-                                    // Entferne auch aus peer_info_map
+                                    // Entferne auch aus peer_info_map und peer_addrs
                                     let peer_id_str = peer_id.to_string();
                                     let was_in_map = {
                                         let mut map = peer_info_map_clone.lock().await;
                                         map.remove(&peer_id_str).is_some()
                                     };
+                                    
+                                    // Entferne auch aus peer_addrs
+                                    {
+                                        let mut addrs = peer_addrs_clone.lock().await;
+                                        addrs.remove(&peer_id_str);
+                                    }
                                     
                                     if was_in_map {
                                         println!("Peer {} aus Map entfernt (mDNS expired)", peer_id_str);
@@ -875,34 +918,49 @@ pub async fn run_discovery(
                     let has_connections = swarm.connected_peers().any(|p| p == &peer_id);
                     
                     if !has_connections {
-                        // Keine Verbindungen mehr - warte kurz, um Reconnects zu ermöglichen
-                        let event_tx_delayed = event_tx_clone.clone();
-                        let peer_id_delayed = peer_id_str.clone();
-                        let peer_info_map_delayed = peer_info_map_clone.clone();
+                        // Keine Verbindungen mehr - aber entferne Peer NICHT sofort
+                        // mDNS wird den Peer wieder entdecken und reconnecten
+                        // Versuche auch manuell Reconnect mit gespeicherter Adresse
+                        println!("Verbindung zu {} geschlossen, versuche Reconnect...", peer_id_str);
+                        eprintln!("Verbindung zu {} geschlossen, versuche Reconnect...", peer_id_str);
+                        
+                        // Versuche manuell Reconnect mit gespeicherter Multiaddr
+                        let peer_id_for_reconnect = peer_id.clone();
+                        let peer_addrs_for_reconnect = peer_addrs_clone.clone();
+                        let reconnect_tx_for_spawn = reconnect_tx_clone.clone();
                         
                         tokio::spawn(async move {
-                            // Warte 3 Sekunden, um Reconnects zu ermöglichen
-                            tokio::time::sleep(Duration::from_secs(3)).await;
+                            // Warte kurz, dann versuche Reconnect
+                            tokio::time::sleep(Duration::from_secs(2)).await;
                             
-                            // Prüfe nochmal, ob Peer noch in der Map ist
-                            let still_exists = {
-                                let map = peer_info_map_delayed.lock().await;
-                                map.contains_key(&peer_id_delayed)
+                            // Hole gespeicherte Multiaddr
+                            let addr_opt = {
+                                let addrs = peer_addrs_for_reconnect.lock().await;
+                                addrs.get(&peer_id_str).cloned()
                             };
                             
-                            if still_exists {
-                                // Peer existiert noch, aber keine Verbindung mehr
-                                // Entferne aus Map und sende PeerLost Event
-                                let was_removed = {
-                                    let mut map = peer_info_map_delayed.lock().await;
-                                    map.remove(&peer_id_delayed).is_some()
+                            if let Some(addr) = addr_opt {
+                                // Versuche Reconnect mit gespeicherter Adresse
+                                println!("Versuche Reconnect zu {} über {}", peer_id_str, addr);
+                                eprintln!("Versuche Reconnect zu {} über {}", peer_id_str, addr);
+                                
+                                // Füge Peer-ID zur Adresse hinzu, falls nicht vorhanden
+                                let addr_with_peer = if addr.iter().any(|p| matches!(p, libp2p::multiaddr::Protocol::P2p(_))) {
+                                    addr.clone()
+                                } else {
+                                    if let Ok(peer_id_parsed) = PeerId::from_str(&peer_id_str) {
+                                        addr.with(libp2p::multiaddr::Protocol::P2p(peer_id_parsed))
+                                    } else {
+                                        addr
+                                    }
                                 };
                                 
-                                if was_removed {
-                                    println!("Peer {} entfernt nach ConnectionClosed (keine Verbindung mehr)", peer_id_delayed);
-                                    eprintln!("Peer {} entfernt nach ConnectionClosed (keine Verbindung mehr)", peer_id_delayed);
-                                    let _ = event_tx_delayed.send(DiscoveryEvent::PeerLost(peer_id_delayed)).await;
+                                // Sende Reconnect-Anfrage über Channel
+                                if let Err(e) = reconnect_tx_for_spawn.send(addr_with_peer) {
+                                    eprintln!("Fehler beim Senden von Reconnect-Anfrage: {}", e);
                                 }
+                            } else {
+                                println!("Keine Adresse für {} gespeichert, warte auf mDNS Discovery", peer_id_str);
                             }
                         });
                     }
