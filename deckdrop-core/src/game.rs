@@ -170,7 +170,6 @@ where
         
         // Logging und Progress-Callback
         println!("Verarbeite Datei {}/{}: {}", file_index + 1, total_files, path_str);
-        eprintln!("Verarbeite Datei {}/{}: {}", file_index + 1, total_files, path_str);
         if let Some(ref callback) = progress_callback {
             callback(file_index + 1, total_files, &path_str);
         }
@@ -186,7 +185,6 @@ where
         let hash_hex = crate::gamechecker::calculate_file_hash(&file_path)?;
         
         println!("  Datei abgeschlossen: {} Chunks, {} Bytes, Hash: {}", chunk_count, file_size, hash_hex);
-        eprintln!("  Datei abgeschlossen: {} Chunks, {} Bytes, Hash: {}", chunk_count, file_size, hash_hex);
         
         file_entries.push(FileChunkEntry {
             path: path_str,

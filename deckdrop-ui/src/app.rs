@@ -71,6 +71,7 @@ pub struct DeckDropApp {
     pub add_game_progress: Option<(usize, usize, String)>, // current, total, current_file
     pub add_game_progress_tracker: Arc<std::sync::Mutex<Option<(usize, usize, String)>>>, // Shared state for thread updates
     pub add_game_generating: Option<PathBuf>, // Path of game being generated
+    pub add_game_saving: bool, // Whether save button was clicked (to disable it)
     
     // Settings-Felder
     pub settings_player_name: String,
@@ -263,6 +264,7 @@ impl Default for DeckDropApp {
             add_game_progress: None,
             add_game_progress_tracker: Arc::new(std::sync::Mutex::new(None)),
             add_game_generating: None,
+            add_game_saving: false,
             settings_player_name: config.player_name.clone(),
             settings_download_path: config.download_path.to_string_lossy().to_string(),
             license_player_name: config.player_name.clone(),
@@ -473,6 +475,7 @@ impl DeckDropApp {
             add_game_progress: None,
             add_game_progress_tracker: Arc::new(std::sync::Mutex::new(None)),
             add_game_generating: None,
+            add_game_saving: false,
             settings_player_name: config.player_name.clone(),
             settings_download_path: config.download_path.to_string_lossy().to_string(),
             license_player_name: config.player_name.clone(),
@@ -499,8 +502,18 @@ impl DeckDropApp {
             }
             Message::AddGameChunksGenerated(game_path, hash_result) => {
                 // Chunk generation complete
+                // Check if already processed (prevent double processing)
+                // Note: add_game_generating is set to None in Tick before sending this message,
+                // so we check if add_game_progress is also None (meaning we already processed)
+                if self.add_game_generating.is_none() && self.add_game_progress.is_none() {
+                    // Already processed, ignore duplicate message
+                    return Task::none();
+                }
+                
+                // Mark as processed immediately
                 self.add_game_generating = None;
                 self.add_game_progress = None;
+                self.add_game_saving = false; // Re-enable button after completion
                 if let Ok(mut tracker) = self.add_game_progress_tracker.lock() {
                     *tracker = None;
                 }
@@ -555,14 +568,28 @@ impl DeckDropApp {
                 // Deduplicate games by game_id
                 self.deduplicate_games_by_id();
                 
-                // Initialize integrity status for all games as "Checking" - get total file count immediately
-                for (game_path, _) in &self.my_games {
-                    let chunks_toml_path = game_path.join("deckdrop_chunks.toml");
-                    let total = if chunks_toml_path.exists() {
-                        if let Ok(content) = std::fs::read_to_string(&chunks_toml_path) {
-                            if let Ok(parsed) = toml::from_str::<toml::Value>(&content) {
-                                if let Some(files) = parsed.get("file").and_then(|f| f.as_array()) {
-                                    files.len()
+                // Mark the newly added game as "Intact" immediately (we just generated chunks, so we know it's valid)
+                self.game_integrity_status.insert(game_path.clone(), GameIntegrityStatus::Intact);
+                
+                // Initialize integrity status for other games as "Checking" - get total file count immediately
+                // Only set to "Checking" if not already set (preserve existing status)
+                for (other_game_path, _) in &self.my_games {
+                    // Skip the newly added game (already set to Intact above)
+                    if other_game_path == &game_path {
+                        continue;
+                    }
+                    
+                    // Only initialize if not already set
+                    if !self.game_integrity_status.contains_key(other_game_path) {
+                        let chunks_toml_path = other_game_path.join("deckdrop_chunks.toml");
+                        let total = if chunks_toml_path.exists() {
+                            if let Ok(content) = std::fs::read_to_string(&chunks_toml_path) {
+                                if let Ok(parsed) = toml::from_str::<toml::Value>(&content) {
+                                    if let Some(files) = parsed.get("file").and_then(|f| f.as_array()) {
+                                        files.len()
+                                    } else {
+                                        0
+                                    }
                                 } else {
                                     0
                                 }
@@ -571,12 +598,10 @@ impl DeckDropApp {
                             }
                         } else {
                             0
-                        }
-                    } else {
-                        0
-                    };
-                    self.game_integrity_status.insert(game_path.clone(), GameIntegrityStatus::Checking { current: 0, total });
-                    // Don't set start time here - it will be set when the check actually starts
+                        };
+                        self.game_integrity_status.insert(other_game_path.clone(), GameIntegrityStatus::Checking { current: 0, total });
+                        // Don't set start time here - it will be set when the check actually starts
+                    }
                 }
                 
                 // Close dialog and reset form
@@ -658,6 +683,7 @@ impl DeckDropApp {
             }
             Message::AddGame => {
                 self.show_add_game_dialog = true;
+                self.add_game_saving = false; // Reset saving state when dialog is opened
             }
             Message::AddGamePathChanged(path) => {
                 self.add_game_path = path;
@@ -758,15 +784,23 @@ impl DeckDropApp {
                 self.add_game_additional_instructions = instructions;
             }
             Message::SaveGame => {
+                // Disable button immediately to prevent double-clicking
+                if self.add_game_saving {
+                    return Task::none();
+                }
+                self.add_game_saving = true;
+                
                 // Validate required fields
                 if self.add_game_path.is_empty() || self.add_game_name.is_empty() || self.add_game_start_file.is_empty() {
                     eprintln!("Error: Path, name, and start file are required");
+                    self.add_game_saving = false; // Re-enable button on validation error
                     return Task::none();
                 }
                 
                 let game_path = PathBuf::from(&self.add_game_path);
                 if !game_path.exists() {
                     eprintln!("Error: Game path does not exist: {}", game_path.display());
+                    self.add_game_saving = false; // Re-enable button on validation error
                     return Task::none();
                 }
                 
@@ -806,6 +840,7 @@ impl DeckDropApp {
             }
             Message::CancelAddGame => {
                 self.show_add_game_dialog = false;
+                self.add_game_saving = false; // Reset saving state when dialog is closed
             }
             Message::OpenSettings => {
                 self.show_settings = true;
@@ -906,7 +941,9 @@ impl DeckDropApp {
                             let chunks_toml_path = game_path.join("deckdrop_chunks.toml");
                             if chunks_toml_path.exists() && progress.1 > 0 && progress.0 >= progress.1 {
                                 // Generation complete - trigger completion message
+                                // IMPORTANT: Set add_game_generating to None IMMEDIATELY to prevent multiple triggers
                                 let game_path_clone = game_path.clone();
+                                self.add_game_generating = None; // Prevent multiple triggers
                                 return Task::perform(async move {
                                     use futures_timer::Delay;
                                     use std::time::Duration;
@@ -1944,9 +1981,14 @@ impl DeckDropApp {
                         button("Cancel")
                             .on_press(Message::CancelAddGame),
                         Space::with_width(Length::Fill),
-                        button("Save")
-                            .on_press(Message::SaveGame)
-                            .style(button::primary),
+                        if self.add_game_saving {
+                            button("Save")
+                                .style(button::primary)
+                        } else {
+                            button("Save")
+                                .on_press(Message::SaveGame)
+                                .style(button::primary)
+                        },
                     ]
                     .width(Length::Fill),
                 ]

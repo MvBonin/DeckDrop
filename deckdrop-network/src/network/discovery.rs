@@ -316,8 +316,6 @@ pub async fn run_discovery(
                 if let Some(update) = update {
                     println!("Received metadata update: player_name={:?}, games_count={:?}", 
                         update.player_name, update.games_count);
-                    eprintln!("Received metadata update: player_name={:?}, games_count={:?}", 
-                        update.player_name, update.games_count);
                     
                     // Update metadata
                     let (new_player_name, new_games_count) = {
@@ -336,7 +334,6 @@ pub async fn run_discovery(
                     // Für jetzt: Wir speichern die Metadaten, aber sie werden erst beim nächsten App-Start gesendet
                     // TODO: Implementiere korrekte Lösung zum Neuerstellen des Swarms mit neuen Metadaten
                     println!("Metadata updated. Note: New metadata will not be sent until swarm is restarted (libp2p Identify limitation).");
-                    eprintln!("Metadata updated. Note: New metadata will not be sent until swarm is restarted (libp2p Identify limitation).");
                 }
             }
             // Handle Download Requests vom GTK-Thread
