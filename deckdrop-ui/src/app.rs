@@ -1836,38 +1836,41 @@ impl DeckDropApp {
     
     /// Shows license dialog
     fn view_license_dialog(&self) -> Element<Message> {
-        container(
-            column![
-                text("Welcome to DeckDrop").size(scale_text(24.0)),
-                Space::with_height(Length::Fixed(scale(15.0))),
-                text("Before you can use DeckDrop, you must agree to the terms and conditions.").size(scale_text(14.0)),
-                Space::with_height(Length::Fixed(scale(15.0))),
-                text("Player Name:").size(scale_text(14.0)),
-                text_input("Enter your player name", &self.license_player_name)
-                    .on_input(Message::LicensePlayerNameChanged)
-                    .padding(scale(8.0)),
-                Space::with_height(Length::Fixed(scale(15.0))),
-                scrollable(
+        // Make the entire dialog scrollable and responsive
+        scrollable(
+            container(
+                column![
+                    text("Welcome to DeckDrop").size(scale_text(20.0)),
+                    Space::with_height(Length::Fixed(scale(12.0))),
+                    text("Before you can use DeckDrop, you must agree to the terms and conditions.").size(scale_text(12.0)),
+                    Space::with_height(Length::Fixed(scale(12.0))),
+                    text("Player Name:").size(scale_text(12.0)),
+                    text_input("Enter your player name", &self.license_player_name)
+                        .on_input(Message::LicensePlayerNameChanged)
+                        .padding(scale(8.0)),
+                    Space::with_height(Length::Fixed(scale(12.0))),
                     text("DeckDrop is a peer-to-peer game sharing platform.\n\n\
                           By using DeckDrop, you agree to:\n\n\
                           • Only share games for which you have the rights\n\
                           • Not share illegal content\n\
                           • Take responsibility for your shared content\n\n\
                           DeckDrop assumes no liability for shared content.")
-                        .size(scale_text(12.0))
-                )
-                .height(Length::Fixed(scale(150.0))),
-                Space::with_height(Length::Fixed(scale(15.0))),
-                button("Accept")
-                    .on_press(Message::AcceptLicense)
-                    .style(button::primary),
-            ]
-            .spacing(scale(12.0))
-            .padding(scale(20.0))
+                        .size(scale_text(11.0)),
+                    Space::with_height(Length::Fixed(scale(12.0))),
+                    button("Accept")
+                        .on_press(Message::AcceptLicense)
+                        .style(button::primary),
+                ]
+                .spacing(scale(10.0))
+                .padding(scale(15.0))
+            )
+            .width(Length::Fill)
+            .max_width(scale(400.0))
+            .height(Length::Shrink)
+            .style(container_box_style)
         )
-        .width(Length::Fixed(scale(500.0)))
-        .height(Length::Shrink)
-        .style(container_box_style)
+        .width(Length::Fill)
+        .height(Length::Fill)
         .into()
     }
     
