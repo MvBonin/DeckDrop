@@ -758,7 +758,7 @@ impl DeckDropApp {
                         
                         if !peer_ids.is_empty() {
                             if let Some(tx) = crate::network_bridge::get_download_request_tx() {
-                                if let Err(e) = deckdrop_core::request_missing_chunks(&game_id, &peer_ids, &tx, 3) {
+                                if let Err(e) = deckdrop_core::request_missing_chunks(&game_id, &peer_ids, &tx, 8) {
                                     eprintln!("Error requesting missing chunks when resuming download for {}: {}", game_id, e);
                                 }
                             }
@@ -1434,14 +1434,14 @@ impl DeckDropApp {
                                 };
                                 
                                 if let Some(tx) = crate::network_bridge::get_download_request_tx() {
-                                    if let Err(e) = deckdrop_core::request_missing_chunks(&game_id, &peer_ids, &tx, 3) {
+                                    if let Err(e) = deckdrop_core::request_missing_chunks(&game_id, &peer_ids, &tx, 8) {
                                         eprintln!("Error requesting missing chunks for {}: {}", game_id, e);
                                     }
                                 }
                             } else {
                                 // Fallback: Use the peer that sent the metadata
                                 if let Some(tx) = crate::network_bridge::get_download_request_tx() {
-                                    if let Err(e) = deckdrop_core::request_missing_chunks(&game_id, &[peer_id.clone()], &tx, 3) {
+                                    if let Err(e) = deckdrop_core::request_missing_chunks(&game_id, &[peer_id.clone()], &tx, 8) {
                                         eprintln!("Error requesting missing chunks for {}: {}", game_id, e);
                                     }
                                 }
@@ -1545,11 +1545,20 @@ impl DeckDropApp {
                                                                             let missing = manifest.get_missing_chunks();
                                                                             
                                                                             // Filtere bereits angeforderte Chunks
+                                                                            // Prefetch-Strategie: Fordere mehr Chunks an, wenn weniger als 15 in der Queue sind
                                                                             let new_chunks: Vec<String> = {
                                                                                 if let Ok(requested) = requested_chunks_for_thread.lock() {
+                                                                                    let requested_count = requested.len();
+                                                                                    let prefetch_threshold = 15; // Wenn weniger als 15 angeforderte Chunks, fordere mehr an
+                                                                                    let batch_size = if requested_count < prefetch_threshold {
+                                                                                        15 // Aggressives Prefetching wenn Queue leer wird
+                                                                                    } else {
+                                                                                        8 // Normale Batch-Größe
+                                                                                    };
+                                                                                    
                                                                                     missing.into_iter()
                                                                                         .filter(|chunk| !requested.contains(chunk))
-                                                                                        .take(3) // Max 3 neue Chunks pro Aufruf
+                                                                                        .take(batch_size)
                                                                                         .collect::<Vec<_>>()
                                                                                 } else {
                                                                                     Vec::new()
@@ -1564,20 +1573,26 @@ impl DeckDropApp {
                                                                                     }
                                                                                 }
                                                                                 
-                                                                                // Sende Requests für neue Chunks
-                                                                                for chunk_hash in new_chunks {
-                                                                                    if let Some(peer_id) = peer_ids.first() {
-                                                                                        if let Err(e) = tx.send(
-                                                                                            deckdrop_network::network::discovery::DownloadRequest::RequestChunk {
-                                                                                                peer_id: peer_id.clone(),
-                                                                                                chunk_hash: chunk_hash.clone(),
-                                                                                                game_id: game_id.clone(),
-                                                                                            }
-                                                                                        ) {
-                                                                                            eprintln!("Fehler beim Senden von Chunk-Request für {}: {}", chunk_hash, e);
-                                                                                        }
-                                                                                    }
-                                                                                }
+                                                // Sende Requests für neue Chunks
+                                                // Round-Robin-Verteilung über alle verfügbaren Peers für bessere Parallelisierung
+                                                let peer_count = peer_ids.len();
+                                                for (index, chunk_hash) in new_chunks.iter().enumerate() {
+                                                    let peer_id = if peer_count > 0 {
+                                                        &peer_ids[index % peer_count] // Round-Robin über Peers
+                                                    } else {
+                                                        continue;
+                                                    };
+                                                    
+                                                    if let Err(e) = tx.send(
+                                                        deckdrop_network::network::discovery::DownloadRequest::RequestChunk {
+                                                            peer_id: peer_id.clone(),
+                                                            chunk_hash: chunk_hash.clone(),
+                                                            game_id: game_id.clone(),
+                                                        }
+                                                    ) {
+                                                        eprintln!("Fehler beim Senden von Chunk-Request für {}: {}", chunk_hash, e);
+                                                    }
+                                                }
                                                                             }
                                                                         }
                                                                     }

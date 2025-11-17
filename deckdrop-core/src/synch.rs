@@ -357,20 +357,50 @@ pub fn request_missing_chunks(
     eprintln!("Fordere {} fehlende Chunks für Spiel {} an (max {} pro Peer)", 
         missing_chunks.len(), game_id, max_chunks_per_peer);
     
-    // Verteile Chunks auf verfügbare Peers mit Begrenzung pro Peer
+    // Optimierte Multi-Peer Parallelisierung mit Round-Robin und Load-Balancing
     let mut peer_chunk_counts: HashMap<String, usize> = HashMap::new();
+    let mut peer_index = 0; // Round-Robin Index
+    
+    // Initialisiere alle Peers mit 0
+    for peer_id in peer_ids.iter() {
+        peer_chunk_counts.insert(peer_id.clone(), 0);
+    }
     
     for chunk_hash in missing_chunks.iter() {
-        // Finde Peer mit den wenigsten aktiven Downloads
+        // Round-Robin Start: Beginne mit dem nächsten Peer im Round-Robin
+        let start_index = peer_index;
         let mut selected_peer = None;
         let mut min_count = usize::MAX;
+        let mut attempts = 0;
         
-        for peer_id in peer_ids {
-            let count = peer_chunk_counts.get(peer_id).copied().unwrap_or(0);
+        // Suche den besten Peer (mit wenigsten aktiven Downloads, aber unter Limit)
+        while attempts < peer_ids.len() {
+            let current_peer = &peer_ids[peer_index % peer_ids.len()];
+            let count = peer_chunk_counts.get(current_peer).copied().unwrap_or(0);
+            
+            // Wenn dieser Peer noch Platz hat und weniger Downloads hat als bisher
             if count < max_chunks_per_peer && count < min_count {
                 min_count = count;
-                selected_peer = Some(peer_id.clone());
+                selected_peer = Some(current_peer.clone());
+                // Wenn dieser Peer deutlich weniger Downloads hat, nimm ihn sofort (aggressives Load-Balancing)
+                if count == 0 || (min_count > 0 && count < min_count / 2) {
+                    break;
+                }
             }
+            
+            peer_index = (peer_index + 1) % peer_ids.len();
+            attempts += 1;
+            
+            // Verhindere Endlosschleife
+            if peer_index == start_index && attempts > 0 {
+                break;
+            }
+        }
+        
+        // Wenn kein Peer mit Platz gefunden, verwende Round-Robin als Fallback
+        if selected_peer.is_none() {
+            selected_peer = Some(peer_ids[peer_index % peer_ids.len()].clone());
+            peer_index = (peer_index + 1) % peer_ids.len();
         }
         
         if let Some(peer_id) = selected_peer {
@@ -389,9 +419,6 @@ pub fn request_missing_chunks(
                 if let Some(count) = peer_chunk_counts.get_mut(&peer_id) {
                     *count = count.saturating_sub(1);
                 }
-            } else {
-                println!("Chunk-Request gesendet: {} von Peer {} ({} aktive Downloads)", 
-                    chunk_hash, peer_id, peer_chunk_counts.get(&peer_id).copied().unwrap_or(0));
             }
         } else {
             eprintln!("Kein Peer verfügbar für Chunk {} (alle Peers haben max Downloads erreicht)", chunk_hash);

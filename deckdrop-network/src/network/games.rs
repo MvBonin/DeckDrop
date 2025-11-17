@@ -405,7 +405,7 @@ pub type ChunkBehaviour = libp2p::request_response::Behaviour<ChunkCodec>;
 /// Erstellt ein ChunkBehaviour
 pub fn create_chunk_behaviour() -> ChunkBehaviour {
     let config = libp2p::request_response::Config::default()
-        .with_request_timeout(Duration::from_secs(60)); // Längere Timeout für große Chunks
+        .with_request_timeout(Duration::from_secs(120)); // Längere Timeout für große Chunks (Phase 3 Optimierung: 120s für 100MB Chunks)
     
     libp2p::request_response::Behaviour::new(
         [(String::from("/deckdrop/chunks/1.0.0"), ProtocolSupport::Full)],
@@ -958,7 +958,7 @@ pub type ChunkBehaviour = libp2p::request_response::Behaviour<ChunkCodec>;
 /// Erstellt ein ChunkBehaviour
 pub fn create_chunk_behaviour() -> ChunkBehaviour {
     let config = libp2p::request_response::Config::default()
-        .with_request_timeout(Duration::from_secs(60)); // Längere Timeout für große Chunks
+        .with_request_timeout(Duration::from_secs(120)); // Längere Timeout für große Chunks (Phase 3 Optimierung: 120s für 100MB Chunks)
     
     libp2p::request_response::Behaviour::new(
         [(String::from("/deckdrop/chunks/1.0.0"), ProtocolSupport::Full)],

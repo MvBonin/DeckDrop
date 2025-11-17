@@ -263,9 +263,10 @@ pub async fn run_discovery(
     
     // Use the same identity for the swarm
     // Konfiguriere yamux mit KeepAlive, um Verbindungen am Leben zu halten
+    // Performance-Optimierung: Größere Buffer für höheren Durchsatz
     let mut yamux_config = libp2p::yamux::Config::default();
-    yamux_config.set_max_buffer_size(16 * 1024 * 1024); // 16MB Buffer für große Chunks
-    yamux_config.set_receive_window_size(16 * 1024 * 1024);
+    yamux_config.set_max_buffer_size(32 * 1024 * 1024); // 32MB Buffer für große Chunks (Phase 3 Optimierung)
+    yamux_config.set_receive_window_size(32 * 1024 * 1024); // 32MB Receive Window
     
     let mut swarm = libp2p::SwarmBuilder::with_existing_identity(id_keys)
         .with_tokio()
@@ -277,8 +278,8 @@ pub async fn run_discovery(
         .unwrap()
         .with_behaviour(|_| behaviour)
         .unwrap()
-        // Erhöhe idle_connection_timeout auf 5 Minuten und deaktiviere KeepAlive-Timeout nicht
-        .with_swarm_config(|c| c.with_idle_connection_timeout(std::time::Duration::from_secs(300)))
+        // Phase 3 Optimierung: Erhöhe idle_connection_timeout auf 10 Minuten für stabile Verbindungen
+        .with_swarm_config(|c| c.with_idle_connection_timeout(std::time::Duration::from_secs(600)))
         .build();
 
     println!("Swarm created, starting discovery loop...");
