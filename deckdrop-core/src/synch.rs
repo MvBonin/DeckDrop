@@ -205,7 +205,12 @@ pub fn save_chunk(chunk_hash: &str, chunk_data: &[u8], chunks_dir: &Path) -> Res
     let safe_hash_name = chunk_hash.replace(':', "_");
     let chunk_path = chunks_dir.join(format!("{}.chunk", safe_hash_name));
     
-    fs::write(&chunk_path, chunk_data)?;
+    // Phase 4: I/O-Buffering für bessere Performance (8MB Buffer)
+    use std::io::{BufWriter, Write};
+    let file = fs::File::create(&chunk_path)?;
+    let mut writer = BufWriter::with_capacity(8 * 1024 * 1024, file); // 8MB Buffer
+    writer.write_all(chunk_data)?;
+    writer.flush()?;
     
     // Keine Hash-Validierung hier - wird später bei der Datei-Rekonstruktion validiert
     // (da wir nur den file_hash haben, nicht den Chunk-Hash)

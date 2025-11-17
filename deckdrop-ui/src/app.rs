@@ -67,6 +67,9 @@ pub struct DeckDropApp {
     pub active_uploads: Arc<std::sync::Mutex<HashMap<String, (std::time::Instant, usize)>>>, // chunk_hash -> (start_time, chunk_size_bytes)
     pub upload_stats: Arc<std::sync::Mutex<UploadStats>>, // Upload-Statistiken
     
+    // Phase 4: Peer-Performance-Tracking für adaptive Limits
+    pub peer_performance: Arc<std::sync::Mutex<HashMap<String, PeerPerformance>>>, // peer_id -> PeerPerformance
+    
     // Config
     pub config: Config,
     
@@ -144,6 +147,55 @@ pub struct UploadStats {
     pub upload_speed_bytes_per_sec: f64, // Upload-Geschwindigkeit in Bytes/Sekunde
     pub last_update_time: std::time::Instant, // Zeitpunkt der letzten Aktualisierung
     pub last_uploaded_bytes: u64, // Anzahl der hochgeladenen Bytes bei letzter Aktualisierung
+}
+
+/// Peer-Performance-Tracking für adaptive Download-Limits (Phase 4 Optimierung)
+#[derive(Debug, Clone)]
+pub struct PeerPerformance {
+    pub download_speed_bytes_per_sec: f64, // Download-Geschwindigkeit in Bytes/Sekunde (gleitender Durchschnitt)
+    pub success_rate: f64, // Erfolgsrate: 0.0 - 1.0 (erfolgreiche / totale Requests)
+    pub active_requests: usize, // Aktuelle Anzahl aktiver Chunk-Requests
+    pub total_requests: usize, // Gesamtanzahl Requests
+    pub successful_requests: usize, // Anzahl erfolgreicher Requests
+    pub last_update: std::time::Instant, // Zeitpunkt der letzten Aktualisierung
+    pub speed_samples: Vec<(std::time::Instant, usize)>, // Zeitstempel und Bytes für Geschwindigkeitsberechnung
+}
+
+impl Default for PeerPerformance {
+    fn default() -> Self {
+        Self {
+            download_speed_bytes_per_sec: 0.0,
+            success_rate: 1.0, // Starte mit 100% (optimistisch)
+            active_requests: 0,
+            total_requests: 0,
+            successful_requests: 0,
+            last_update: std::time::Instant::now(),
+            speed_samples: Vec::new(),
+        }
+    }
+}
+
+impl PeerPerformance {
+    /// Berechnet adaptive max_chunks_per_peer basierend auf Performance
+    pub fn adaptive_max_chunks(&self, base_max: usize) -> usize {
+        // Schnelle Peers (> 50MB/s): Erhöhe Limit um 50%
+        // Mittlere Peers (10-50MB/s): Standard-Limit
+        // Langsame Peers (< 10MB/s): Reduziere Limit um 50%
+        let speed_mb_per_sec = self.download_speed_bytes_per_sec / (1024.0 * 1024.0);
+        
+        if speed_mb_per_sec > 50.0 && self.success_rate > 0.8 {
+            // Sehr schneller Peer mit guter Erfolgsrate
+            (base_max as f64 * 1.5) as usize
+        } else if speed_mb_per_sec > 10.0 && self.success_rate > 0.7 {
+            // Mittlerer Peer mit akzeptabler Erfolgsrate
+            base_max
+        } else if speed_mb_per_sec < 10.0 || self.success_rate < 0.5 {
+            // Langsamer Peer oder schlechte Erfolgsrate
+            (base_max as f64 * 0.5).max(2.0) as usize // Mindestens 2 Chunks
+        } else {
+            base_max
+        }
+    }
 }
 
 
@@ -282,6 +334,7 @@ impl Default for DeckDropApp {
                 last_update_time: std::time::Instant::now(),
                 last_uploaded_bytes: 0,
             })),
+            peer_performance: Arc::new(std::sync::Mutex::new(HashMap::new())), // Phase 4
             game_integrity_status,
             integrity_check_start_time: HashMap::new(),
             integrity_check_progress: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -509,6 +562,7 @@ impl DeckDropApp {
                 last_update_time: std::time::Instant::now(),
                 last_uploaded_bytes: 0,
             })),
+            peer_performance: Arc::new(std::sync::Mutex::new(HashMap::new())), // Phase 4
             game_integrity_status,
             integrity_check_start_time: HashMap::new(),
             integrity_check_progress: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -758,7 +812,7 @@ impl DeckDropApp {
                         
                         if !peer_ids.is_empty() {
                             if let Some(tx) = crate::network_bridge::get_download_request_tx() {
-                                if let Err(e) = deckdrop_core::request_missing_chunks(&game_id, &peer_ids, &tx, 8) {
+                                if let Err(e) = self.request_missing_chunks_adaptive(&game_id, &peer_ids, 8) {
                                     eprintln!("Error requesting missing chunks when resuming download for {}: {}", game_id, e);
                                 }
                             }
@@ -1433,17 +1487,13 @@ impl DeckDropApp {
                                     peer_ids
                                 };
                                 
-                                if let Some(tx) = crate::network_bridge::get_download_request_tx() {
-                                    if let Err(e) = deckdrop_core::request_missing_chunks(&game_id, &peer_ids, &tx, 8) {
-                                        eprintln!("Error requesting missing chunks for {}: {}", game_id, e);
-                                    }
+                                if let Err(e) = self.request_missing_chunks_adaptive(&game_id, &peer_ids, 8) {
+                                    eprintln!("Error requesting missing chunks for {}: {}", game_id, e);
                                 }
                             } else {
                                 // Fallback: Use the peer that sent the metadata
-                                if let Some(tx) = crate::network_bridge::get_download_request_tx() {
-                                    if let Err(e) = deckdrop_core::request_missing_chunks(&game_id, &[peer_id.clone()], &tx, 8) {
-                                        eprintln!("Error requesting missing chunks for {}: {}", game_id, e);
-                                    }
+                                if let Err(e) = self.request_missing_chunks_adaptive(&game_id, &[peer_id.clone()], 8) {
+                                    eprintln!("Error requesting missing chunks for {}: {}", game_id, e);
                                 }
                             }
                         }
@@ -1451,6 +1501,38 @@ impl DeckDropApp {
                 }
             }
             DiscoveryEvent::ChunkReceived { peer_id, chunk_hash, chunk_data } => {
+                // Phase 4: Tracke Performance für diesen Peer
+                let peer_perf = self.peer_performance.clone();
+                let peer_id_for_perf = peer_id.clone();
+                let chunk_size = chunk_data.len();
+                let chunk_received_time = std::time::Instant::now();
+                
+                // Update Performance-Tracking (erfolgreicher Chunk-Empfang)
+                if let Ok(mut perf_map) = peer_perf.lock() {
+                    let perf = perf_map.entry(peer_id_for_perf.clone()).or_insert_with(PeerPerformance::default);
+                    perf.successful_requests += 1;
+                    perf.total_requests += 1;
+                    perf.success_rate = perf.successful_requests as f64 / perf.total_requests.max(1) as f64;
+                    
+                    // Tracke Download-Geschwindigkeit (5-Sekunden gleitender Durchschnitt)
+                    perf.speed_samples.push((chunk_received_time, chunk_size));
+                    let cutoff_time = chunk_received_time.checked_sub(std::time::Duration::from_secs(5))
+                        .unwrap_or(chunk_received_time);
+                    perf.speed_samples.retain(|(time, _)| *time >= cutoff_time);
+                    
+                    // Berechne Durchschnittsgeschwindigkeit
+                    if perf.speed_samples.len() >= 2 {
+                        let total_bytes: usize = perf.speed_samples.iter().map(|(_, bytes)| bytes).sum();
+                        let time_span = perf.speed_samples.last().unwrap().0
+                            .duration_since(perf.speed_samples.first().unwrap().0)
+                            .as_secs_f64();
+                        if time_span > 0.1 {
+                            perf.download_speed_bytes_per_sec = total_bytes as f64 / time_span;
+                        }
+                    }
+                    perf.last_update = chunk_received_time;
+                }
+                
                 // Prüfe ob dieser Chunk bereits verarbeitet wird (verhindert Duplikate)
                 let processing_chunks = self.processing_chunks.clone();
                 let chunk_hash_clone = chunk_hash.clone();
@@ -1628,11 +1710,65 @@ impl DeckDropApp {
             DiscoveryEvent::ChunkRequestFailed { peer_id, chunk_hash, error } => {
                 eprintln!("ChunkRequestFailed: {} from {}: {}", chunk_hash, peer_id, error);
                 
+                // Phase 4: Tracke fehlgeschlagenen Request für Performance-Tracking
+                if let Ok(mut perf_map) = self.peer_performance.lock() {
+                    let perf = perf_map.entry(peer_id.clone()).or_insert_with(PeerPerformance::default);
+                    perf.total_requests += 1;
+                    perf.success_rate = perf.successful_requests as f64 / perf.total_requests.max(1) as f64;
+                    perf.last_update = std::time::Instant::now();
+                }
+                
                 // Entferne Chunk aus "angefordert" Set, damit er erneut angefordert werden kann
                 if let Ok(mut requested) = self.requested_chunks.lock() {
                     requested.remove(&chunk_hash);
                 }
             }
+        }
+    }
+    
+    /// Phase 4: Request missing chunks with adaptive limits based on peer performance
+    fn request_missing_chunks_adaptive(
+        &self,
+        game_id: &str,
+        peer_ids: &[String],
+        base_max_chunks_per_peer: usize,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(tx) = crate::network_bridge::get_download_request_tx() {
+            // Berechne adaptive Limits für jeden Peer
+            let mut peer_adaptive_limits: HashMap<String, usize> = HashMap::new();
+            
+            if let Ok(perf_map) = self.peer_performance.lock() {
+                for peer_id in peer_ids {
+                    let adaptive_limit = if let Some(perf) = perf_map.get(peer_id) {
+                        perf.adaptive_max_chunks(base_max_chunks_per_peer)
+                    } else {
+                        base_max_chunks_per_peer // Fallback: Standard-Limit
+                    };
+                    peer_adaptive_limits.insert(peer_id.clone(), adaptive_limit);
+                }
+            } else {
+                // Fallback: Verwende Standard-Limit für alle Peers
+                for peer_id in peer_ids {
+                    peer_adaptive_limits.insert(peer_id.clone(), base_max_chunks_per_peer);
+                }
+            }
+            
+            // Verwende den Durchschnitt der adaptiven Limits als max_chunks_per_peer
+            // (request_missing_chunks verwendet ein globales Limit, aber verteilt intelligent)
+            let avg_limit = if !peer_adaptive_limits.is_empty() {
+                let sum: usize = peer_adaptive_limits.values().sum();
+                sum / peer_adaptive_limits.len()
+            } else {
+                base_max_chunks_per_peer
+            };
+            
+            // Verwende das Maximum der adaptiven Limits, um schnelle Peers nicht zu limitieren
+            let max_limit = peer_adaptive_limits.values().max().copied().unwrap_or(base_max_chunks_per_peer);
+            
+            // Verwende max_limit, damit schnelle Peers ihr volles Potential nutzen können
+            deckdrop_core::request_missing_chunks(game_id, peer_ids, &tx, max_limit)
+        } else {
+            Err("Download request channel not available".into())
         }
     }
     
@@ -1919,7 +2055,7 @@ impl DeckDropApp {
                 
                 // Request missing chunks to resume download
                 if let Some(tx) = crate::network_bridge::get_download_request_tx() {
-                    if let Err(e) = deckdrop_core::request_missing_chunks(&game_id, &peer_ids, &tx, 3) {
+                    if let Err(e) = self.request_missing_chunks_adaptive(&game_id, &peer_ids, 8) {
                         eprintln!("Error resuming download for {}: {}", game_id, e);
                     } else {
                         // Update status to Downloading
