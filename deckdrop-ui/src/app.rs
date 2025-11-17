@@ -56,6 +56,9 @@ pub struct DeckDropApp {
     // Downloads
     pub active_downloads: HashMap<String, DownloadState>, // game_id -> DownloadState
     
+    // Chunk processing tracking (to prevent duplicate processing and enable parallel processing)
+    pub processing_chunks: Arc<std::sync::Mutex<HashSet<String>>>, // chunk_hash -> in_progress
+    
     // Config
     pub config: Config,
     
@@ -241,6 +244,7 @@ impl Default for DeckDropApp {
             network_games: HashMap::new(),
             peers: Vec::new(),
             active_downloads: HashMap::new(),
+            processing_chunks: Arc::new(std::sync::Mutex::new(HashSet::new())),
             game_integrity_status,
             integrity_check_start_time: HashMap::new(),
             integrity_check_progress: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -452,6 +456,7 @@ impl DeckDropApp {
             network_games: HashMap::new(),
             peers: Vec::new(),
             active_downloads,
+            processing_chunks: Arc::new(std::sync::Mutex::new(HashSet::new())),
             game_integrity_status,
             integrity_check_start_time: HashMap::new(),
             integrity_check_progress: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -1311,63 +1316,118 @@ impl DeckDropApp {
                 }
             }
             DiscoveryEvent::ChunkReceived { peer_id, chunk_hash, chunk_data } => {
-                // Finde game_id aus chunk_hash (durch Manifest-Suche)
-                if let Ok(game_id) = deckdrop_core::find_game_id_for_chunk(&chunk_hash) {
-                    // Prüfe ob Download pausiert ist
-                    if let Ok(manifest_path) = deckdrop_core::get_manifest_path(&game_id) {
-                        if let Ok(manifest) = deckdrop_core::DownloadManifest::load(&manifest_path) {
-                            // Überspringe wenn pausiert
-                            if !matches!(manifest.overall_status, deckdrop_core::DownloadStatus::Paused) {
-                                // Speichere Chunk
-                                if let Ok(chunks_dir) = deckdrop_core::get_chunks_dir(&game_id) {
-                                    if deckdrop_core::save_chunk(&chunk_hash, &chunk_data, &chunks_dir).is_ok() {
-                                        // Aktualisiere Manifest
-                                        if let Ok(mut manifest) = deckdrop_core::DownloadManifest::load(&manifest_path) {
-                                            manifest.mark_chunk_downloaded(&chunk_hash);
-                                            
-                                            if manifest.save(&manifest_path).is_ok() {
-                                                // Aktualisiere UI-Status (wird beim nächsten Tick gelesen)
-                                                // Das Manifest wird in update_download_progress() gelesen
+                // Prüfe ob dieser Chunk bereits verarbeitet wird (verhindert Duplikate)
+                let processing_chunks = self.processing_chunks.clone();
+                let chunk_hash_clone = chunk_hash.clone();
+                
+                // Prüfe und markiere Chunk als "in Verarbeitung"
+                let should_process = {
+                    if let Ok(mut processing) = processing_chunks.lock() {
+                        if processing.contains(&chunk_hash_clone) {
+                            // Chunk wird bereits verarbeitet, überspringe
+                            false
+                        } else {
+                            // Markiere Chunk als "in Verarbeitung"
+                            processing.insert(chunk_hash_clone.clone());
+                            true
+                        }
+                    } else {
+                        false
+                    }
+                };
+                
+                if !should_process {
+                    // Chunk wird bereits verarbeitet, überspringe
+                    return;
+                }
+                
+                // Verarbeite Chunk in einem separaten Thread, um die GUI nicht zu blockieren
+                let chunk_data_clone = chunk_data.clone();
+                
+                // Extrahiere Peer-IDs für dieses Spiel vor dem Thread-Spawn (um Clone-Kosten zu reduzieren)
+                let game_id_for_peers = deckdrop_core::find_game_id_for_chunk(&chunk_hash).ok();
+                let peer_ids_for_thread: Option<Vec<String>> = game_id_for_peers.as_ref().and_then(|game_id| {
+                    self.network_games.get(game_id).map(|peers| {
+                        peers.iter().map(|(pid, _)| pid.clone()).collect()
+                    })
+                });
+                
+                // Spawn background thread für Chunk-Verarbeitung
+                std::thread::spawn(move || {
+                    // Drop-Guard: Entfernt Chunk aus "in Verarbeitung" Set am Ende (egal ob Erfolg oder Fehler)
+                    struct ChunkProcessingGuard {
+                        processing_chunks: Arc<std::sync::Mutex<HashSet<String>>>,
+                        chunk_hash: String,
+                    }
+                    
+                    impl Drop for ChunkProcessingGuard {
+                        fn drop(&mut self) {
+                            if let Ok(mut processing) = self.processing_chunks.lock() {
+                                processing.remove(&self.chunk_hash);
+                            }
+                        }
+                    }
+                    
+                    let _guard = ChunkProcessingGuard {
+                        processing_chunks: processing_chunks.clone(),
+                        chunk_hash: chunk_hash_clone.clone(),
+                    };
+                    
+                    // Finde game_id aus chunk_hash (durch Manifest-Suche)
+                    if let Ok(game_id) = deckdrop_core::find_game_id_for_chunk(&chunk_hash_clone) {
+                        // Prüfe ob Download pausiert ist
+                        if let Ok(manifest_path) = deckdrop_core::get_manifest_path(&game_id) {
+                            if let Ok(manifest) = deckdrop_core::DownloadManifest::load(&manifest_path) {
+                                // Überspringe wenn pausiert
+                                if !matches!(manifest.overall_status, deckdrop_core::DownloadStatus::Paused) {
+                                    // Speichere Chunk (blockierende I/O-Operation)
+                                    if let Ok(chunks_dir) = deckdrop_core::get_chunks_dir(&game_id) {
+                                        if deckdrop_core::save_chunk(&chunk_hash_clone, &chunk_data_clone, &chunks_dir).is_ok() {
+                                            // Aktualisiere Manifest
+                                            if let Ok(mut manifest) = deckdrop_core::DownloadManifest::load(&manifest_path) {
+                                                manifest.mark_chunk_downloaded(&chunk_hash_clone);
                                                 
-                                                // Prüfe ob Dateien komplett sind und rekonstruiere sie
-                                                if let Err(e) = deckdrop_core::check_and_reconstruct_files(&game_id, &manifest) {
-                                                    eprintln!("Fehler beim Rekonstruieren von Dateien: {}", e);
-                                                }
-                                                
-                                                // Prüfe ob noch weitere Chunks fehlen und fordere sie an
-                                                if matches!(manifest.overall_status, deckdrop_core::DownloadStatus::Downloading) {
-                                                    if let Some(peers) = self.network_games.get(&game_id) {
-                                                        let peer_ids: Vec<String> = peers.iter()
-                                                            .map(|(pid, _)| pid.clone())
-                                                            .collect();
-                                                        if !peer_ids.is_empty() {
-                                                            if let Some(tx) = crate::network_bridge::get_download_request_tx() {
-                                                                // Request weitere fehlende Chunks (max 3 pro Peer)
-                                                                if let Err(e) = deckdrop_core::request_missing_chunks(&game_id, &peer_ids, &tx, 3) {
-                                                                    eprintln!("Fehler beim Anfordern weiterer Chunks für {}: {}", game_id, e);
+                                                if manifest.save(&manifest_path).is_ok() {
+                                                    // Aktualisiere UI-Status (wird beim nächsten Tick gelesen)
+                                                    // Das Manifest wird in update_download_progress() gelesen
+                                                    
+                                                    // Prüfe ob Dateien komplett sind und rekonstruiere sie (blockierende I/O)
+                                                    if let Err(e) = deckdrop_core::check_and_reconstruct_files(&game_id, &manifest) {
+                                                        eprintln!("Fehler beim Rekonstruieren von Dateien: {}", e);
+                                                    }
+                                                    
+                                                    // Prüfe ob noch weitere Chunks fehlen und fordere sie an
+                                                    if matches!(manifest.overall_status, deckdrop_core::DownloadStatus::Downloading) {
+                                                        if let Some(peer_ids) = peer_ids_for_thread {
+                                                            if !peer_ids.is_empty() {
+                                                                if let Some(tx) = crate::network_bridge::get_download_request_tx() {
+                                                                    // Request weitere fehlende Chunks (max 3 pro Peer)
+                                                                    if let Err(e) = deckdrop_core::request_missing_chunks(&game_id, &peer_ids, &tx, 3) {
+                                                                        eprintln!("Fehler beim Anfordern weiterer Chunks für {}: {}", game_id, e);
+                                                                    }
                                                                 }
                                                             }
                                                         }
                                                     }
+                                                    
+                                                    // Prüfe ob Spiel komplett ist (wird in update_download_progress() behandelt)
+                                                } else {
+                                                    eprintln!("Fehler beim Speichern des Manifests für Chunk {}", chunk_hash_clone);
                                                 }
-                                                
-                                                // Prüfe ob Spiel komplett ist (wird in update_download_progress() behandelt)
-                                            } else {
-                                                eprintln!("Fehler beim Speichern des Manifests für Chunk {}", chunk_hash);
                                             }
+                                        } else {
+                                            eprintln!("Fehler beim Speichern des Chunks {}: {}", chunk_hash_clone, peer_id);
                                         }
-                                    } else {
-                                        eprintln!("Fehler beim Speichern des Chunks {}: {}", chunk_hash, peer_id);
                                     }
+                                } else {
+                                    println!("Download pausiert, überspringe Chunk {}", chunk_hash_clone);
                                 }
-                            } else {
-                                println!("Download pausiert, überspringe Chunk {}", chunk_hash);
                             }
                         }
+                    } else {
+                        eprintln!("Konnte game_id für Chunk {} nicht finden", chunk_hash_clone);
                     }
-                } else {
-                    eprintln!("Konnte game_id für Chunk {} nicht finden", chunk_hash);
-                }
+                });
             }
             DiscoveryEvent::ChunkRequestFailed { peer_id, chunk_hash, error } => {
                 eprintln!("ChunkRequestFailed: {} from {}: {}", chunk_hash, peer_id, error);
