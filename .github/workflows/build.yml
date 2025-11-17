@@ -103,11 +103,24 @@ jobs:
         with:
           name: DeckDrop-AppImage
           path: DeckDrop-x86_64.AppImage
+          compression-level: 0
+          if-no-files-found: error
 
       - name: Upload to GitHub Release (only if tag)
         if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
+        uses: ncipollo/create-release@v1
         with:
-          files: |
-            target/release/deckdrop
-            DeckDrop-x86_64.AppImage
+          tag: ${{ github.ref_name }}
+          name: Release ${{ github.ref_name }}
+          draft: false
+          prerelease: false
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload AppImage to Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: ncipollo/upload-release-asset@v1
+        with:
+          file: DeckDrop-x86_64.AppImage
+          tag: ${{ github.ref_name }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+          name: DeckDrop-x86_64.AppImage
