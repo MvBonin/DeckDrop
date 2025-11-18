@@ -917,24 +917,28 @@ pub async fn run_discovery(
                                         // Wir haben einen Chunk erhalten
                                         let peer_id_str = peer.to_string();
                                         
-                                        // Entferne Request aus Tracking
-                                        let (_tracked_chunk_hash, game_id, _) = {
+                                        // Entferne Request aus Tracking und verwende getrackten Hash
+                                        let (chunk_hash, game_id, _) = {
                                             let mut pending = pending_chunk_requests_clone.lock().await;
                                             pending.remove(&request_id)
-                                                .unwrap_or_else(|| (response.chunk_hash.clone(), "unknown".to_string(), peer_id_str.clone()))
+                                                .unwrap_or_else(|| {
+                                                    eprintln!("Warnung: Chunk Request {} nicht im Tracking gefunden, verwende Hash aus Response", request_id);
+                                                    (response.chunk_hash.clone(), "unknown".to_string(), peer_id_str.clone())
+                                                })
                                         };
                                         
                                         println!("Chunk Response erhalten von {} für hash {} (RequestId: {:?}, game_id: {})", 
-                                            peer_id_str, response.chunk_hash, request_id, game_id);
+                                            peer_id_str, chunk_hash, request_id, game_id);
                                         eprintln!("Chunk Response erhalten von {} für hash {} (RequestId: {:?}, game_id: {})", 
-                                            peer_id_str, response.chunk_hash, request_id, game_id);
+                                            peer_id_str, chunk_hash, request_id, game_id);
                                         
-                                        // Sende Event mit chunk_hash
+                                        // Sende Event mit chunk_hash (verwende getrackten Hash, nicht Response-Hash)
                                         let event_tx_for_chunk = event_tx_clone.clone();
+                                        let chunk_hash_clone = chunk_hash.clone();
                                         tokio::spawn(async move {
                                             let _ = event_tx_for_chunk.send(DiscoveryEvent::ChunkReceived {
                                                 peer_id: peer_id_str,
-                                                chunk_hash: response.chunk_hash.clone(),
+                                                chunk_hash: chunk_hash_clone,
                                                 chunk_data: response.chunk_data.clone(),
                                             }).await;
                                         });
