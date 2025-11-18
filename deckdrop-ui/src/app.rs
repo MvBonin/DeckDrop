@@ -2017,8 +2017,8 @@ impl DeckDropApp {
                     perf.success_rate = perf.successful_requests as f64 / perf.total_requests.max(1) as f64;
                     perf.last_update = std::time::Instant::now();
                     
-                    // Circuit Breaker: Blockiere Peer bei <50% Success-Rate oder >3 aufeinanderfolgenden Fehlern
-                    if perf.success_rate < 0.5 || perf.consecutive_failures >= 3 {
+                    // Robustheit: Circuit Breaker - Blockiere früher (nach 2 Fehlern) um Crash zu verhindern
+                    if perf.success_rate < 0.5 || perf.consecutive_failures >= 2 {
                         perf.blocked_until = Some(std::time::Instant::now() + std::time::Duration::from_secs(300)); // 5 Minuten
                         should_block_peer = true;
                         eprintln!("Circuit Breaker: Peer {} blockiert für 5 Minuten (Success-Rate: {:.1}%, Consecutive Failures: {})", 

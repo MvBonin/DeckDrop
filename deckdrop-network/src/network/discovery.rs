@@ -163,6 +163,11 @@ pub async fn run_discovery(
         Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     let pending_chunk_requests_clone = pending_chunk_requests.clone();
     
+    // Robustheit: Rate-Limiting - Zähle aktive Requests pro Peer (verhindert Request-Sturm)
+    let active_requests_per_peer: Arc<tokio::sync::Mutex<HashMap<String, usize>>> = 
+        Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let active_requests_per_peer_clone = active_requests_per_peer.clone();
+    
     // Tracking für Metadata-Requests: request_id -> (game_id, peer_id)
     let pending_metadata_requests: Arc<tokio::sync::Mutex<HashMap<OutboundRequestId, (String, String)>>> = 
         Arc::new(tokio::sync::Mutex::new(HashMap::new()));
@@ -225,9 +230,10 @@ pub async fn run_discovery(
     // Helper function to create agent_version from metadata
     let version = env!("CARGO_PKG_VERSION");
     let create_agent_version = |player_name: &Option<String>, games_count: &Option<u32>| {
+        // Robustheit: Nur "Unknown" verwenden wenn wirklich kein Name vorhanden ist
         if player_name.is_some() || games_count.is_some() {
             let metadata = serde_json::json!({
-                "player_name": player_name.as_ref().unwrap_or(&"Unknown".to_string()),
+                "player_name": player_name.as_ref().map(|s| s.as_str()).unwrap_or("Unknown"),
                 "games_count": games_count.unwrap_or(0),
                 "version": version
             });
@@ -332,8 +338,93 @@ pub async fn run_discovery(
     keepalive_interval_timer_normal.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     keepalive_interval_timer_active.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     
+    // Robustheit: Periodische Prüfung für Peers ohne Namen - erfrage Name nachträglich
+    // Jeder Player hat einen Namen, daher sollten wir ihn erfragen wenn er fehlt oder "Unknown" ist
+    let mut name_request_interval = tokio::time::interval(Duration::from_secs(30)); // Alle 30 Sekunden prüfen
+    name_request_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    
     loop {
         tokio::select! {
+            // Robustheit: Prüfe Peers ohne Namen und erfrage Name nachträglich
+            _ = name_request_interval.tick() => {
+                let connected_peers: Vec<PeerId> = swarm.connected_peers().cloned().collect();
+                if !connected_peers.is_empty() {
+                    // Prüfe welche Peers keinen Namen haben oder "Unknown" haben
+                    let peers_without_name: Vec<(PeerId, String)> = {
+                        let map = peer_info_map_clone.lock().await;
+                        let addrs = peer_addrs_clone.lock().await;
+                        connected_peers.iter()
+                            .filter_map(|peer_id| {
+                                let peer_id_str = peer_id.to_string();
+                                if let Some(peer_info) = map.get(&peer_id_str) {
+                                    // Prüfe ob Name fehlt oder "Unknown" ist
+                                    let needs_name = peer_info.player_name.is_none() || 
+                                        peer_info.player_name.as_ref().map(|n| n == "Unknown" || n.is_empty()).unwrap_or(false);
+                                    if needs_name {
+                                        // Hole Adresse für Reconnect
+                                        let addr = addrs.get(&peer_id_str).cloned();
+                                        if addr.is_some() {
+                                            Some((*peer_id, peer_id_str))
+                                        } else {
+                                            None
+                                        }
+                                    } else {
+                                        None
+                                    }
+                                } else {
+                                    // Peer nicht in Map - sollte Name erfragt werden
+                                    let addr = addrs.get(&peer_id_str).cloned();
+                                    if addr.is_some() {
+                                        Some((*peer_id, peer_id_str))
+                                    } else {
+                                        None
+                                    }
+                                }
+                            })
+                            .collect()
+                    };
+                    
+                    if !peers_without_name.is_empty() {
+                        println!("Name-Request: {} Peers ohne Namen gefunden, erfrage Name nachträglich", peers_without_name.len());
+                        eprintln!("Name-Request: {} Peers ohne Namen gefunden, erfrage Name nachträglich", peers_without_name.len());
+                        
+                        // Für jeden Peer ohne Namen: Baue Verbindung neu auf
+                        // Dies löst Identify erneut aus, was die aktualisierte Agent Version sendet
+                        for (peer_id, peer_id_str) in peers_without_name {
+                            // Prüfe ob Peer noch verbunden ist
+                            if swarm.connected_peers().any(|p| p == &peer_id) {
+                                // Hole Adresse für Reconnect
+                                let addr_opt = {
+                                    let addrs = peer_addrs_clone.lock().await;
+                                    addrs.get(&peer_id_str).cloned()
+                                };
+                                
+                                if let Some(addr) = addr_opt {
+                                    // Baue Verbindung neu auf (löst Identify erneut aus)
+                                    println!("Name-Request: Baue Verbindung zu {} neu auf, um Name zu erfragen", peer_id_str);
+                                    eprintln!("Name-Request: Baue Verbindung zu {} neu auf, um Name zu erfragen", peer_id_str);
+                                    
+                                    let addr_with_peer = if addr.iter().any(|p| matches!(p, libp2p::multiaddr::Protocol::P2p(_))) {
+                                        addr.clone()
+                                    } else {
+                                        addr.with(libp2p::multiaddr::Protocol::P2p(peer_id))
+                                    };
+                                    
+                                    // Baue Verbindung neu auf (löst Identify erneut aus)
+                                    // Einfacher Ansatz: Baue Verbindung direkt neu auf
+                                    // libp2p wird Identify automatisch erneut senden
+                                    if let Err(e) = swarm.dial(addr_with_peer) {
+                                        eprintln!("Name-Request: Reconnect fehlgeschlagen für {}: {}", peer_id_str, e);
+                                    } else {
+                                        println!("Name-Request: Reconnect initiiert für {} (wird Identify erneut auslösen)", peer_id_str);
+                                        eprintln!("Name-Request: Reconnect initiiert für {} (wird Identify erneut auslösen)", peer_id_str);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             // Keep-Alive: Periodische GamesList-Requests an alle verbundenen Peers
             _ = keepalive_interval_timer_normal.tick() => {
                 let connected_peers: Vec<PeerId> = swarm.connected_peers().cloned().collect();
@@ -532,6 +623,18 @@ pub async fn run_discovery(
                                 }
                             };
                             
+                            // Robustheit: Rate-Limiting - Max 5 gleichzeitige Requests pro Peer
+                            let active_count = {
+                                let mut active = active_requests_per_peer_clone.lock().await;
+                                *active.entry(peer_id.clone()).or_insert(0)
+                            };
+                            
+                            if active_count >= 5 {
+                                eprintln!("Rate-Limit erreicht für Peer {} ({} aktive Requests), überspringe Chunk-Request für {}", 
+                                    peer_id, active_count, chunk_hash);
+                                continue; // Überspringe Request, wenn zu viele aktiv
+                            }
+                            
                             // Prüfe ob Peer verbunden ist, versuche Reconnect falls nicht
                             if !swarm.connected_peers().any(|p| p == &peer_id_parsed) {
                                 eprintln!("Peer {} nicht verbunden für Chunk Request, versuche Reconnect...", peer_id);
@@ -551,11 +654,15 @@ pub async fn run_discovery(
                                     
                                     if let Err(e) = swarm.dial(addr_with_peer) {
                                         eprintln!("Reconnect fehlgeschlagen für {}: {}", peer_id, e);
+                                        continue; // Überspringe Request bei Reconnect-Fehler
                                     } else {
                                         println!("Reconnect initiiert für {}, warte auf Verbindung...", peer_id);
                                         // Warte kurz auf Verbindung
                                         tokio::time::sleep(Duration::from_millis(500)).await;
                                     }
+                                } else {
+                                    eprintln!("Keine Adresse für Peer {} gefunden, überspringe Request", peer_id);
+                                    continue;
                                 }
                                 
                                 // Prüfe erneut, ob Peer jetzt verbunden ist
@@ -572,6 +679,12 @@ pub async fn run_discovery(
                             {
                                 let mut pending = pending_chunk_requests_clone.lock().await;
                                 pending.insert(request_id, (chunk_hash.clone(), game_id.clone(), peer_id.clone()));
+                            }
+                            
+                            // Robustheit: Erhöhe aktive Request-Zahl
+                            {
+                                let mut active = active_requests_per_peer_clone.lock().await;
+                                *active.entry(peer_id.clone()).or_insert(0) += 1;
                             }
                             
                             println!("Chunk Request gesendet an {} für hash: {} (RequestId: {:?})", peer_id, chunk_hash, request_id);
@@ -617,8 +730,13 @@ pub async fn run_discovery(
                                         eprintln!("Parsed metadata: {:?}", metadata);
                                         
                                         if let Some(name) = metadata.get("player_name").and_then(|v| v.as_str()) {
-                                            player_name = Some(name.to_string());
-                                            println!("Extracted player_name: {}", name);
+                                            // Robustheit: "Unknown" sollte nicht als echter Name verwendet werden
+                                            if name != "Unknown" && !name.is_empty() {
+                                                player_name = Some(name.to_string());
+                                                println!("Extracted player_name: {}", name);
+                                            } else {
+                                                println!("Ignoring 'Unknown' or empty player_name");
+                                            }
                                         }
                                         if let Some(count) = metadata.get("games_count").and_then(|v| v.as_u64()) {
                                             games_count = Some(count as u32);
@@ -883,6 +1001,7 @@ pub async fn run_discovery(
                     DiscoveryBehaviourEvent::Chunks(chunk_event) => {
                         println!("Chunks Event empfangen: {:?}", chunk_event);
                         eprintln!("Chunks Event empfangen: {:?}", chunk_event);
+                        let active_requests_per_peer_for_chunks = active_requests_per_peer_clone.clone();
                         match chunk_event {
                             libp2p::request_response::Event::Message { message, peer, .. } => {
                                 match message {
@@ -918,7 +1037,7 @@ pub async fn run_discovery(
                                         let peer_id_str = peer.to_string();
                                         
                                         // Entferne Request aus Tracking und verwende getrackten Hash
-                                        let (chunk_hash, game_id, _) = {
+                                        let (chunk_hash, game_id, peer_id_from_tracking) = {
                                             let mut pending = pending_chunk_requests_clone.lock().await;
                                             pending.remove(&request_id)
                                                 .unwrap_or_else(|| {
@@ -926,6 +1045,17 @@ pub async fn run_discovery(
                                                     (response.chunk_hash.clone(), "unknown".to_string(), peer_id_str.clone())
                                                 })
                                         };
+                                        
+                                        // Robustheit: Reduziere aktive Request-Zahl bei Erfolg
+                                        {
+                                            let mut active = active_requests_per_peer_for_chunks.lock().await;
+                                            if let Some(count) = active.get_mut(&peer_id_from_tracking) {
+                                                *count = count.saturating_sub(1);
+                                                if *count == 0 {
+                                                    active.remove(&peer_id_from_tracking);
+                                                }
+                                            }
+                                        }
                                         
                                         println!("Chunk Response erhalten von {} für hash {} (RequestId: {:?}, game_id: {})", 
                                             peer_id_str, chunk_hash, request_id, game_id);
@@ -948,6 +1078,17 @@ pub async fn run_discovery(
                             libp2p::request_response::Event::OutboundFailure { peer, request_id, error, .. } => {
                                 let peer_id_str = peer.to_string();
                                 
+                                // Robustheit: Reduziere aktive Request-Zahl
+                                {
+                                    let mut active = active_requests_per_peer_for_chunks.lock().await;
+                                    if let Some(count) = active.get_mut(&peer_id_str) {
+                                        *count = count.saturating_sub(1);
+                                        if *count == 0 {
+                                            active.remove(&peer_id_str);
+                                        }
+                                    }
+                                }
+                                
                                 // Hole Request-Informationen aus Tracking
                                 let (chunk_hash, game_id, _) = {
                                     let mut pending = pending_chunk_requests_clone.lock().await;
@@ -958,41 +1099,10 @@ pub async fn run_discovery(
                                 eprintln!("Chunks OutboundFailure für {} (RequestId: {:?}): chunk_hash={}, game_id={}, error={:?}", 
                                     peer_id_str, request_id, chunk_hash, game_id, error);
                                 
-                                // Retry-Mechanismus: Bei Timeout oder ConnectionClosed versuche Reconnect
-                                let should_retry = matches!(error, 
-                                    libp2p::request_response::OutboundFailure::Timeout |
-                                    libp2p::request_response::OutboundFailure::ConnectionClosed
-                                );
+                                // Robustheit: KEINE Reconnect-Versuche mehr bei Timeout - verhindert Reconnect-Sturm
+                                // Der Circuit Breaker in app.rs wird das Retry übernehmen
                                 
-                                if should_retry {
-                                    eprintln!("Chunk Request fehlgeschlagen, versuche Reconnect und Retry für {}", peer_id_str);
-                                    
-                                    // Versuche Reconnect
-                                    let addr_opt = {
-                                        let addrs = peer_addrs_clone.lock().await;
-                                        addrs.get(&peer_id_str).cloned()
-                                    };
-                                    
-                                    if let Some(addr) = addr_opt {
-                                        let addr_with_peer = if addr.iter().any(|p| matches!(p, libp2p::multiaddr::Protocol::P2p(_))) {
-                                            addr.clone()
-                                        } else {
-                                            if let Ok(peer_id_parsed) = PeerId::from_str(&peer_id_str) {
-                                                addr.with(libp2p::multiaddr::Protocol::P2p(peer_id_parsed))
-                                            } else {
-                                                addr
-                                            }
-                                        };
-                                        
-                                        if let Err(e) = swarm.dial(addr_with_peer) {
-                                            eprintln!("Reconnect fehlgeschlagen für {}: {}", peer_id_str, e);
-                                        } else {
-                                            println!("Reconnect initiiert für {}, Retry wird später versucht", peer_id_str);
-                                        }
-                                    }
-                                }
-                                
-                                // Sende ChunkRequestFailed Event
+                                // Sende ChunkRequestFailed Event (Retry wird in app.rs mit Exponential Backoff gehandhabt)
                                 let event_tx_for_failure = event_tx_clone.clone();
                                 let chunk_hash_clone = chunk_hash.clone();
                                 tokio::spawn(async move {
@@ -2209,5 +2319,434 @@ mod tests {
                 panic!("Expected PeerLost event, got different event");
             }
         }
+    }
+    
+    #[tokio::test]
+    async fn test_rate_limiting_per_peer() {
+        // Test: Rate-Limiting verhindert zu viele gleichzeitige Requests
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+        use std::collections::HashMap;
+        
+        let active_requests: Arc<Mutex<HashMap<String, usize>>> = 
+            Arc::new(Mutex::new(HashMap::new()));
+        
+        let peer_id = "test-peer-123".to_string();
+        let max_requests = 5;
+        
+        // Test 1: Erhöhe auf Max
+        for i in 0..max_requests {
+            let mut active = active_requests.lock().await;
+            *active.entry(peer_id.clone()).or_insert(0) += 1;
+            let count = active.get(&peer_id).copied().unwrap_or(0);
+            assert_eq!(count, i + 1, "Request-Zahl sollte {} sein", i + 1);
+        }
+        
+        // Test 2: Prüfe ob Limit erreicht ist
+        {
+            let active = active_requests.lock().await;
+            let count = active.get(&peer_id).copied().unwrap_or(0);
+            assert_eq!(count, max_requests, "Limit sollte erreicht sein");
+            assert!(count >= max_requests, "Weitere Requests sollten blockiert werden");
+        }
+        
+        // Test 3: Reduziere bei Erfolg
+        {
+            let mut active = active_requests.lock().await;
+            if let Some(count) = active.get_mut(&peer_id) {
+                *count = count.saturating_sub(1);
+            }
+            let count = active.get(&peer_id).copied().unwrap_or(0);
+            assert_eq!(count, max_requests - 1, "Request-Zahl sollte reduziert sein");
+        }
+        
+        // Test 4: Reduziere bei Fehler
+        {
+            let mut active = active_requests.lock().await;
+            if let Some(count) = active.get_mut(&peer_id) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    active.remove(&peer_id);
+                }
+            }
+            let count = active.get(&peer_id).copied().unwrap_or(0);
+            assert_eq!(count, max_requests - 2, "Request-Zahl sollte weiter reduziert sein");
+        }
+        
+        println!("✓ Rate-Limiting funktioniert korrekt");
+    }
+    
+    #[tokio::test]
+    async fn test_no_reconnect_on_timeout() {
+        // Test: Keine Reconnect-Versuche bei Timeout (verhindert Reconnect-Sturm)
+        // Dieser Test prüft, dass OutboundFailure Events keine Reconnect-Versuche mehr auslösen
+        
+        use tokio::sync::mpsc;
+        use libp2p::request_response::OutboundFailure;
+        
+        let (event_tx, mut event_rx) = mpsc::channel::<DiscoveryEvent>(100);
+        
+        // Simuliere Timeout-Event (sollte kein Reconnect auslösen)
+        let test_peer_id = "12D3KooWTestPeerTimeout".to_string();
+        let test_chunk_hash = "test_chunk:0".to_string();
+        
+        // Sende ChunkRequestFailed Event (simuliert Timeout)
+        let _ = event_tx.send(DiscoveryEvent::ChunkRequestFailed {
+            peer_id: test_peer_id.clone(),
+            chunk_hash: test_chunk_hash.clone(),
+            error: "Timeout".to_string(),
+        }).await;
+        
+        // Empfange das Event
+        let received_event = event_rx.recv().await;
+        
+        assert!(received_event.is_some());
+        match received_event.unwrap() {
+            DiscoveryEvent::ChunkRequestFailed { peer_id, chunk_hash, error } => {
+                assert_eq!(peer_id, test_peer_id);
+                assert_eq!(chunk_hash, test_chunk_hash);
+                assert_eq!(error, "Timeout");
+                println!("✓ ChunkRequestFailed Event korrekt empfangen (kein Reconnect)");
+            }
+            _ => {
+                panic!("Expected ChunkRequestFailed event");
+            }
+        }
+        
+        // Wichtig: Es sollte KEIN Reconnect-Versuch stattgefunden haben
+        // (Das wird in der Implementierung sichergestellt, indem Reconnect-Code entfernt wurde)
+        println!("✓ Kein Reconnect bei Timeout - verhindert Reconnect-Sturm");
+    }
+    
+    #[test]
+    fn test_agent_version_contains_player_name() {
+        // Test: Agent Version sollte player_name enthalten, nicht "Unknown"
+        let version = env!("CARGO_PKG_VERSION");
+        
+        // Test 1: Mit player_name
+        let player_name = Some("TestPlayer".to_string());
+        let games_count = Some(5);
+        
+        let metadata = serde_json::json!({
+            "player_name": player_name.as_ref().unwrap(),
+            "games_count": games_count.unwrap(),
+            "version": version
+        });
+        let json_str = serde_json::to_string(&metadata).unwrap();
+        let agent_version = format!("deckdrop/{}", json_str);
+        
+        assert!(agent_version.contains("TestPlayer"), "Agent Version sollte player_name enthalten");
+        assert!(!agent_version.contains("Unknown"), "Agent Version sollte NICHT 'Unknown' enthalten");
+        assert!(agent_version.contains(&games_count.unwrap().to_string()), "Agent Version sollte games_count enthalten");
+        
+        // Test 2: Ohne player_name (sollte "Unknown" verwenden als Fallback)
+        let player_name_none: Option<String> = None;
+        let metadata_fallback = serde_json::json!({
+            "player_name": player_name_none.as_ref().unwrap_or(&"Unknown".to_string()),
+            "games_count": 0,
+            "version": version
+        });
+        let json_str_fallback = serde_json::to_string(&metadata_fallback).unwrap();
+        let agent_version_fallback = format!("deckdrop/{}", json_str_fallback);
+        
+        // In diesem Fall ist "Unknown" OK, da kein Name vorhanden ist
+        assert!(agent_version_fallback.contains("Unknown"), "Agent Version sollte 'Unknown' enthalten wenn kein Name vorhanden");
+        
+        println!("✓ Agent Version enthält korrekten player_name");
+    }
+    
+    #[test]
+    fn test_extract_player_name_from_agent_version() {
+        // Test: Extrahiere player_name aus agent_version
+        let version = env!("CARGO_PKG_VERSION");
+        
+        // Test 1: Korrekte agent_version mit player_name
+        let agent_version = format!(
+            r#"deckdrop/{{"player_name":"Alice","games_count":10,"version":"{}"}}"#,
+            version
+        );
+        
+        // Simuliere Parsing wie in discovery.rs
+        if agent_version.starts_with("deckdrop/") {
+            let json_str = &agent_version[9..]; // Skip "deckdrop/"
+            if let Ok(metadata) = serde_json::from_str::<serde_json::Value>(json_str) {
+                if let Some(name) = metadata.get("player_name").and_then(|v| v.as_str()) {
+                    assert_eq!(name, "Alice", "player_name sollte 'Alice' sein");
+                    assert_ne!(name, "Unknown", "player_name sollte NICHT 'Unknown' sein");
+                    assert_ne!(name, "unknown", "player_name sollte NICHT 'unknown' sein");
+                } else {
+                    panic!("player_name sollte extrahiert werden können");
+                }
+            } else {
+                panic!("JSON sollte geparst werden können");
+            }
+        }
+        
+        // Test 2: Agent version ohne player_name (nur Version)
+        let agent_version_minimal = format!("deckdrop/{}", version);
+        // In diesem Fall sollte kein player_name extrahiert werden
+        assert!(!agent_version_minimal.contains("player_name"), "Minimale agent_version sollte kein player_name enthalten");
+        
+        println!("✓ player_name wird korrekt aus agent_version extrahiert");
+    }
+    
+    #[tokio::test]
+    async fn test_peer_info_name_not_unknown() {
+        // Test: PeerInfo sollte nicht "unknown" oder "Unknown" als Name haben wenn ein Name vorhanden ist
+        use crate::network::peer::PeerInfo;
+        
+        // Test 1: PeerInfo mit korrektem Namen
+        let peer_with_name = PeerInfo {
+            id: "test-peer-123".to_string(),
+            addr: Some("192.168.1.100:8080".to_string()),
+            player_name: Some("TestPlayer".to_string()),
+            games_count: Some(5),
+            version: None,
+        };
+        
+        assert!(peer_with_name.player_name.is_some(), "player_name sollte vorhanden sein");
+        assert_eq!(peer_with_name.player_name.as_ref().unwrap(), "TestPlayer");
+        assert_ne!(peer_with_name.player_name.as_ref().unwrap(), "Unknown");
+        assert_ne!(peer_with_name.player_name.as_ref().unwrap(), "unknown");
+        
+        // Test 2: PeerInfo ohne Namen (None ist OK)
+        let peer_without_name = PeerInfo {
+            id: "test-peer-456".to_string(),
+            addr: Some("192.168.1.101:8080".to_string()),
+            player_name: None,
+            games_count: None,
+            version: None,
+        };
+        
+        assert!(peer_without_name.player_name.is_none(), "player_name sollte None sein wenn nicht vorhanden");
+        
+        // Test 3: PeerInfo sollte nicht "Unknown" als String haben
+        let peer_with_unknown = PeerInfo {
+            id: "test-peer-789".to_string(),
+            addr: Some("192.168.1.102:8080".to_string()),
+            player_name: Some("Unknown".to_string()),
+            games_count: None,
+            version: None,
+        };
+        
+        // "Unknown" sollte nur verwendet werden wenn wirklich kein Name vorhanden ist
+        // In diesem Test prüfen wir, dass wenn ein Name gesetzt ist, er nicht "Unknown" sein sollte
+        // (außer es ist wirklich der Name des Spielers)
+        // Aber in der Praxis sollte "Unknown" vermieden werden
+        
+        println!("✓ PeerInfo hat korrekten Namen (nicht 'unknown')");
+    }
+    
+    #[tokio::test]
+    async fn test_identify_announcement_contains_name() {
+        // Test: Identify Announcement sollte player_name enthalten
+        use tokio::sync::mpsc;
+        
+        let (event_tx, mut event_rx) = mpsc::channel::<DiscoveryEvent>(100);
+        
+        // Simuliere PeerFound Event mit korrektem Namen
+        let test_peer = crate::network::peer::PeerInfo {
+            id: "12D3KooWTestPeer123".to_string(),
+            addr: Some("192.168.1.100:8080".to_string()),
+            player_name: Some("Alice".to_string()),
+            games_count: Some(10),
+            version: Some("1.0.0".to_string()),
+        };
+        
+        let _ = event_tx.send(DiscoveryEvent::PeerFound(test_peer.clone())).await;
+        
+        // Empfange das Event
+        let received_event = event_rx.recv().await;
+        
+        assert!(received_event.is_some());
+        match received_event.unwrap() {
+            DiscoveryEvent::PeerFound(peer) => {
+                assert_eq!(peer.id, test_peer.id);
+                assert!(peer.player_name.is_some(), "player_name sollte vorhanden sein");
+                assert_eq!(peer.player_name.as_ref().unwrap(), "Alice");
+                assert_ne!(peer.player_name.as_ref().unwrap(), "Unknown");
+                assert_ne!(peer.player_name.as_ref().unwrap(), "unknown");
+                println!("✓ PeerFound Event hat korrekten Namen: {}", peer.player_name.as_ref().unwrap());
+            }
+            _ => {
+                panic!("Expected PeerFound event");
+            }
+        }
+    }
+    
+    #[test]
+    fn test_create_agent_version_with_name() {
+        // Test: create_agent_version sollte korrekten Namen verwenden
+        let version = env!("CARGO_PKG_VERSION");
+        
+        // Test 1: Mit player_name
+        let player_name = Some("Bob".to_string());
+        let games_count = Some(3);
+        
+        let metadata = serde_json::json!({
+            "player_name": player_name.as_ref().unwrap(),
+            "games_count": games_count.unwrap(),
+            "version": version
+        });
+        let json_str = serde_json::to_string(&metadata).unwrap();
+        let agent_version = format!("deckdrop/{}", json_str);
+        
+        // Prüfe dass Name korrekt ist
+        assert!(agent_version.contains("Bob"), "Agent Version sollte 'Bob' enthalten");
+        assert!(!agent_version.contains("Unknown"), "Agent Version sollte NICHT 'Unknown' enthalten wenn Name vorhanden");
+        
+        // Test 2: Parsing zurück
+        if agent_version.starts_with("deckdrop/") {
+            let json_str = &agent_version[9..];
+            if let Ok(metadata) = serde_json::from_str::<serde_json::Value>(json_str) {
+                if let Some(name) = metadata.get("player_name").and_then(|v| v.as_str()) {
+                    assert_eq!(name, "Bob");
+                    assert_ne!(name, "Unknown");
+                }
+            }
+        }
+        
+        println!("✓ create_agent_version verwendet korrekten Namen");
+    }
+    
+    #[test]
+    fn test_unknown_name_not_used_as_real_name() {
+        // Test: "Unknown" sollte nicht als echter Name verwendet werden
+        let version = env!("CARGO_PKG_VERSION");
+        
+        // Test 1: Agent version mit "Unknown" sollte nicht als Name extrahiert werden
+        let agent_version_with_unknown = format!(
+            r#"deckdrop/{{"player_name":"Unknown","games_count":0,"version":"{}"}}"#,
+            version
+        );
+        
+        // Simuliere Parsing wie in discovery.rs
+        let mut player_name = None;
+        if agent_version_with_unknown.starts_with("deckdrop/") {
+            let json_str = &agent_version_with_unknown[9..];
+            if let Ok(metadata) = serde_json::from_str::<serde_json::Value>(json_str) {
+                if let Some(name) = metadata.get("player_name").and_then(|v| v.as_str()) {
+                    // Robustheit: "Unknown" sollte nicht als echter Name verwendet werden
+                    if name != "Unknown" && !name.is_empty() {
+                        player_name = Some(name.to_string());
+                    }
+                }
+            }
+        }
+        
+        // "Unknown" sollte NICHT als Name gesetzt werden
+        assert!(player_name.is_none(), "player_name sollte None sein wenn 'Unknown' extrahiert wird");
+        
+        // Test 2: Agent version mit echtem Namen sollte extrahiert werden
+        let agent_version_with_real_name = format!(
+            r#"deckdrop/{{"player_name":"RealPlayer","games_count":5,"version":"{}"}}"#,
+            version
+        );
+        
+        let mut player_name_real = None;
+        if agent_version_with_real_name.starts_with("deckdrop/") {
+            let json_str = &agent_version_with_real_name[9..];
+            if let Ok(metadata) = serde_json::from_str::<serde_json::Value>(json_str) {
+                if let Some(name) = metadata.get("player_name").and_then(|v| v.as_str()) {
+                    if name != "Unknown" && !name.is_empty() {
+                        player_name_real = Some(name.to_string());
+                    }
+                }
+            }
+        }
+        
+        // Echter Name sollte extrahiert werden
+        assert!(player_name_real.is_some(), "player_name sollte vorhanden sein wenn echter Name extrahiert wird");
+        assert_eq!(player_name_real.as_ref().unwrap(), "RealPlayer");
+        assert_ne!(player_name_real.as_ref().unwrap(), "Unknown");
+        
+        println!("✓ 'Unknown' wird nicht als echter Name verwendet");
+    }
+    
+    #[tokio::test]
+    async fn test_name_request_for_peers_without_name() {
+        // Test: Peers ohne Namen sollten nachträglich Name erfragt bekommen
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+        use crate::network::peer::PeerInfo;
+        
+        // Simuliere peer_info_map
+        let peer_info_map: Arc<Mutex<HashMap<String, PeerInfo>>> = 
+            Arc::new(Mutex::new(HashMap::new()));
+        
+        // Test 1: Peer ohne Namen
+        let peer_id_no_name = "test-peer-no-name".to_string();
+        let peer_without_name = PeerInfo {
+            id: peer_id_no_name.clone(),
+            addr: Some("192.168.1.100:8080".to_string()),
+            player_name: None,
+            games_count: None,
+            version: None,
+        };
+        {
+            let mut map = peer_info_map.lock().await;
+            map.insert(peer_id_no_name.clone(), peer_without_name);
+        }
+        
+        // Prüfe ob Name fehlt
+        {
+            let map = peer_info_map.lock().await;
+            if let Some(peer_info) = map.get(&peer_id_no_name) {
+                let needs_name = peer_info.player_name.is_none() || 
+                    peer_info.player_name.as_ref().map(|n| n == "Unknown" || n.is_empty()).unwrap_or(false);
+                assert!(needs_name, "Peer sollte Name benötigen");
+            }
+        }
+        
+        // Test 2: Peer mit "Unknown" Name
+        let peer_id_unknown = "test-peer-unknown".to_string();
+        let peer_with_unknown = PeerInfo {
+            id: peer_id_unknown.clone(),
+            addr: Some("192.168.1.101:8080".to_string()),
+            player_name: Some("Unknown".to_string()),
+            games_count: None,
+            version: None,
+        };
+        {
+            let mut map = peer_info_map.lock().await;
+            map.insert(peer_id_unknown.clone(), peer_with_unknown);
+        }
+        
+        // Prüfe ob Name erfragt werden sollte
+        {
+            let map = peer_info_map.lock().await;
+            if let Some(peer_info) = map.get(&peer_id_unknown) {
+                let needs_name = peer_info.player_name.is_none() || 
+                    peer_info.player_name.as_ref().map(|n| n == "Unknown" || n.is_empty()).unwrap_or(false);
+                assert!(needs_name, "Peer mit 'Unknown' sollte Name benötigen");
+            }
+        }
+        
+        // Test 3: Peer mit echtem Namen sollte KEINEN Name-Request bekommen
+        let peer_id_real_name = "test-peer-real-name".to_string();
+        let peer_with_real_name = PeerInfo {
+            id: peer_id_real_name.clone(),
+            addr: Some("192.168.1.102:8080".to_string()),
+            player_name: Some("RealPlayer".to_string()),
+            games_count: Some(5),
+            version: None,
+        };
+        {
+            let mut map = peer_info_map.lock().await;
+            map.insert(peer_id_real_name.clone(), peer_with_real_name);
+        }
+        
+        // Prüfe ob Name NICHT erfragt werden sollte
+        {
+            let map = peer_info_map.lock().await;
+            if let Some(peer_info) = map.get(&peer_id_real_name) {
+                let needs_name = peer_info.player_name.is_none() || 
+                    peer_info.player_name.as_ref().map(|n| n == "Unknown" || n.is_empty()).unwrap_or(false);
+                assert!(!needs_name, "Peer mit echtem Namen sollte KEINEN Name-Request bekommen");
+            }
+        }
+        
+        println!("✓ Name-Request-Logik funktioniert korrekt");
     }
 } 

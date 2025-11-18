@@ -960,4 +960,174 @@ file_size = {}
         
         // TempDir wird automatisch gelöscht wenn es out of scope geht
     }
+    
+    #[test]
+    fn test_validate_chunk_size() {
+        let temp_dir = TempDir::new().unwrap();
+        let game_path = temp_dir.path().join("game");
+        fs::create_dir_all(&game_path).unwrap();
+        
+        // Erstelle Test-Datei (200MB für 2 Chunks à 100MB)
+        const CHUNK_SIZE: usize = 100 * 1024 * 1024; // 100MB
+        let test_data = vec![42u8; 200 * 1024 * 1024];
+        let test_file_path = game_path.join("test.bin");
+        fs::write(&test_file_path, &test_data).unwrap();
+        
+        let file_hash = crate::gamechecker::calculate_file_hash(&test_file_path).unwrap();
+        
+        // Erstelle Manifest
+        let chunks_toml = format!(
+            r#"[[file]]
+path = "test.bin"
+file_hash = "{}"
+chunk_count = 2
+file_size = {}
+"#,
+            file_hash, test_data.len()
+        );
+        
+        let manifest = DownloadManifest::from_chunks_toml(
+            "test-game".to_string(),
+            "Test Game".to_string(),
+            game_path.to_string_lossy().to_string(),
+            &chunks_toml,
+        ).unwrap();
+        
+        // Test 1: Korrekte Chunk-Größe (100MB für ersten Chunk)
+        let chunk0_data = vec![1u8; CHUNK_SIZE];
+        let chunk0_hash = format!("{}:0", file_hash);
+        assert!(validate_chunk_size(&chunk0_hash, &chunk0_data, &manifest).is_ok());
+        
+        // Test 2: Falsche Chunk-Größe (zu klein)
+        let chunk0_small = vec![1u8; 10 * 1024 * 1024]; // 10MB statt 100MB
+        assert!(validate_chunk_size(&chunk0_hash, &chunk0_small, &manifest).is_err());
+        
+        // Test 3: Letzter Chunk kann kleiner sein (100MB für letzten Chunk)
+        let chunk1_hash = format!("{}:1", file_hash);
+        let chunk1_data = vec![1u8; CHUNK_SIZE]; // 100MB für letzten Chunk
+        assert!(validate_chunk_size(&chunk1_hash, &chunk1_data, &manifest).is_ok());
+        
+        // Test 4: Ungültiges Chunk-Hash-Format
+        assert!(validate_chunk_size("invalid_hash", &chunk0_data, &manifest).is_err());
+    }
+    
+    #[test]
+    fn test_save_chunk_atomic_write() {
+        let temp_dir = TempDir::new().unwrap();
+        let chunks_dir = temp_dir.path();
+        
+        let chunk_hash = "test_file:0";
+        let chunk_data = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+        
+        // Test: Atomic Write (Temp-File → Rename)
+        let saved_path = save_chunk(chunk_hash, &chunk_data, chunks_dir).unwrap();
+        assert!(saved_path.exists());
+        
+        // Prüfe dass keine Temp-Datei übrig bleibt (nach kurzer Wartezeit für Filesystem-Sync)
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let temp_files: Vec<_> = fs::read_dir(chunks_dir).unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                let path_str = e.path().to_string_lossy().to_string();
+                path_str.contains(".tmp") && !path_str.contains(".chunk")
+            })
+            .collect();
+        assert_eq!(temp_files.len(), 0, "Keine Temp-Dateien sollten übrig bleiben (gefunden: {:?})", 
+            temp_files.iter().map(|e| e.path()).collect::<Vec<_>>());
+        
+        // Prüfe dass Chunk korrekt gespeichert wurde
+        let loaded_data = load_chunk(chunk_hash, chunks_dir).unwrap();
+        assert_eq!(loaded_data, chunk_data);
+    }
+    
+    #[test]
+    fn test_update_manifest_atomic() {
+        let temp_dir = TempDir::new().unwrap();
+        let manifest_path = temp_dir.path().join("manifest.json");
+        
+        // Erstelle initiales Manifest
+        let chunks_toml = r#"[[file]]
+path = "test.bin"
+file_hash = "abc123"
+chunk_count = 2
+file_size = 200000000
+"#;
+        
+        let manifest = DownloadManifest::from_chunks_toml(
+            "test-game".to_string(),
+            "Test Game".to_string(),
+            "/path/to/game".to_string(),
+            chunks_toml,
+        ).unwrap();
+        manifest.save(&manifest_path).unwrap();
+        
+        // Test: Atomares Update
+        let updated_manifest = DownloadManifest::update_manifest_atomic(
+            &manifest_path,
+            |manifest| {
+                manifest.mark_chunk_downloaded("abc123:0");
+                Ok(())
+            }
+        ).unwrap();
+        
+        // Prüfe dass Update erfolgreich war
+        assert_eq!(updated_manifest.progress.downloaded_chunks, 1);
+        
+        // Prüfe dass Manifest korrekt gespeichert wurde
+        let loaded_manifest = DownloadManifest::load(&manifest_path).unwrap();
+        assert_eq!(loaded_manifest.progress.downloaded_chunks, 1);
+        
+        // Test: Mehrere atomare Updates hintereinander
+        DownloadManifest::update_manifest_atomic(
+            &manifest_path,
+            |manifest| {
+                manifest.mark_chunk_downloaded("abc123:1");
+                Ok(())
+            }
+        ).unwrap();
+        
+        let final_manifest = DownloadManifest::load(&manifest_path).unwrap();
+        assert_eq!(final_manifest.progress.downloaded_chunks, 2);
+        assert_eq!(final_manifest.progress.total_chunks, 2);
+    }
+    
+    #[test]
+    fn test_manifest_save_atomic() {
+        let temp_dir = TempDir::new().unwrap();
+        let manifest_path = temp_dir.path().join("manifest.json");
+        
+        let chunks_toml = r#"[[file]]
+path = "test.bin"
+file_hash = "abc123"
+chunk_count = 1
+file_size = 100000000
+"#;
+        
+        let manifest = DownloadManifest::from_chunks_toml(
+            "test-game".to_string(),
+            "Test Game".to_string(),
+            "/path/to/game".to_string(),
+            chunks_toml,
+        ).unwrap();
+        
+        // Test: Atomic Save (Temp-File → Rename)
+        manifest.save(&manifest_path).unwrap();
+        assert!(manifest_path.exists());
+        
+        // Prüfe dass keine Temp-Datei übrig bleibt (nach kurzer Wartezeit für Filesystem-Sync)
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let temp_files: Vec<_> = fs::read_dir(temp_dir.path()).unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                let path_str = e.path().to_string_lossy().to_string();
+                path_str.contains(".tmp") && !path_str.contains("manifest")
+            })
+            .collect();
+        assert_eq!(temp_files.len(), 0, "Keine Temp-Dateien sollten übrig bleiben (gefunden: {:?})", 
+            temp_files.iter().map(|e| e.path()).collect::<Vec<_>>());
+        
+        // Prüfe dass Manifest korrekt geladen werden kann
+        let loaded = DownloadManifest::load(&manifest_path).unwrap();
+        assert_eq!(loaded.game_id, "test-game");
+    }
 }

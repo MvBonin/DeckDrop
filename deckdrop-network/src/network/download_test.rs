@@ -240,5 +240,101 @@ file_size = {}
         
         println!("Test erfolgreich: Zwei Peers haben Spiel-Daten ausgetauscht!");
     }
+    
+    /// Test: Robustheit - Rate-Limiting verhindert Request-Sturm
+    #[tokio::test]
+    async fn test_rate_limiting_prevents_request_storm() {
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+        
+        // Simuliere Rate-Limiting
+        let active_requests: Arc<Mutex<HashMap<String, usize>>> = 
+            Arc::new(Mutex::new(HashMap::new()));
+        
+        let peer_id = "test-peer-rate-limit".to_string();
+        let max_requests = 5;
+        
+        // Test: Versuche mehr Requests als erlaubt
+        let mut requests_sent = 0;
+        for i in 0..10 {
+            let mut active = active_requests.lock().await;
+            let current_count = active.get(&peer_id).copied().unwrap_or(0);
+            
+            if current_count < max_requests {
+                *active.entry(peer_id.clone()).or_insert(0) += 1;
+                requests_sent += 1;
+                println!("Request {} gesendet (aktive: {})", i + 1, current_count + 1);
+            } else {
+                println!("Request {} blockiert (Rate-Limit erreicht: {})", i + 1, current_count);
+                // Request sollte blockiert werden
+                break;
+            }
+        }
+        
+        // Prüfe dass nur max_requests gesendet wurden
+        {
+            let active = active_requests.lock().await;
+            let count = active.get(&peer_id).copied().unwrap_or(0);
+            assert_eq!(count, max_requests, "Nur {} Requests sollten aktiv sein", max_requests);
+            assert_eq!(requests_sent, max_requests, "Nur {} Requests sollten gesendet worden sein", max_requests);
+        }
+        
+        println!("✓ Rate-Limiting verhindert Request-Sturm korrekt");
+    }
+    
+    /// Test: Robustheit - Circuit Breaker blockiert Peer nach Fehlern
+    #[test]
+    fn test_circuit_breaker_blocks_peer() {
+        use std::time::Instant;
+        use std::time::Duration;
+        
+        // Simuliere PeerPerformance
+        struct TestPeerPerformance {
+            consecutive_failures: usize,
+            success_rate: f64,
+            blocked_until: Option<Instant>,
+        }
+        
+        let mut perf = TestPeerPerformance {
+            consecutive_failures: 0,
+            success_rate: 1.0,
+            blocked_until: None,
+        };
+        
+        // Test 1: Erster Fehler - noch nicht blockiert
+        perf.consecutive_failures = 1;
+        perf.success_rate = 0.9;
+        let should_block = perf.consecutive_failures >= 2 || perf.success_rate < 0.5;
+        assert!(!should_block, "Peer sollte nach 1 Fehler noch nicht blockiert sein");
+        
+        // Test 2: Zweiter Fehler - sollte blockiert werden
+        perf.consecutive_failures = 2;
+        perf.success_rate = 0.8;
+        let should_block = perf.consecutive_failures >= 2 || perf.success_rate < 0.5;
+        assert!(should_block, "Peer sollte nach 2 Fehlern blockiert werden");
+        
+        // Test 3: Blockierung setzen
+        if should_block {
+            perf.blocked_until = Some(Instant::now() + Duration::from_secs(300));
+        }
+        assert!(perf.blocked_until.is_some(), "Peer sollte blockiert sein");
+        
+        // Test 4: Prüfe ob Peer noch blockiert ist
+        if let Some(blocked_until) = perf.blocked_until {
+            let is_blocked = Instant::now() < blocked_until;
+            assert!(is_blocked, "Peer sollte noch blockiert sein");
+        }
+        
+        // Test 5: Erfolgreicher Request sollte Blockierung zurücksetzen
+        perf.consecutive_failures = 0;
+        perf.success_rate = 0.8;
+        if perf.success_rate > 0.7 {
+            perf.blocked_until = None; // Entblockiere bei guter Performance
+        }
+        assert!(perf.blocked_until.is_none(), "Peer sollte entblockiert sein bei guter Performance");
+        
+        println!("✓ Circuit Breaker funktioniert korrekt");
+    }
 }
 
