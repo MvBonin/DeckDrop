@@ -1779,11 +1779,12 @@ impl DeckDropApp {
                     // Berechne Durchschnittsgeschwindigkeit
                     if perf.speed_samples.len() >= 2 {
                         let total_bytes: usize = perf.speed_samples.iter().map(|(_, bytes)| bytes).sum();
-                        let time_span = perf.speed_samples.last().unwrap().0
-                            .duration_since(perf.speed_samples.first().unwrap().0)
-                            .as_secs_f64();
-                        if time_span > 0.1 {
-                            perf.download_speed_bytes_per_sec = total_bytes as f64 / time_span;
+                        // Sichere Berechnung ohne unwrap() - verhindert Abstürze
+                        if let (Some(first), Some(last)) = (perf.speed_samples.first(), perf.speed_samples.last()) {
+                            let time_span = last.0.duration_since(first.0).as_secs_f64();
+                            if time_span > 0.1 {
+                                perf.download_speed_bytes_per_sec = total_bytes as f64 / time_span;
+                            }
                         }
                     }
                     perf.last_update = chunk_received_time;
@@ -2148,20 +2149,24 @@ impl DeckDropApp {
                     
                     // Berechne Geschwindigkeit basierend auf dem ältesten und neuesten Sample
                     let speed = if samples.len() >= 2 {
-                        let (oldest_time, oldest_chunks) = samples.first().unwrap();
-                        let (newest_time, newest_chunks) = samples.last().unwrap();
-                        
-                        let elapsed = newest_time.duration_since(*oldest_time).as_secs_f64();
-                        let chunks_downloaded = newest_chunks.saturating_sub(*oldest_chunks);
-                        
-                        // Chunk-Größe: 100MB = 100 * 1024 * 1024 Bytes
-                        const CHUNK_SIZE_BYTES: u64 = 100 * 1024 * 1024;
-                        let bytes_downloaded = (chunks_downloaded as u64) * CHUNK_SIZE_BYTES;
-                        
-                        if elapsed > 0.5 { // Mindestens 0.5 Sekunden für stabile Berechnung
-                            bytes_downloaded as f64 / elapsed
+                        // Sichere Berechnung ohne unwrap() - verhindert Abstürze
+                        if let (Some((oldest_time, oldest_chunks)), Some((newest_time, newest_chunks))) = 
+                            (samples.first(), samples.last()) {
+                            let elapsed = newest_time.duration_since(*oldest_time).as_secs_f64();
+                            let chunks_downloaded = newest_chunks.saturating_sub(*oldest_chunks);
+                            
+                            // Chunk-Größe: 100MB = 100 * 1024 * 1024 Bytes
+                            const CHUNK_SIZE_BYTES: u64 = 100 * 1024 * 1024;
+                            let bytes_downloaded = (chunks_downloaded as u64) * CHUNK_SIZE_BYTES;
+                            
+                            if elapsed > 0.5 { // Mindestens 0.5 Sekunden für stabile Berechnung
+                                bytes_downloaded as f64 / elapsed
+                            } else {
+                                // Verwende vorherige Geschwindigkeit, wenn Zeitfenster zu kurz
+                                existing.download_speed_bytes_per_sec
+                            }
                         } else {
-                            // Verwende vorherige Geschwindigkeit, wenn Zeitfenster zu kurz
+                            // Nicht genug Samples - verwende vorherige Geschwindigkeit
                             existing.download_speed_bytes_per_sec
                         }
                     } else {
