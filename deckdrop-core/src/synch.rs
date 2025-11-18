@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, Arc};
+use std::collections::hash_map::Entry;
 
 /// Manifest-Struktur für Download-Status
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -107,16 +109,43 @@ impl DownloadManifest {
         })
     }
     
-    /// Speichert das Manifest
+    /// Speichert das Manifest (nicht thread-safe, verwende update_manifest_atomic für thread-safe Updates)
     pub fn save(&self, manifest_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
         if let Some(parent) = manifest_path.parent() {
             fs::create_dir_all(parent)?;
         }
         
+        // Robustheit: Atomic Write (Temp-File → Rename) für Transaktions-Sicherheit
+        let temp_path = manifest_path.with_extension("json.tmp");
+        
         let json = serde_json::to_string_pretty(self)?;
-        fs::write(manifest_path, json)?;
+        fs::write(&temp_path, json)?;
+        
+        // Atomic Rename (atomar auf den meisten Dateisystemen)
+        fs::rename(&temp_path, manifest_path)?;
         
         Ok(())
+    }
+    
+    /// Atomares Update eines Manifests (thread-safe)
+    /// Führt Load-Modify-Save atomar durch, um Race Conditions zu vermeiden
+    pub fn update_manifest_atomic<F>(
+        manifest_path: &Path,
+        update_fn: F,
+    ) -> Result<Self, Box<dyn std::error::Error>>
+    where
+        F: FnOnce(&mut Self) -> Result<(), Box<dyn std::error::Error>>,
+    {
+        // Lade Manifest
+        let mut manifest = Self::load(manifest_path)?;
+        
+        // Führe Update durch
+        update_fn(&mut manifest)?;
+        
+        // Speichere atomar
+        manifest.save(manifest_path)?;
+        
+        Ok(manifest)
     }
     
     /// Lädt ein Manifest
