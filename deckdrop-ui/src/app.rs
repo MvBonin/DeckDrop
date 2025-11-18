@@ -2156,7 +2156,7 @@ impl DeckDropApp {
                             button("Details")
                                 .on_press(Message::ShowGameDetails(game_path_clone.clone(), game_info_clone.clone()))
                                 .style(button::primary)
-                                .width(Length::Fixed(scale(140.0))),
+                                .width(Length::Fixed(scale(180.0))),
                             // Download control buttons (only show if download is active and not complete)
                             if let Some(ds) = download_state {
                                 let game_id = ds.manifest.game_id.clone();
@@ -2173,20 +2173,20 @@ impl DeckDropApp {
                                             button("Pause")
                                                 .on_press(Message::PauseDownload(game_id.clone()))
                                                 .style(button::secondary)
-                                                .width(Length::Fixed(scale(140.0)))
+                                                .width(Length::Fixed(scale(180.0)))
                                         } else if can_resume {
                                             button("Resume")
                                                 .on_press(Message::ResumeDownload(game_id.clone()))
                                                 .style(button::secondary)
-                                                .width(Length::Fixed(scale(140.0)))
+                                                .width(Length::Fixed(scale(180.0)))
                                         } else {
                                             button("Downloading...")
                                                 .style(button::secondary)
-                                                .width(Length::Fixed(scale(140.0)))
+                                                .width(Length::Fixed(scale(180.0)))
                                         },
                                         button("Cancel")
                                             .on_press(Message::CancelDownload(game_id.clone()))
-                                            .width(Length::Fixed(scale(140.0))),
+                                            .width(Length::Fixed(scale(180.0))),
                                     ]
                                     .spacing(scale(4.0))
                                 } else {
@@ -2205,12 +2205,12 @@ impl DeckDropApp {
                                     if is_checking {
                                         button("Checking...")
                                             .style(button::secondary)
-                                            .width(Length::Fixed(scale(140.0)))
+                                            .width(Length::Fixed(scale(180.0)))
                                     } else {
                                         button("Check Integrity")
                                             .on_press(Message::CheckIntegrity(game_path_for_integrity.clone()))
                                             .style(button::secondary)
-                                            .width(Length::Fixed(scale(140.0)))
+                                            .width(Length::Fixed(scale(180.0)))
                                     },
                                 ]
                                 .spacing(scale(4.0))
@@ -2426,7 +2426,7 @@ impl DeckDropApp {
                                 button("Details")
                                     .on_press(Message::ShowGameDetails(network_game_path.clone(), game_info_for_details.clone()))
                                     .style(button::primary)
-                                    .width(Length::Fixed(scale(140.0))),
+                                    .width(Length::Fixed(scale(180.0))),
                                 // Download buttons
                                 if is_downloading {
                                     let (can_pause, can_resume) = if let Some(ds) = download_state {
@@ -2443,20 +2443,20 @@ impl DeckDropApp {
                                             button("Pause")
                                                 .on_press(Message::PauseDownload(game_id_clone.clone()))
                                                 .style(button::secondary)
-                                                .width(Length::Fixed(scale(140.0)))
+                                                .width(Length::Fixed(scale(180.0)))
                                         } else if can_resume {
                                             button("Resume")
                                                 .on_press(Message::ResumeDownload(game_id_clone.clone()))
                                                 .style(button::secondary)
-                                                .width(Length::Fixed(scale(140.0)))
+                                                .width(Length::Fixed(scale(180.0)))
                                         } else {
                                             button("Downloading...")
                                                 .style(button::secondary)
-                                                .width(Length::Fixed(scale(140.0)))
+                                                .width(Length::Fixed(scale(180.0)))
                                         },
                                         button("Cancel")
                                             .on_press(Message::CancelDownload(game_id_clone.clone()))
-                                            .width(Length::Fixed(scale(140.0))),
+                                            .width(Length::Fixed(scale(180.0))),
                                     ]
                                     .spacing(scale(4.0))
                                 } else {
@@ -2464,7 +2464,7 @@ impl DeckDropApp {
                                         button("Get this game")
                                             .on_press(Message::DownloadGame(game_id_clone.clone()))
                                             .style(button::primary)
-                                            .width(Length::Fixed(scale(140.0))),
+                                            .width(Length::Fixed(scale(180.0))),
                                     ]
                                     .spacing(scale(4.0))
                                 },
@@ -2870,173 +2870,225 @@ impl DeckDropApp {
                         .on_press(Message::BackFromDetails)
                         .style(button::secondary),
                     Space::with_width(Length::Fill),
-                    text("Game Details").size(scale_text(24.0)),
-                    Space::with_width(Length::Fill),
                 ]
-                .spacing(scale(8.0)),
-                Space::with_height(Length::Fixed(scale(15.0))),
-                // Game information
+                .spacing(scale(8.0))
+                .width(Length::Fill),
+                Space::with_height(Length::Fixed(scale(20.0))),
+                // Game title - large and prominent
                 container(
-                    column![
-                        text(&game_info.name).size(scale_text(20.0)),
-                        Space::with_height(Length::Fixed(scale(8.0))),
-                        row![
-                            text("Version:").size(scale_text(14.0)),
-                            Space::with_width(Length::Fixed(scale(8.0))),
-                            text(&game_info.version).size(scale_text(14.0)),
-                        ],
-                        Space::with_height(Length::Fixed(scale(8.0))),
-                        row![
-                            text("Game ID:").size(scale_text(14.0)),
-                            Space::with_width(Length::Fixed(scale(8.0))),
-                            text(&game_info.game_id).size(scale_text(12.0)),
-                        ],
-                        Space::with_height(Length::Fixed(scale(8.0))),
-                        row![
-                            text("Path:").size(scale_text(14.0)),
-                            Space::with_width(Length::Fixed(scale(8.0))),
-                            text(game_path.display().to_string()).size(scale_text(12.0)),
-                        ],
-                        Space::with_height(Length::Fixed(scale(8.0))),
-                        row![
-                            text("Start File:").size(scale_text(14.0)),
-                            Space::with_width(Length::Fixed(scale(8.0))),
-                            text(&game_info.start_file).size(scale_text(12.0)),
-                        ],
-                        if let Some(ref start_args) = game_info.start_args {
-                            column![
-                                Space::with_height(Length::Fixed(scale(8.0))),
-                                row![
-                                    text("Start Args:").size(scale_text(14.0)),
-                                    Space::with_width(Length::Fixed(scale(8.0))),
-                                    text(start_args).size(scale_text(12.0)),
-                                ],
+                    text(&game_info.name).size(scale_text(32.0))
+                )
+                .width(Length::Fill)
+                .padding(scale(20.0))
+                .style(container_box_style),
+                Space::with_height(Length::Fixed(scale(20.0))),
+                // Main content in two columns for better use of space
+                row![
+                    // Left column - Basic Information
+                    container(
+                        column![
+                            text("Basic Information").size(scale_text(18.0)),
+                            Space::with_height(Length::Fixed(scale(15.0))),
+                            row![
+                                text("Version:").size(scale_text(14.0)).width(Length::Fixed(scale(150.0))),
+                                text(&game_info.version).size(scale_text(14.0)),
                             ]
-                        } else {
-                            column![]
-                        },
-                        if let Some(ref description) = game_info.description {
+                            .width(Length::Fill),
+                            Space::with_height(Length::Fixed(scale(12.0))),
+                            row![
+                                text("Game ID:").size(scale_text(14.0)).width(Length::Fixed(scale(150.0))),
+                                text(&game_info.game_id).size(scale_text(12.0)),
+                            ]
+                            .width(Length::Fill),
+                            Space::with_height(Length::Fixed(scale(12.0))),
                             column![
-                                Space::with_height(Length::Fixed(scale(8.0))),
-                                text("Description:").size(scale_text(14.0)),
+                                text("Path:").size(scale_text(14.0)),
                                 Space::with_height(Length::Fixed(scale(4.0))),
-                                text(description).size(scale_text(12.0)),
+                                text(game_path.display().to_string()).size(scale_text(12.0)),
                             ]
-                        } else {
-                            column![]
-                        },
-                        if let Some(ref instructions) = game_info.additional_instructions {
+                            .width(Length::Fill),
+                            Space::with_height(Length::Fixed(scale(12.0))),
+                            row![
+                                text("Start File:").size(scale_text(14.0)).width(Length::Fixed(scale(150.0))),
+                                text(&game_info.start_file).size(scale_text(12.0)),
+                            ]
+                            .width(Length::Fill),
+                            if let Some(ref start_args) = game_info.start_args {
+                                column![
+                                    Space::with_height(Length::Fixed(scale(12.0))),
+                                    row![
+                                        text("Start Args:").size(scale_text(14.0)).width(Length::Fixed(scale(150.0))),
+                                        text(start_args).size(scale_text(12.0)),
+                                    ]
+                                    .width(Length::Fill),
+                                ]
+                            } else {
+                                column![]
+                            },
+                        ]
+                        .spacing(scale(8.0))
+                        .width(Length::Fill)
+                        .padding(scale(20.0))
+                    )
+                    .width(Length::Fill)
+                    .style(container_box_style),
+                    Space::with_width(Length::Fixed(scale(20.0))),
+                    // Right column - Status and Metadata
+                    container(
+                        column![
+                            text("Status & Metadata").size(scale_text(18.0)),
+                            Space::with_height(Length::Fixed(scale(15.0))),
+                            // Integrity status
                             column![
+                                text("Integrity Status:").size(scale_text(14.0)),
                                 Space::with_height(Length::Fixed(scale(8.0))),
-                                text("Additional Instructions:").size(scale_text(14.0)),
-                                Space::with_height(Length::Fixed(scale(4.0))),
-                                text(instructions).size(scale_text(12.0)),
-                            ]
-                        } else {
-                            column![]
-                        },
-                        if let Some(ref creator_peer_id) = game_info.creator_peer_id {
-                            column![
-                                Space::with_height(Length::Fixed(scale(8.0))),
-                                row![
-                                    text("Creator Peer ID:").size(scale_text(14.0)),
-                                    Space::with_width(Length::Fixed(scale(8.0))),
-                                    text(creator_peer_id).size(scale_text(12.0)),
-                                ],
-                            ]
-                        } else {
-                            column![]
-                        },
-                        if let Some(ref hash) = game_info.hash {
-                            column![
-                                Space::with_height(Length::Fixed(scale(8.0))),
-                                row![
-                                    text("Chunks Hash:").size(scale_text(14.0)),
-                                    Space::with_width(Length::Fixed(scale(8.0))),
-                                    text(hash).size(scale_text(10.0)),
-                                ],
-                            ]
-                        } else {
-                            column![]
-                        },
-                        Space::with_height(Length::Fixed(scale(15.0))),
-                        // Integrity status
-                        row![
-                            text("Integrity Status:").size(scale_text(14.0)),
-                            Space::with_width(Length::Fixed(scale(8.0))),
-                            match integrity_status {
-                                GameIntegrityStatus::NotChecked => {
-                                    text("Not checked").size(scale_text(12.0))
-                                        .style(|_theme: &Theme| {
-                                            iced::widget::text::Style {
-                                                color: Some(Color::from_rgba(0.7, 0.7, 0.7, 1.0)),
-                                            }
-                                        })
-                                }
-                                GameIntegrityStatus::Checking { current, total } => {
-                                    if *total > 0 {
-                                        text(format!("Checking... ({}/{})", current, total)).size(scale_text(12.0))
-                                            .style(|_theme: &Theme| {
-                                                iced::widget::text::Style {
-                                                    color: Some(Color::from_rgba(0.7, 0.7, 0.7, 1.0)),
-                                                }
-                                            })
-                                    } else {
-                                        text("Checking...").size(scale_text(12.0))
+                                match integrity_status {
+                                    GameIntegrityStatus::NotChecked => {
+                                        text("Not checked").size(scale_text(14.0))
                                             .style(|_theme: &Theme| {
                                                 iced::widget::text::Style {
                                                     color: Some(Color::from_rgba(0.7, 0.7, 0.7, 1.0)),
                                                 }
                                             })
                                     }
-                                }
-                                GameIntegrityStatus::Intact => {
-                                    text("Game files intact").size(scale_text(12.0))
-                                        .style(|_theme: &Theme| {
-                                            iced::widget::text::Style {
-                                                color: Some(Color::from_rgba(0.0, 1.0, 0.0, 1.0)),
-                                            }
-                                        })
-                                }
-                                GameIntegrityStatus::Changed => {
-                                    text("Game files have changed").size(scale_text(12.0))
-                                        .style(|_theme: &Theme| {
-                                            iced::widget::text::Style {
-                                                color: Some(Color::from_rgba(1.0, 0.7, 0.0, 1.0)),
-                                            }
-                                        })
-                                }
-                                GameIntegrityStatus::Error(ref e) => {
-                                    text(format!("Error: {}", e)).size(scale_text(12.0))
-                                        .style(|_theme: &Theme| {
-                                            iced::widget::text::Style {
-                                                color: Some(Color::from_rgba(1.0, 0.0, 0.0, 1.0)),
-                                            }
-                                        })
-                                }
+                                    GameIntegrityStatus::Checking { current, total } => {
+                                        if *total > 0 {
+                                            text(format!("Checking... ({}/{})", current, total)).size(scale_text(14.0))
+                                                .style(|_theme: &Theme| {
+                                                    iced::widget::text::Style {
+                                                        color: Some(Color::from_rgba(0.7, 0.7, 0.7, 1.0)),
+                                                    }
+                                                })
+                                        } else {
+                                            text("Checking...").size(scale_text(14.0))
+                                                .style(|_theme: &Theme| {
+                                                    iced::widget::text::Style {
+                                                        color: Some(Color::from_rgba(0.7, 0.7, 0.7, 1.0)),
+                                                    }
+                                                })
+                                        }
+                                    }
+                                    GameIntegrityStatus::Intact => {
+                                        text("Game files intact").size(scale_text(14.0))
+                                            .style(|_theme: &Theme| {
+                                                iced::widget::text::Style {
+                                                    color: Some(Color::from_rgba(0.0, 1.0, 0.0, 1.0)),
+                                                }
+                                            })
+                                    }
+                                    GameIntegrityStatus::Changed => {
+                                        text("Game files have changed").size(scale_text(14.0))
+                                            .style(|_theme: &Theme| {
+                                                iced::widget::text::Style {
+                                                    color: Some(Color::from_rgba(1.0, 0.7, 0.0, 1.0)),
+                                                }
+                                            })
+                                    }
+                                    GameIntegrityStatus::Error(ref e) => {
+                                        text(format!("Error: {}", e)).size(scale_text(14.0))
+                                            .style(|_theme: &Theme| {
+                                                iced::widget::text::Style {
+                                                    color: Some(Color::from_rgba(1.0, 0.0, 0.0, 1.0)),
+                                                }
+                                            })
+                                    }
+                                },
+                            ]
+                            .width(Length::Fill),
+                            // Download status if downloading
+                            if let Some(ds) = download_state {
+                                column![
+                                    Space::with_height(Length::Fixed(scale(20.0))),
+                                    text("Download Status:").size(scale_text(14.0)),
+                                    Space::with_height(Length::Fixed(scale(8.0))),
+                                    text(format!("Status: {:?}", ds.manifest.overall_status)).size(scale_text(12.0)),
+                                    Space::with_height(Length::Fixed(scale(4.0))),
+                                    text(format!("Progress: {:.1}%", ds.progress_percent)).size(scale_text(12.0)),
+                                    Space::with_height(Length::Fixed(scale(4.0))),
+                                    text(format!("Chunks: {}/{}", ds.manifest.progress.downloaded_chunks, ds.manifest.progress.total_chunks)).size(scale_text(12.0)),
+                                ]
+                                .width(Length::Fill)
+                            } else {
+                                column![]
                             },
-                        ],
-                        // Download status if downloading
-                        if let Some(ds) = download_state {
+                            if let Some(ref creator_peer_id) = game_info.creator_peer_id {
+                                column![
+                                    Space::with_height(Length::Fixed(scale(20.0))),
+                                    text("Creator Peer ID:").size(scale_text(14.0)),
+                                    Space::with_height(Length::Fixed(scale(4.0))),
+                                    text(creator_peer_id).size(scale_text(12.0)),
+                                ]
+                                .width(Length::Fill)
+                            } else {
+                                column![]
+                            },
+                            if let Some(ref hash) = game_info.hash {
+                                column![
+                                    Space::with_height(Length::Fixed(scale(20.0))),
+                                    text("Chunks Hash:").size(scale_text(14.0)),
+                                    Space::with_height(Length::Fixed(scale(4.0))),
+                                    text(hash).size(scale_text(10.0)),
+                                ]
+                                .width(Length::Fill)
+                            } else {
+                                column![]
+                            },
+                        ]
+                        .spacing(scale(8.0))
+                        .width(Length::Fill)
+                        .padding(scale(20.0))
+                    )
+                    .width(Length::Fill)
+                    .style(container_box_style),
+                ]
+                .width(Length::Fill),
+                // Description and Instructions - full width
+                if game_info.description.is_some() || game_info.additional_instructions.is_some() {
+                    column![
+                        Space::with_height(Length::Fixed(scale(20.0))),
+                        if let Some(ref description) = game_info.description {
+                            container(
+                                column![
+                                    text("Description").size(scale_text(18.0)),
+                                    Space::with_height(Length::Fixed(scale(12.0))),
+                                    text(description).size(scale_text(14.0)),
+                                ]
+                                .spacing(scale(8.0))
+                                .width(Length::Fill)
+                                .padding(scale(20.0))
+                            )
+                            .width(Length::Fill)
+                            .style(container_box_style)
+                        } else {
+                            container(column![]).width(Length::Fill)
+                        },
+                        if let Some(ref instructions) = game_info.additional_instructions {
                             column![
-                                Space::with_height(Length::Fixed(scale(15.0))),
-                                text("Download Status:").size(scale_text(14.0)),
-                                Space::with_height(Length::Fixed(scale(4.0))),
-                                text(format!("Status: {:?}", ds.manifest.overall_status)).size(scale_text(12.0)),
-                                text(format!("Progress: {:.1}%", ds.progress_percent)).size(scale_text(12.0)),
-                                text(format!("Chunks: {}/{}", ds.manifest.progress.downloaded_chunks, ds.manifest.progress.total_chunks)).size(scale_text(12.0)),
+                                Space::with_height(Length::Fixed(scale(20.0))),
+                                container(
+                                    column![
+                                        text("Additional Instructions").size(scale_text(18.0)),
+                                        Space::with_height(Length::Fixed(scale(12.0))),
+                                        text(instructions).size(scale_text(14.0)),
+                                    ]
+                                    .spacing(scale(8.0))
+                                    .width(Length::Fill)
+                                    .padding(scale(20.0))
+                                )
+                                .width(Length::Fill)
+                                .style(container_box_style)
                             ]
                         } else {
                             column![]
                         },
                     ]
-                    .spacing(scale(8.0))
-                    .padding(scale(15.0))
-                )
-                .style(container_box_style),
+                } else {
+                    column![]
+                },
             ]
             .spacing(scale(15.0))
-            .padding(scale(15.0));
+            .padding(scale(20.0))
+            .width(Length::Fill);
             
             scrollable(details_column)
                 .width(Length::Fill)
