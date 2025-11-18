@@ -198,12 +198,14 @@ impl From<libp2p::request_response::Event<GamesListRequest, GamesListResponse>> 
 
 /// Request zum Abfragen der Metadaten eines Spiels (deckdrop.toml und deckdrop_chunks.toml)
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub struct GameMetadataRequest {
     pub game_id: String,
 }
 
 /// Response mit den Metadaten eines Spiels
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub struct GameMetadataResponse {
     pub deckdrop_toml: String,
     pub deckdrop_chunks_toml: String,
@@ -211,6 +213,7 @@ pub struct GameMetadataResponse {
 
 /// Codec für Game-Metadaten-Requests/Responses
 #[derive(Clone, Default)]
+#[allow(dead_code)]
 pub struct GameMetadataCodec;
 
 #[async_trait::async_trait]
@@ -281,9 +284,11 @@ impl Codec for GameMetadataCodec {
 }
 
 /// Network Behaviour für Game-Metadaten
+#[allow(dead_code)]
 pub type GameMetadataBehaviour = libp2p::request_response::Behaviour<GameMetadataCodec>;
 
 /// Erstellt ein GameMetadataBehaviour
+#[allow(dead_code)]
 pub fn create_game_metadata_behaviour() -> GameMetadataBehaviour {
     let config = libp2p::request_response::Config::default()
         // Robustheit: Erhöhe Timeout auf 60 Sekunden für größere Daten und langsamere Verbindungen
@@ -301,12 +306,14 @@ pub fn create_game_metadata_behaviour() -> GameMetadataBehaviour {
 
 /// Request zum Abfragen eines Chunks
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub struct ChunkRequest {
     pub chunk_hash: String,  // Blake3 Hash im Format "{hash}:{chunk_index}"
 }
 
 /// Response mit Chunk-Daten
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub struct ChunkResponse {
     pub chunk_hash: String,   // Der Hash des Chunks (zur Identifikation)
     pub chunk_data: Vec<u8>,  // Die Chunk-Daten (max 10MB)
@@ -314,6 +321,7 @@ pub struct ChunkResponse {
 
 /// Codec für Chunk-Requests/Responses
 #[derive(Clone, Default)]
+#[allow(dead_code)]
 pub struct ChunkCodec;
 
 #[async_trait::async_trait]
@@ -402,9 +410,11 @@ impl Codec for ChunkCodec {
 }
 
 /// Network Behaviour für Chunks
+#[allow(dead_code)]
 pub type ChunkBehaviour = libp2p::request_response::Behaviour<ChunkCodec>;
 
 /// Erstellt ein ChunkBehaviour
+#[allow(dead_code)]
 pub fn create_chunk_behaviour() -> ChunkBehaviour {
     let config = libp2p::request_response::Config::default()
         // Robustheit: Erhöhe Timeout auf 300 Sekunden (5 Minuten) für große Chunks
@@ -754,12 +764,14 @@ mod tests {
 
 /// Request zum Abfragen der Metadaten eines Spiels (deckdrop.toml und deckdrop_chunks.toml)
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub struct GameMetadataRequest {
     pub game_id: String,
 }
 
 /// Response mit den Metadaten eines Spiels
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub struct GameMetadataResponse {
     pub deckdrop_toml: String,
     pub deckdrop_chunks_toml: String,
@@ -767,6 +779,7 @@ pub struct GameMetadataResponse {
 
 /// Codec für Game-Metadaten-Requests/Responses
 #[derive(Clone, Default)]
+#[allow(dead_code)]
 pub struct GameMetadataCodec;
 
 #[async_trait::async_trait]
@@ -837,9 +850,11 @@ impl Codec for GameMetadataCodec {
 }
 
 /// Network Behaviour für Game-Metadaten
+#[allow(dead_code)]
 pub type GameMetadataBehaviour = libp2p::request_response::Behaviour<GameMetadataCodec>;
 
 /// Erstellt ein GameMetadataBehaviour
+#[allow(dead_code)]
 pub fn create_game_metadata_behaviour() -> GameMetadataBehaviour {
     let config = libp2p::request_response::Config::default()
         // Robustheit: Erhöhe Timeout auf 60 Sekunden für größere Daten und langsamere Verbindungen
@@ -857,12 +872,14 @@ pub fn create_game_metadata_behaviour() -> GameMetadataBehaviour {
 
 /// Request zum Abfragen eines Chunks
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub struct ChunkRequest {
     pub chunk_hash: String,  // Blake3 Hash im Format "{hash}:{chunk_index}"
 }
 
 /// Response mit Chunk-Daten
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub struct ChunkResponse {
     pub chunk_hash: String,   // Der Hash des Chunks (zur Identifikation)
     pub chunk_data: Vec<u8>,  // Die Chunk-Daten (max 10MB)
@@ -870,6 +887,7 @@ pub struct ChunkResponse {
 
 /// Codec für Chunk-Requests/Responses
 #[derive(Clone, Default)]
+#[allow(dead_code)]
 pub struct ChunkCodec;
 
 #[async_trait::async_trait]
@@ -958,9 +976,11 @@ impl Codec for ChunkCodec {
 }
 
 /// Network Behaviour für Chunks
+#[allow(dead_code)]
 pub type ChunkBehaviour = libp2p::request_response::Behaviour<ChunkCodec>;
 
 /// Erstellt ein ChunkBehaviour
+#[allow(dead_code)]
 pub fn create_chunk_behaviour() -> ChunkBehaviour {
     let config = libp2p::request_response::Config::default()
         // Robustheit: Erhöhe Timeout auf 300 Sekunden (5 Minuten) für große Chunks
