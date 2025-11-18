@@ -434,6 +434,11 @@ pub enum Message {
     // Progress update for adding games (chunk generation)
     UpdateAddGameProgress(usize, usize, String), // current, total, current_file
     AddGameChunksGenerated(PathBuf, Result<String, String>), // game_path, hash_result
+    
+    // System Tray
+    ShowWindow,
+    HideWindow,
+    Quit,
 }
 
 impl DeckDropApp {
@@ -1188,6 +1193,30 @@ impl DeckDropApp {
                     }
                 }
                 
+                // Check for Window operations from System-Tray (non-blocking) via global access
+                if let Some(rx) = crate::get_window_op_rx() {
+                    if let Ok(mut rx) = rx.lock() {
+                        while let Ok(msg) = rx.try_recv() {
+                            // Verarbeite Window-Operationen direkt
+                            match msg {
+                                Message::ShowWindow => {
+                                    // Window wird über plattformspezifische APIs sichtbar gemacht
+                                    crate::window_control::show_window();
+                                }
+                                Message::HideWindow => {
+                                    // Window wird über plattformspezifische APIs versteckt
+                                    crate::window_control::hide_window();
+                                }
+                                Message::Quit => {
+                                    // Beende die Anwendung
+                                    std::process::exit(0);
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+                
                 // Check for add game progress updates
                 if let Some(game_path) = &self.add_game_generating {
                     if let Ok(tracker) = self.add_game_progress_tracker.lock() {
@@ -1265,6 +1294,18 @@ impl DeckDropApp {
                 
                 // Don't create additional Tick tasks - the subscription in main.rs already sends Ticks every 100ms
                 // This prevents task cascades that slow down the application
+            }
+            Message::ShowWindow => {
+                // Window wird über plattformspezifische APIs sichtbar gemacht
+                crate::window_control::show_window();
+            }
+            Message::HideWindow => {
+                // Window wird über plattformspezifische APIs versteckt
+                crate::window_control::hide_window();
+            }
+            Message::Quit => {
+                // Beende die Anwendung
+                std::process::exit(0);
             }
         }
         Task::none()

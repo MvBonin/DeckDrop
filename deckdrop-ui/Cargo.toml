@@ -21,4 +21,9 @@ libp2p = { version = "0.54", features = ["identify"] }
 async-channel = "2"
 rfd = "0.14"
 futures-timer = "3.0"
+tray-icon = "0.21"
+image = "0.25"
+
+[target.'cfg(windows)'.dependencies]
+winapi = { version = "0.3", features = ["winuser"] }
 

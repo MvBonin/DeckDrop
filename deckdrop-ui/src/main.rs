@@ -2,17 +2,34 @@
 
 mod app;
 mod network_bridge;
+mod window_control;
 
 use app::{DeckDropApp, Message};
 use iced::application;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use std::env;
+use std::path::PathBuf;
+use std::sync::mpsc as std_mpsc;
+
+/// Globaler Window-Operation-Receiver (für einfachen Zugriff)
+static WINDOW_OP_RX: std::sync::OnceLock<Arc<std::sync::Mutex<std_mpsc::Receiver<Message>>>> = std::sync::OnceLock::new();
+
+/// Setzt den globalen Window-Operation-Receiver
+fn set_window_op_rx(rx: Arc<std::sync::Mutex<std_mpsc::Receiver<Message>>>) {
+    let _ = WINDOW_OP_RX.set(rx);
+}
+
+/// Gibt den globalen Window-Operation-Receiver zurück
+pub fn get_window_op_rx() -> Option<Arc<std::sync::Mutex<std_mpsc::Receiver<Message>>>> {
+    WINDOW_OP_RX.get().cloned()
+}
 
 fn main() -> iced::Result {
     // Prüfe Command-Line-Argumente
     let args: Vec<String> = env::args().collect();
     let random_id = args.iter().any(|arg| arg == "--random-id" || arg == "-random-id");
+    let background = args.iter().any(|arg| arg == "--background" || arg == "-background" || arg == "--minimized" || arg == "-minimized");
     
     // Wenn --random-id gesetzt ist, generiere eine neue Peer-ID
     if random_id {
@@ -79,6 +96,18 @@ fn main() -> iced::Result {
     // Setze Metadata Update Sender global
     network_bridge::set_metadata_update_tx(network_bridge.metadata_update_tx);
     
+    // Erstelle Channel für Window-Operationen vom System-Tray
+    let (window_op_tx, window_op_rx) = std_mpsc::channel::<Message>();
+    let window_op_rx = Arc::new(std::sync::Mutex::new(window_op_rx));
+    
+    // Setze globalen Window-Operation-Receiver (für Zugriff in app.rs)
+    set_window_op_rx(window_op_rx.clone());
+    
+    // Initialisiere System-Tray-Icon
+    if let Err(e) = init_system_tray(window_op_tx) {
+        eprintln!("Warnung: System-Tray-Icon konnte nicht initialisiert werden: {}", e);
+    }
+    
     application(
         "DeckDrop",
         DeckDropApp::update,
@@ -87,6 +116,7 @@ fn main() -> iced::Result {
     .theme(|_state: &DeckDropApp| iced::Theme::Dark)
     .subscription(|_state: &DeckDropApp| {
         // Periodischer Tick für Event-Polling (alle 100ms)
+        // Window-Operationen werden über den Tick-Mechanismus in app.rs abgefragt
         use iced::Subscription;
         use iced::futures::StreamExt;
         use iced::futures::stream;
@@ -106,19 +136,94 @@ fn main() -> iced::Result {
     .window(iced::window::Settings {
         size: iced::Size::new(800.0, 600.0),
         min_size: Some(iced::Size::new(640.0, 480.0)),
+        visible: !background, // Fenster verstecken, wenn --background gesetzt ist
         ..Default::default()
     })
     .run()
 }
 
-/// Subscription für Network-Events
-/// 
-/// Da die Iced Subscription API kompliziert ist, verwenden wir einen einfacheren Ansatz:
-/// Events werden über den Tick-Mechanismus abgefragt (siehe app.rs update für Message::Tick)
-fn network_subscription(
-    _event_rx: Arc<std::sync::Mutex<mpsc::Receiver<deckdrop_network::network::discovery::DiscoveryEvent>>>,
-) -> iced::Subscription<Message> {
-    // Leere Subscription - Events werden über Tick abgefragt
-    iced::Subscription::none()
+/// Initialisiert das System-Tray-Icon
+fn init_system_tray(window_op_tx: std_mpsc::Sender<Message>) -> Result<(), Box<dyn std::error::Error>> {
+    use tray_icon::{TrayIconBuilder, menu::{Menu, MenuItem}};
+    use image::ImageReader;
+    
+    // Lade Icon aus assets
+    let icon_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().join("assets").join("deckdrop.png");
+    
+    // Lade Icon
+    let icon = if icon_path.exists() {
+        // Lade PNG mit image crate
+        let img = ImageReader::open(&icon_path)?.decode()?;
+        let rgba = img.to_rgba8();
+        let width = rgba.width();
+        let height = rgba.height();
+        tray_icon::Icon::from_rgba(rgba.into_raw(), width, height)?
+    } else {
+        // Fallback: Erstelle ein einfaches Icon
+        eprintln!("Warnung: Icon nicht gefunden unter {:?}, verwende Standard-Icon", icon_path);
+        // Erstelle ein einfaches 16x16 Icon
+        let rgba = vec![255u8; 16 * 16 * 4];
+        tray_icon::Icon::from_rgba(rgba, 16, 16)?
+    };
+    
+    // Erstelle Menü
+    let mut menu = Menu::new();
+    
+    let show_item = MenuItem::new("Fenster anzeigen", true, None);
+    let hide_item = MenuItem::new("Fenster verstecken", true, None);
+    let quit_item = MenuItem::new("Beenden", true, None);
+    
+    // Speichere IDs vor dem move
+    let show_id = show_item.id();
+    let hide_id = hide_item.id();
+    let quit_id = quit_item.id();
+    
+    menu.append(&show_item)?;
+    menu.append(&hide_item)?;
+    menu.append(&quit_item)?;
+    
+    // Erstelle Tray-Icon
+    let _tray_icon = TrayIconBuilder::new()
+        .with_icon(icon)
+        .with_tooltip("DeckDrop")
+        .with_menu(Box::new(menu))
+        .build()?;
+    
+    // Starte Thread für Tray-Events
+    // Die IDs werden vor dem move kopiert
+    let show_id_clone = show_id.clone();
+    let hide_id_clone = hide_id.clone();
+    let quit_id_clone = quit_id.clone();
+    std::thread::spawn(move || {
+        use tray_icon::{TrayIconEvent, menu::MenuEvent};
+        
+        loop {
+            // Prüfe auf Tray-Icon-Events
+            if let Ok(event) = TrayIconEvent::receiver().try_recv() {
+                match event {
+                    TrayIconEvent::Click { .. } => {
+                        // Bei Klick: Fenster anzeigen/verstecken umschalten
+                        let _ = window_op_tx.send(Message::ShowWindow);
+                    }
+                    _ => {}
+                }
+            }
+            
+            // Prüfe auf Menü-Events
+            if let Ok(event) = MenuEvent::receiver().try_recv() {
+                if event.id == show_id_clone {
+                    let _ = window_op_tx.send(Message::ShowWindow);
+                } else if event.id == hide_id_clone {
+                    let _ = window_op_tx.send(Message::HideWindow);
+                } else if event.id == quit_id_clone {
+                    let _ = window_op_tx.send(Message::Quit);
+                }
+            }
+            
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    });
+    
+    Ok(())
 }
 
