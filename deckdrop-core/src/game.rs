@@ -1,8 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::io::Read;
-use hex;
 
 /// Struktur für Spiel-Informationen
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -387,7 +385,7 @@ mod tests {
         let game_info = GameInfo::default();
         
         assert!(!game_info.game_id.is_empty(), "Default GameInfo sollte eine game_id haben");
-        assert_eq!(game_info.version, "1.0");
+        assert_eq!(game_info.version, initial_version()); // Standard-Version ist jetzt "1"
         assert_eq!(game_info.name, "");
     }
 
@@ -445,6 +443,28 @@ mod tests {
         // Wenn game_id leer war, sollte sie durch default generiert werden
         // Aber in diesem Fall ist sie explizit leer, also testen wir die Serialisierung
         assert!(toml_string.contains("name = \"Test\""));
+    }
+
+    #[test]
+    fn test_initial_version() {
+        // Test: initial_version() sollte immer "1" zurückgeben
+        assert_eq!(initial_version(), "1");
+    }
+
+    #[test]
+    fn test_increment_version() {
+        // Test: increment_version sollte die Version korrekt inkrementieren
+        assert_eq!(increment_version("1"), "2");
+        assert_eq!(increment_version("2"), "3");
+        assert_eq!(increment_version("10"), "11");
+        
+        // Test: Sollte auch mit "1.0" funktionieren (extrahiert erste Zahl)
+        assert_eq!(increment_version("1.0"), "2");
+        assert_eq!(increment_version("1.2.3"), "2");
+        
+        // Test: Fallback für ungültige Versionen
+        let result = increment_version("invalid");
+        assert_eq!(result, "2"); // Fallback sollte "2" sein
     }
 
     #[test]
