@@ -45,12 +45,40 @@ pub fn generate_game_id() -> String {
     format!("{:x}", hasher.finish())
 }
 
+/// Gibt die initiale Version zurück (immer "1")
+pub fn initial_version() -> String {
+    "1".to_string()
+}
+
+/// Inkrementiert die aktuelle Version
+/// 
+/// Parst die Version als Integer und erhöht sie um 1.
+/// Falls die Version nicht geparst werden kann, wird "2" zurückgegeben.
+pub fn increment_version(current_version: &str) -> String {
+    // Versuche, die Version als Integer zu parsen
+    if let Ok(version_num) = current_version.parse::<u32>() {
+        (version_num + 1).to_string()
+    } else {
+        // Falls Parsing fehlschlägt, versuche die erste Zahl zu extrahieren
+        // z.B. "1.0" -> "1" -> "2", oder "1.2.3" -> "1" -> "2"
+        if let Some(first_digit) = current_version.chars().next() {
+            if first_digit.is_ascii_digit() {
+                if let Ok(version_num) = first_digit.to_string().parse::<u32>() {
+                    return (version_num + 1).to_string();
+                }
+            }
+        }
+        // Fallback: Wenn gar nichts funktioniert, gib "2" zurück
+        "2".to_string()
+    }
+}
+
 impl Default for GameInfo {
     fn default() -> Self {
         Self {
             game_id: generate_game_id(),
             name: String::new(),
-            version: "1.0".to_string(),
+            version: initial_version(),
             start_file: String::new(),
             start_args: None,
             description: None,

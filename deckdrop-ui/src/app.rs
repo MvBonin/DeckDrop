@@ -123,6 +123,15 @@ pub struct DeckDropApp {
     
     // License Dialog fields
     pub license_player_name: String,
+    
+    // Game Edit fields (for Creator)
+    pub editing_game: bool,
+    pub edit_game_name: String,
+    pub edit_game_start_file: String,
+    pub edit_game_start_args: String,
+    pub edit_game_description: String,
+    pub edit_game_additional_instructions: String,
+    pub edit_game_path: Option<PathBuf>, // Path of game being edited
 }
 
 /// Tab selection
@@ -369,6 +378,13 @@ impl Default for DeckDropApp {
             settings_player_name: config.player_name.clone(),
             settings_download_path: config.download_path.to_string_lossy().to_string(),
             license_player_name: config.player_name.clone(),
+            editing_game: false,
+            edit_game_name: String::new(),
+            edit_game_start_file: String::new(),
+            edit_game_start_args: String::new(),
+            edit_game_description: String::new(),
+            edit_game_additional_instructions: String::new(),
+            edit_game_path: None,
         }
     }
 }
@@ -439,6 +455,17 @@ pub enum Message {
     ShowWindow,
     HideWindow,
     Quit,
+    
+    // Game Edit (for Creator)
+    EditGame,
+    EditGameNameChanged(String),
+    EditGameStartFileChanged(String),
+    BrowseEditStartFile,
+    EditGameStartArgsChanged(String),
+    EditGameDescriptionChanged(String),
+    EditGameAdditionalInstructionsChanged(String),
+    SaveGameEdit,
+    CancelGameEdit,
 }
 
 impl DeckDropApp {
@@ -583,6 +610,13 @@ impl DeckDropApp {
             settings_player_name: config.player_name.clone(),
             settings_download_path: config.download_path.to_string_lossy().to_string(),
             license_player_name: config.player_name.clone(),
+            editing_game: false,
+            edit_game_name: String::new(),
+            edit_game_start_file: String::new(),
+            edit_game_start_args: String::new(),
+            edit_game_description: String::new(),
+            edit_game_additional_instructions: String::new(),
+            edit_game_path: None,
         }
     }
 
@@ -750,7 +784,7 @@ impl DeckDropApp {
                 let mut game_info = GameInfo {
                     game_id: deckdrop_core::game::generate_game_id(),
                     name: self.add_game_name.clone(),
-                    version: if self.add_game_version.is_empty() { "1.0".to_string() } else { self.add_game_version.clone() },
+                    version: deckdrop_core::game::initial_version(), // Immer "1" für neues Spiel
                     start_file: self.add_game_start_file.clone(),
                     start_args: if self.add_game_start_args.is_empty() { None } else { Some(self.add_game_start_args.clone()) },
                     description: if self.add_game_description.is_empty() { None } else { Some(self.add_game_description.clone()) },
@@ -974,8 +1008,9 @@ impl DeckDropApp {
             Message::AddGameNameChanged(name) => {
                 self.add_game_name = name;
             }
-            Message::AddGameVersionChanged(version) => {
-                self.add_game_version = version;
+            Message::AddGameVersionChanged(_version) => {
+                // Version ist nicht änderbar - immer "1" für neues Spiel
+                // Ignoriere Änderungen
             }
             Message::AddGameStartFileChanged(start_file) => {
                 // If user enters an absolute path that's within game_path, convert to relative
@@ -1061,7 +1096,7 @@ impl DeckDropApp {
                 let game_info = GameInfo {
                     game_id: deckdrop_core::game::generate_game_id(),
                     name: self.add_game_name.clone(),
-                    version: if self.add_game_version.is_empty() { "1.0".to_string() } else { self.add_game_version.clone() },
+                    version: deckdrop_core::game::initial_version(), // Immer "1" für neues Spiel
                     start_file: self.add_game_start_file.clone(),
                     start_args: if self.add_game_start_args.is_empty() { None } else { Some(self.add_game_start_args.clone()) },
                     description: if self.add_game_description.is_empty() { None } else { Some(self.add_game_description.clone()) },
@@ -1306,6 +1341,129 @@ impl DeckDropApp {
             Message::Quit => {
                 // Beende die Anwendung
                 std::process::exit(0);
+            }
+            Message::EditGame => {
+                // Starte Bearbeitungsmodus
+                if let Some((game_path, game_info)) = &self.current_game_details {
+                    // Prüfe, ob der aktuelle Benutzer der Creator ist
+                    let is_creator = game_info.creator_peer_id.as_ref()
+                        .and_then(|creator_id| self.config.peer_id.as_ref().map(|my_id| creator_id == my_id))
+                        .unwrap_or(false);
+                    
+                    if is_creator {
+                        self.editing_game = true;
+                        self.edit_game_path = Some(game_path.clone());
+                        self.edit_game_name = game_info.name.clone();
+                        self.edit_game_start_file = game_info.start_file.clone();
+                        self.edit_game_start_args = game_info.start_args.clone().unwrap_or_default();
+                        self.edit_game_description = game_info.description.clone().unwrap_or_default();
+                        self.edit_game_additional_instructions = game_info.additional_instructions.clone().unwrap_or_default();
+                    }
+                }
+            }
+            Message::EditGameNameChanged(name) => {
+                self.edit_game_name = name;
+            }
+            Message::EditGameStartFileChanged(start_file) => {
+                self.edit_game_start_file = start_file;
+            }
+            Message::BrowseEditStartFile => {
+                if let Some(game_path) = &self.edit_game_path {
+                    if !game_path.exists() {
+                        eprintln!("Error: Game path does not exist: {}", game_path.display());
+                        return Task::none();
+                    }
+                    
+                    // Open file dialog starting from game path
+                    if let Some(selected_file) = rfd::FileDialog::new()
+                        .set_title("Select Game Executable")
+                        .set_directory(game_path)
+                        .pick_file()
+                    {
+                        // Convert to relative path from game_path
+                        if let Ok(relative_path) = selected_file.strip_prefix(game_path) {
+                            // Convert to forward slashes for cross-platform compatibility
+                            let relative_str = relative_path.to_string_lossy().replace('\\', "/");
+                            self.edit_game_start_file = relative_str;
+                        } else {
+                            eprintln!("Error: Selected file is not within game path");
+                        }
+                    }
+                }
+            }
+            Message::EditGameStartArgsChanged(args) => {
+                self.edit_game_start_args = args;
+            }
+            Message::EditGameDescriptionChanged(description) => {
+                self.edit_game_description = description;
+            }
+            Message::EditGameAdditionalInstructionsChanged(instructions) => {
+                self.edit_game_additional_instructions = instructions;
+            }
+            Message::SaveGameEdit => {
+                if let Some(game_path) = &self.edit_game_path {
+                    // Lade aktuelle GameInfo
+                    if let Ok(mut game_info) = GameInfo::load_from_path(game_path) {
+                        // Prüfe, ob der aktuelle Benutzer der Creator ist
+                        let is_creator = game_info.creator_peer_id.as_ref()
+                            .and_then(|creator_id| self.config.peer_id.as_ref().map(|my_id| creator_id == my_id))
+                            .unwrap_or(false);
+                        
+                        if is_creator {
+                            // Aktualisiere Felder
+                            game_info.name = self.edit_game_name.clone();
+                            game_info.start_file = self.edit_game_start_file.clone();
+                            game_info.start_args = if self.edit_game_start_args.is_empty() {
+                                None
+                            } else {
+                                Some(self.edit_game_start_args.clone())
+                            };
+                            game_info.description = if self.edit_game_description.is_empty() {
+                                None
+                            } else {
+                                Some(self.edit_game_description.clone())
+                            };
+                            game_info.additional_instructions = if self.edit_game_additional_instructions.is_empty() {
+                                None
+                            } else {
+                                Some(self.edit_game_additional_instructions.clone())
+                            };
+                            
+                            // Inkrementiere Version
+                            game_info.version = deckdrop_core::game::increment_version(&game_info.version);
+                            
+                            // Speichere aktualisierte GameInfo
+                            if let Err(e) = game_info.save_to_path(game_path) {
+                                eprintln!("Fehler beim Speichern der Bearbeitung: {}", e);
+                            } else {
+                                // Aktualisiere current_game_details mit neuer Version
+                                if let Some((_, old_info)) = &mut self.current_game_details {
+                                    *old_info = game_info.clone();
+                                }
+                                
+                                // Aktualisiere auch in my_games
+                                if let Some((_, stored_info)) = self.my_games.iter_mut()
+                                    .find(|(path, _)| path == game_path) {
+                                    *stored_info = game_info;
+                                }
+                                
+                                // Beende Bearbeitungsmodus
+                                self.editing_game = false;
+                                self.edit_game_path = None;
+                            }
+                        }
+                    }
+                }
+            }
+            Message::CancelGameEdit => {
+                // Beende Bearbeitungsmodus ohne zu speichern
+                self.editing_game = false;
+                self.edit_game_path = None;
+                self.edit_game_name = String::new();
+                self.edit_game_start_file = String::new();
+                self.edit_game_start_args = String::new();
+                self.edit_game_description = String::new();
+                self.edit_game_additional_instructions = String::new();
             }
         }
         Task::none()
@@ -2827,9 +2985,13 @@ impl DeckDropApp {
                                 .padding(scale(8.0)),
                             Space::with_height(Length::Fixed(scale(8.0))),
                             text("Version:").size(scale_text(14.0)),
-                            text_input("Version (default: 1.0)", &self.add_game_version)
-                                .on_input(Message::AddGameVersionChanged)
-                                .padding(scale(8.0)),
+                            text(deckdrop_core::game::initial_version())
+                                .size(scale_text(14.0))
+                                .style(|_theme: &Theme| {
+                                    iced::widget::text::Style {
+                                        color: Some(Color::from_rgba(0.6, 0.6, 0.6, 1.0)),
+                                    }
+                                }), // Read-only: Immer "1" für neues Spiel
                             Space::with_height(Length::Fixed(scale(8.0))),
                             text("Start Args (optional):").size(scale_text(14.0)),
                             text_input("Start Args", &self.add_game_start_args)
@@ -2942,6 +3104,11 @@ impl DeckDropApp {
             let is_network_game = !is_local_game && self.network_games.contains_key(&game_info.game_id);
             let is_downloading = download_state.is_some();
             
+            // Prüfe, ob der aktuelle Benutzer der Creator ist
+            let is_creator = game_info.creator_peer_id.as_ref()
+                .and_then(|creator_id| self.config.peer_id.as_ref().map(|my_id| creator_id == my_id))
+                .unwrap_or(false);
+            
             let details_column = column![
                 // Header with back button and action buttons (outside the frame)
                 {
@@ -2963,6 +3130,13 @@ impl DeckDropApp {
                                 .on_press(Message::CheckIntegrity(game_path.clone()))
                                 .style(button::secondary));
                         }
+                        
+                        // Show Edit button if user is creator
+                        if is_creator && !self.editing_game {
+                            header_row = header_row.push(button("Edit")
+                                .on_press(Message::EditGame)
+                                .style(button::primary));
+                        }
                     } else if is_network_game && !is_downloading {
                         // Network game without download: show Download button
                         header_row = header_row.push(button("Download")
@@ -2979,8 +3153,20 @@ impl DeckDropApp {
                 container(
                     column![
                         Space::with_height(Length::Fixed(scale(20.0))),
-                        // Game title - large and prominent
-                        text(&game_info.name).size(scale_text(36.0)),
+                        // Game title - large and prominent (editierbar im Bearbeitungsmodus)
+                        if self.editing_game {
+                            column![
+                                text("Name:").size(scale_text(14.0)),
+                                text_input("Name", &self.edit_game_name)
+                                    .on_input(Message::EditGameNameChanged)
+                                    .padding(scale(8.0)),
+                            ]
+                            .spacing(scale(8.0))
+                        } else {
+                            column![
+                                text(&game_info.name).size(scale_text(36.0)),
+                            ]
+                        },
                         Space::with_height(Length::Fixed(scale(8.0))),
                         text(&game_info.version).size(scale_text(16.0))
                             .style(|_theme: &Theme| {
@@ -2988,6 +3174,19 @@ impl DeckDropApp {
                                     color: Some(Color::from_rgba(0.7, 0.7, 0.7, 1.0)),
                                 }
                             }),
+                        if self.editing_game {
+                            column![
+                                text(format!("Neue Version: {}", deckdrop_core::game::increment_version(&game_info.version)))
+                                    .size(scale_text(12.0))
+                                    .style(|_theme: &Theme| {
+                                        iced::widget::text::Style {
+                                            color: Some(Color::from_rgba(0.5, 0.8, 1.0, 1.0)),
+                                        }
+                                    }),
+                            ]
+                        } else {
+                            column![]
+                        },
                         Space::with_height(Length::Fixed(scale(30.0))),
                         // Main content in two columns for better use of space
                         row![
@@ -3024,34 +3223,70 @@ impl DeckDropApp {
                                 ]
                                 .width(Length::Fill),
                                 Space::with_height(Length::Fixed(scale(16.0))),
-                                row![
-                                    text("Start File").size(scale_text(13.0))
-                                        .style(|_theme: &Theme| {
-                                            iced::widget::text::Style {
-                                                color: Some(Color::from_rgba(0.6, 0.6, 0.6, 1.0)),
-                                            }
-                                        })
-                                        .width(Length::Fixed(scale(140.0))),
-                                    text(&game_info.start_file).size(scale_text(13.0)),
-                                ]
-                                .width(Length::Fill),
-                                if let Some(ref start_args) = game_info.start_args {
+                                if self.editing_game {
                                     column![
+                                        text("Start File:").size(scale_text(13.0))
+                                            .style(|_theme: &Theme| {
+                                                iced::widget::text::Style {
+                                                    color: Some(Color::from_rgba(0.6, 0.6, 0.6, 1.0)),
+                                                }
+                                            }),
+                                        Space::with_height(Length::Fixed(scale(6.0))),
+                                        row![
+                                            text_input("Start File", &self.edit_game_start_file)
+                                                .on_input(Message::EditGameStartFileChanged)
+                                                .padding(scale(8.0)),
+                                            button("Browse...")
+                                                .on_press(Message::BrowseEditStartFile)
+                                                .padding(scale(8.0)),
+                                        ]
+                                        .spacing(scale(8.0)),
                                         Space::with_height(Length::Fixed(scale(16.0))),
-                                        column![
-                                            text("Start Args").size(scale_text(13.0))
+                                        text("Start Args:").size(scale_text(13.0))
+                                            .style(|_theme: &Theme| {
+                                                iced::widget::text::Style {
+                                                    color: Some(Color::from_rgba(0.6, 0.6, 0.6, 1.0)),
+                                                }
+                                            }),
+                                        Space::with_height(Length::Fixed(scale(6.0))),
+                                        text_input("Start Args (optional)", &self.edit_game_start_args)
+                                            .on_input(Message::EditGameStartArgsChanged)
+                                            .padding(scale(8.0)),
+                                    ]
+                                    .width(Length::Fill)
+                                } else {
+                                    column![
+                                        row![
+                                            text("Start File").size(scale_text(13.0))
                                                 .style(|_theme: &Theme| {
                                                     iced::widget::text::Style {
                                                         color: Some(Color::from_rgba(0.6, 0.6, 0.6, 1.0)),
                                                     }
-                                                }),
-                                            Space::with_height(Length::Fixed(scale(6.0))),
-                                            text(start_args).size(scale_text(13.0)),
+                                                })
+                                                .width(Length::Fixed(scale(140.0))),
+                                            text(&game_info.start_file).size(scale_text(13.0)),
                                         ]
                                         .width(Length::Fill),
+                                        if let Some(ref start_args) = game_info.start_args {
+                                            column![
+                                                Space::with_height(Length::Fixed(scale(16.0))),
+                                                column![
+                                                    text("Start Args").size(scale_text(13.0))
+                                                        .style(|_theme: &Theme| {
+                                                            iced::widget::text::Style {
+                                                                color: Some(Color::from_rgba(0.6, 0.6, 0.6, 1.0)),
+                                                            }
+                                                        }),
+                                                    Space::with_height(Length::Fixed(scale(6.0))),
+                                                    text(start_args).size(scale_text(13.0)),
+                                                ]
+                                                .width(Length::Fill),
+                                            ]
+                                        } else {
+                                            column![]
+                                        },
                                     ]
-                                } else {
-                                    column![]
+                                    .width(Length::Fill)
                                 },
                             ]
                             .width(Length::Fill),
@@ -3200,11 +3435,36 @@ impl DeckDropApp {
                             .width(Length::Fill),
                         ]
                         .width(Length::Fill),
-                        // Description and Instructions - full width
-                        if game_info.description.is_some() || game_info.additional_instructions.is_some() {
+                        // Description and Instructions - full width (editierbar im Bearbeitungsmodus)
+                        if self.editing_game || game_info.description.is_some() || game_info.additional_instructions.is_some() {
                             column![
                                 Space::with_height(Length::Fixed(scale(40.0))),
-                                if let Some(ref description) = game_info.description {
+                                if self.editing_game {
+                                    column![
+                                        text("Description:").size(scale_text(20.0))
+                                            .style(|_theme: &Theme| {
+                                                iced::widget::text::Style {
+                                                    color: Some(Color::from_rgba(0.9, 0.9, 0.9, 1.0)),
+                                                }
+                                            }),
+                                        Space::with_height(Length::Fixed(scale(16.0))),
+                                        text_input("Description (optional)", &self.edit_game_description)
+                                            .on_input(Message::EditGameDescriptionChanged)
+                                            .padding(scale(8.0)),
+                                        Space::with_height(Length::Fixed(scale(30.0))),
+                                        text("Additional Instructions:").size(scale_text(20.0))
+                                            .style(|_theme: &Theme| {
+                                                iced::widget::text::Style {
+                                                    color: Some(Color::from_rgba(0.9, 0.9, 0.9, 1.0)),
+                                                }
+                                            }),
+                                        Space::with_height(Length::Fixed(scale(16.0))),
+                                        text_input("Additional Instructions (optional)", &self.edit_game_additional_instructions)
+                                            .on_input(Message::EditGameAdditionalInstructionsChanged)
+                                            .padding(scale(8.0)),
+                                    ]
+                                    .width(Length::Fill)
+                                } else if let Some(ref description) = game_info.description {
                                     column![
                                         text("Description").size(scale_text(20.0))
                                             .style(|_theme: &Theme| {
@@ -3220,24 +3480,49 @@ impl DeckDropApp {
                                 } else {
                                     column![]
                                 },
-                                if let Some(ref instructions) = game_info.additional_instructions {
-                                    column![
-                                        Space::with_height(Length::Fixed(scale(40.0))),
-                                        text("Additional Instructions").size(scale_text(20.0))
-                                            .style(|_theme: &Theme| {
-                                                iced::widget::text::Style {
-                                                    color: Some(Color::from_rgba(0.9, 0.9, 0.9, 1.0)),
-                                                }
-                                            }),
-                                        Space::with_height(Length::Fixed(scale(16.0))),
-                                        text(instructions).size(scale_text(14.0))
-                                            .line_height(1.6),
-                                    ]
-                                    .width(Length::Fill)
+                                // Additional Instructions (nur im Anzeigemodus, nicht im Bearbeitungsmodus)
+                                if !self.editing_game {
+                                    if let Some(ref instructions) = game_info.additional_instructions {
+                                        column![
+                                            Space::with_height(Length::Fixed(scale(40.0))),
+                                            text("Additional Instructions").size(scale_text(20.0))
+                                                .style(|_theme: &Theme| {
+                                                    iced::widget::text::Style {
+                                                        color: Some(Color::from_rgba(0.9, 0.9, 0.9, 1.0)),
+                                                    }
+                                                }),
+                                            Space::with_height(Length::Fixed(scale(16.0))),
+                                            text(instructions).size(scale_text(14.0))
+                                                .line_height(1.6),
+                                        ]
+                                        .width(Length::Fill)
+                                    } else {
+                                        column![]
+                                    }
                                 } else {
                                     column![]
                                 },
                             ]
+                        } else {
+                            column![]
+                        },
+                        // Save/Cancel buttons im Bearbeitungsmodus
+                        if self.editing_game {
+                            column![
+                                Space::with_height(Length::Fixed(scale(30.0))),
+                                row![
+                                    button("Cancel")
+                                        .on_press(Message::CancelGameEdit)
+                                        .style(button::secondary),
+                                    Space::with_width(Length::Fill),
+                                    button("Save")
+                                        .on_press(Message::SaveGameEdit)
+                                        .style(button::primary),
+                                ]
+                                .width(Length::Fill)
+                                .spacing(scale(8.0)),
+                            ]
+                            .width(Length::Fill)
                         } else {
                             column![]
                         },
