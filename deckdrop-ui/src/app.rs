@@ -29,6 +29,18 @@ fn scale_text(size: f32) -> f32 {
     (size * UI_SCALE).max(10.0) // Minimum 10px for readability
 }
 
+/// Format bytes as MB or GB
+fn format_size(bytes: u64) -> String {
+    const GB: f64 = 1024.0 * 1024.0 * 1024.0;
+    const MB: f64 = 1024.0 * 1024.0;
+    
+    if bytes as f64 >= GB {
+        format!("{:.1} GB", bytes as f64 / GB)
+    } else {
+        format!("{:.1} MB", bytes as f64 / MB)
+    }
+}
+
 /// Game integrity status
 #[derive(Debug, Clone, PartialEq)]
 pub enum GameIntegrityStatus {
@@ -812,7 +824,7 @@ impl DeckDropApp {
                         
                         if !peer_ids.is_empty() {
                             if let Some(tx) = crate::network_bridge::get_download_request_tx() {
-                                if let Err(e) = self.request_missing_chunks_adaptive(&game_id, &peer_ids, 8) {
+                                if let Err(e) = self.request_missing_chunks_adaptive(&game_id, &peer_ids, 10) {
                                     eprintln!("Error requesting missing chunks when resuming download for {}: {}", game_id, e);
                                 }
                             }
@@ -1487,12 +1499,12 @@ impl DeckDropApp {
                                     peer_ids
                                 };
                                 
-                                if let Err(e) = self.request_missing_chunks_adaptive(&game_id, &peer_ids, 8) {
+                                if let Err(e) = self.request_missing_chunks_adaptive(&game_id, &peer_ids, 10) {
                                     eprintln!("Error requesting missing chunks for {}: {}", game_id, e);
                                 }
                             } else {
                                 // Fallback: Use the peer that sent the metadata
-                                if let Err(e) = self.request_missing_chunks_adaptive(&game_id, &[peer_id.clone()], 8) {
+                                if let Err(e) = self.request_missing_chunks_adaptive(&game_id, &[peer_id.clone()], 10) {
                                     eprintln!("Error requesting missing chunks for {}: {}", game_id, e);
                                 }
                             }
@@ -2028,11 +2040,43 @@ impl DeckDropApp {
             }
         }
         
-        // Resume downloads if host is available (only Pending, not Paused - paused downloads should be resumed manually)
+        // Resume downloads if host is available
+        // - Pending downloads: Start them when peers become available
+        // - Downloading downloads: Continue them if they have missing chunks but no active requests
+        // - Paused downloads: Should be resumed manually (not automatically)
         let games_to_resume: Vec<String> = self.active_downloads
             .iter()
-            .filter(|(_, download_state)| {
-                matches!(download_state.manifest.overall_status, deckdrop_core::DownloadStatus::Pending)
+            .filter(|(_game_id, download_state)| {
+                // Prüfe ob Download pausiert oder abgebrochen ist (diese sollten nicht automatisch fortgesetzt werden)
+                if matches!(download_state.manifest.overall_status, deckdrop_core::DownloadStatus::Paused | deckdrop_core::DownloadStatus::Cancelled) {
+                    return false;
+                }
+                
+                // Prüfe ob Download Pending ist (sollte gestartet werden)
+                if matches!(download_state.manifest.overall_status, deckdrop_core::DownloadStatus::Pending) {
+                    return true;
+                }
+                
+                // Prüfe ob Download Downloading ist, aber keine aktiven Requests hat
+                if matches!(download_state.manifest.overall_status, deckdrop_core::DownloadStatus::Downloading) {
+                    // Prüfe ob es fehlende Chunks gibt
+                    let missing_chunks = download_state.manifest.get_missing_chunks();
+                    if missing_chunks.is_empty() {
+                        return false; // Keine fehlenden Chunks, nichts zu tun
+                    }
+                    
+                    // Prüfe ob es aktive Chunk-Requests gibt
+                    let has_active_requests = if let Ok(requested) = self.requested_chunks.lock() {
+                        missing_chunks.iter().any(|chunk| requested.contains(chunk))
+                    } else {
+                        false
+                    };
+                    
+                    // Wenn es fehlende Chunks gibt, aber keine aktiven Requests, sollte der Download fortgesetzt werden
+                    return !has_active_requests;
+                }
+                
+                false
             })
             .filter_map(|(game_id, _)| {
                 // Check if peers are available for this game
@@ -2053,21 +2097,23 @@ impl DeckDropApp {
             if let Some(peers) = self.network_games.get(&game_id) {
                 let peer_ids: Vec<String> = peers.iter().map(|(peer_id, _)| peer_id.clone()).collect();
                 
-                // Request missing chunks to resume download
-                if let Some(tx) = crate::network_bridge::get_download_request_tx() {
-                    if let Err(e) = self.request_missing_chunks_adaptive(&game_id, &peer_ids, 8) {
+                // Request missing chunks to resume/continue download
+                if crate::network_bridge::get_download_request_tx().is_some() {
+                    if let Err(e) = self.request_missing_chunks_adaptive(&game_id, &peer_ids, 10) {
                         eprintln!("Error resuming download for {}: {}", game_id, e);
                     } else {
-                        // Update status to Downloading
+                        // Update status to Downloading (falls es noch Pending war)
                         if let Some(ds) = self.active_downloads.get_mut(&game_id) {
-                            ds.manifest.overall_status = deckdrop_core::DownloadStatus::Downloading;
-                            
-                            // Save updated manifest
-                            if let Ok(manifest_path) = deckdrop_core::get_manifest_path(&game_id) {
-                                let _ = ds.manifest.save(&manifest_path);
+                            if matches!(ds.manifest.overall_status, deckdrop_core::DownloadStatus::Pending) {
+                                ds.manifest.overall_status = deckdrop_core::DownloadStatus::Downloading;
+                                
+                                // Save updated manifest
+                                if let Ok(manifest_path) = deckdrop_core::get_manifest_path(&game_id) {
+                                    let _ = ds.manifest.save(&manifest_path);
+                                }
                             }
                         }
-                        println!("Resumed download for game: {}", game_id);
+                        println!("Resumed/continued download for game: {}", game_id);
                     }
                 }
             }
@@ -2210,13 +2256,44 @@ impl DeckDropApp {
                 
                 // Show download status if downloading
                 if let Some(ds) = download_state {
+                    // Calculate total size from actual file sizes
+                    let total_bytes: u64 = ds.manifest.chunks.values()
+                        .filter_map(|file_info| file_info.file_size)
+                        .sum();
+                    
+                    // Calculate downloaded size: use average chunk size if we have total size,
+                    // otherwise fall back to 100MB per chunk
+                    let downloaded_bytes = if total_bytes > 0 && ds.manifest.progress.total_chunks > 0 {
+                        // Use proportional calculation based on actual total size
+                        (total_bytes as f64 * (ds.manifest.progress.downloaded_chunks as f64 / ds.manifest.progress.total_chunks as f64)) as u64
+                    } else {
+                        // Fallback: assume 100MB per chunk
+                        const CHUNK_SIZE_BYTES: u64 = 100 * 1024 * 1024;
+                        (ds.manifest.progress.downloaded_chunks as u64) * CHUNK_SIZE_BYTES
+                    };
+                    
+                    let total_bytes_final = if total_bytes > 0 {
+                        total_bytes
+                    } else {
+                        // Fallback: estimate from chunk count
+                        const CHUNK_SIZE_BYTES: u64 = 100 * 1024 * 1024;
+                        (ds.manifest.progress.total_chunks as u64) * CHUNK_SIZE_BYTES
+                    };
+                    
+                    let downloaded_size_str = format_size(downloaded_bytes);
+                    let total_size_str = format_size(total_bytes_final);
+                    
                     let download_status_text = match ds.manifest.overall_status {
                         deckdrop_core::DownloadStatus::Downloading => {
-                            format!("Downloading... {:.1}%", ds.progress_percent)
+                            format!("Downloading... {:.1}% ({}/{})", ds.progress_percent, downloaded_size_str, total_size_str)
                         }
-                        deckdrop_core::DownloadStatus::Paused => "Paused".to_string(),
+                        deckdrop_core::DownloadStatus::Paused => {
+                            format!("Paused ({}/{})", downloaded_size_str, total_size_str)
+                        }
                         deckdrop_core::DownloadStatus::Pending => "Waiting for host...".to_string(),
-                        deckdrop_core::DownloadStatus::Complete => "Download complete".to_string(),
+                        deckdrop_core::DownloadStatus::Complete => {
+                            format!("Download complete ({})", total_size_str)
+                        }
                         deckdrop_core::DownloadStatus::Error(ref e) => format!("Download error: {}", e),
                         deckdrop_core::DownloadStatus::Cancelled => "Cancelled".to_string(),
                     };
@@ -2421,14 +2498,47 @@ impl DeckDropApp {
                             .spacing(scale(4.0))
                         );
                         
+                        // Calculate total size from actual file sizes
+                        let total_bytes: u64 = ds.manifest.chunks.values()
+                            .filter_map(|file_info| file_info.file_size)
+                            .sum();
+                        
+                        // Calculate downloaded size: use average chunk size if we have total size,
+                        // otherwise fall back to 100MB per chunk
+                        let downloaded_bytes = if total_bytes > 0 && ds.manifest.progress.total_chunks > 0 {
+                            // Use proportional calculation based on actual total size
+                            (total_bytes as f64 * (ds.manifest.progress.downloaded_chunks as f64 / ds.manifest.progress.total_chunks as f64)) as u64
+                        } else {
+                            // Fallback: assume 100MB per chunk
+                            const CHUNK_SIZE_BYTES: u64 = 100 * 1024 * 1024;
+                            (ds.manifest.progress.downloaded_chunks as u64) * CHUNK_SIZE_BYTES
+                        };
+                        
+                        let total_bytes_final = if total_bytes > 0 {
+                            total_bytes
+                        } else {
+                            // Fallback: estimate from chunk count
+                            const CHUNK_SIZE_BYTES: u64 = 100 * 1024 * 1024;
+                            (ds.manifest.progress.total_chunks as u64) * CHUNK_SIZE_BYTES
+                        };
+                        
+                        let downloaded_size_str = format_size(downloaded_bytes);
+                        let total_size_str = format_size(total_bytes_final);
+                        
                         // Show status
                         let status_text = match ds.manifest.overall_status {
-                            deckdrop_core::DownloadStatus::Downloading => "Downloading...",
-                            deckdrop_core::DownloadStatus::Paused => "Paused",
-                            deckdrop_core::DownloadStatus::Complete => "Completed",
-                            deckdrop_core::DownloadStatus::Error(_) => "Failed",
-                            deckdrop_core::DownloadStatus::Pending => "Pending",
-                            deckdrop_core::DownloadStatus::Cancelled => "Cancelled",
+                            deckdrop_core::DownloadStatus::Downloading => {
+                                format!("Downloading... ({}/{})", downloaded_size_str, total_size_str)
+                            }
+                            deckdrop_core::DownloadStatus::Paused => {
+                                format!("Paused ({}/{})", downloaded_size_str, total_size_str)
+                            }
+                            deckdrop_core::DownloadStatus::Complete => {
+                                format!("Completed ({})", total_size_str)
+                            }
+                            deckdrop_core::DownloadStatus::Error(_) => "Failed".to_string(),
+                            deckdrop_core::DownloadStatus::Pending => "Pending".to_string(),
+                            deckdrop_core::DownloadStatus::Cancelled => "Cancelled".to_string(),
                         };
                         game_column = game_column.push(
                             text(status_text).size(scale_text(10.0))
