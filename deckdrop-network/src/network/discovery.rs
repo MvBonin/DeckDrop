@@ -5,7 +5,7 @@ use libp2p::{
 };
 use std::str::FromStr;
 use std::net::IpAddr;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 use std::sync::Arc;
 
@@ -266,6 +266,7 @@ pub async fn run_discovery(
     // Performance-Optimierung: Größere Buffer für höheren Durchsatz
     // Hinweis: set_max_buffer_size und set_receive_window_size sind deprecated
     // Die yamux-Konfiguration verwendet jetzt Standardwerte
+    // Yamux hat standardmäßig KeepAlive aktiviert, daher verwenden wir die Standard-Konfiguration
     let yamux_config = libp2p::yamux::Config::default();
     
     let mut swarm = libp2p::SwarmBuilder::with_existing_identity(id_keys)
@@ -278,8 +279,9 @@ pub async fn run_discovery(
         .unwrap()
         .with_behaviour(|_| behaviour)
         .unwrap()
-        // Phase 3 Optimierung: Erhöhe idle_connection_timeout auf 10 Minuten für stabile Verbindungen
-        .with_swarm_config(|c| c.with_idle_connection_timeout(std::time::Duration::from_secs(600)))
+        // Robustheit: Erhöhe idle_connection_timeout auf 30 Minuten für stabile Verbindungen
+        // KeepAlive-Mechanismen halten Verbindungen aktiv, daher können wir längere Timeouts verwenden
+        .with_swarm_config(|c| c.with_idle_connection_timeout(std::time::Duration::from_secs(1800)))
         .build();
 
     println!("Swarm created, starting discovery loop...");
@@ -319,8 +321,103 @@ pub async fn run_discovery(
     // Verwende StreamExt für select_next_some
     use futures::StreamExt;
     
+    // Keep-Alive-Mechanismus: Periodische GamesList-Requests an alle verbundenen Peers
+    // Dies hält Verbindungen aktiv und verhindert Timeouts
+    // Für Peers mit aktiven Downloads senden wir häufiger KeepAlive (alle 30 Sekunden)
+    // Für andere Peers alle 60 Sekunden
+    let keepalive_interval_normal = Duration::from_secs(60); // Normale Peers: alle 60 Sekunden
+    let keepalive_interval_active = Duration::from_secs(30); // Peers mit aktiven Downloads: alle 30 Sekunden
+    let mut keepalive_interval_timer_normal = tokio::time::interval(keepalive_interval_normal);
+    let mut keepalive_interval_timer_active = tokio::time::interval(keepalive_interval_active);
+    keepalive_interval_timer_normal.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    keepalive_interval_timer_active.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    
     loop {
         tokio::select! {
+            // Keep-Alive: Periodische GamesList-Requests an alle verbundenen Peers
+            _ = keepalive_interval_timer_normal.tick() => {
+                let connected_peers: Vec<PeerId> = swarm.connected_peers().cloned().collect();
+                if !connected_peers.is_empty() {
+                    // Prüfe welche Peers aktive Downloads haben
+                    let peers_with_active_downloads: HashSet<PeerId> = {
+                        let pending_chunks = pending_chunk_requests_clone.lock().await;
+                        let pending_metadata = pending_metadata_requests_clone.lock().await;
+                        
+                        // Sammle alle Peer-IDs mit aktiven Requests
+                        let mut active_peers = HashSet::new();
+                        for (_, (_, _, peer_id)) in pending_chunks.iter() {
+                            if let Ok(peer_id_parsed) = PeerId::from_str(peer_id) {
+                                active_peers.insert(peer_id_parsed);
+                            }
+                        }
+                        for (_, (_, peer_id)) in pending_metadata.iter() {
+                            if let Ok(peer_id_parsed) = PeerId::from_str(peer_id) {
+                                active_peers.insert(peer_id_parsed);
+                            }
+                        }
+                        active_peers
+                    };
+                    
+                    // Sende KeepAlive nur an Peers OHNE aktive Downloads (diese bekommen häufiger KeepAlive)
+                    let peers_without_active = connected_peers.iter()
+                        .filter(|p| !peers_with_active_downloads.contains(p))
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    
+                    if !peers_without_active.is_empty() {
+                        println!("KeepAlive: Sende GamesList-Requests an {} Peers ohne aktive Downloads", peers_without_active.len());
+                        eprintln!("KeepAlive: Sende GamesList-Requests an {} Peers ohne aktive Downloads", peers_without_active.len());
+                        
+                        for peer_id in peers_without_active {
+                            let request = GamesListRequest;
+                            let _request_id = swarm.behaviour_mut().games_list.send_request(&peer_id, request);
+                            println!("KeepAlive: GamesList-Request gesendet an {}", peer_id);
+                        }
+                    }
+                }
+            }
+            // Keep-Alive für Peers mit aktiven Downloads: Häufiger (alle 30 Sekunden)
+            _ = keepalive_interval_timer_active.tick() => {
+                let connected_peers: Vec<PeerId> = swarm.connected_peers().cloned().collect();
+                if !connected_peers.is_empty() {
+                    // Prüfe welche Peers aktive Downloads haben
+                    let peers_with_active_downloads: HashSet<PeerId> = {
+                        let pending_chunks = pending_chunk_requests_clone.lock().await;
+                        let pending_metadata = pending_metadata_requests_clone.lock().await;
+                        
+                        // Sammle alle Peer-IDs mit aktiven Requests
+                        let mut active_peers = HashSet::new();
+                        for (_, (_, _, peer_id)) in pending_chunks.iter() {
+                            if let Ok(peer_id_parsed) = PeerId::from_str(peer_id) {
+                                active_peers.insert(peer_id_parsed);
+                            }
+                        }
+                        for (_, (_, peer_id)) in pending_metadata.iter() {
+                            if let Ok(peer_id_parsed) = PeerId::from_str(peer_id) {
+                                active_peers.insert(peer_id_parsed);
+                            }
+                        }
+                        active_peers
+                    };
+                    
+                    // Sende KeepAlive nur an Peers MIT aktiven Downloads (häufiger)
+                    let peers_with_active = connected_peers.iter()
+                        .filter(|p| peers_with_active_downloads.contains(p))
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    
+                    if !peers_with_active.is_empty() {
+                        println!("KeepAlive (aktiv): Sende GamesList-Requests an {} Peers mit aktiven Downloads", peers_with_active.len());
+                        eprintln!("KeepAlive (aktiv): Sende GamesList-Requests an {} Peers mit aktiven Downloads", peers_with_active.len());
+                        
+                        for peer_id in peers_with_active {
+                            let request = GamesListRequest;
+                            let _request_id = swarm.behaviour_mut().games_list.send_request(&peer_id, request);
+                            println!("KeepAlive (aktiv): GamesList-Request gesendet an {}", peer_id);
+                        }
+                    }
+                }
+            }
             // Handle Reconnect-Anfragen
             Some(addr) = reconnect_rx.recv() => {
                 println!("Reconnect-Anfrage erhalten für {}", addr);
@@ -381,10 +478,37 @@ pub async fn run_discovery(
                                 }
                             };
                             
-                            // Prüfe ob Peer verbunden ist
+                            // Prüfe ob Peer verbunden ist, versuche Reconnect falls nicht
                             if !swarm.connected_peers().any(|p| p == &peer_id_parsed) {
-                                eprintln!("Peer {} nicht verbunden für GameMetadata Request", peer_id);
-                                continue;
+                                eprintln!("Peer {} nicht verbunden für GameMetadata Request, versuche Reconnect...", peer_id);
+                                
+                                // Versuche Reconnect mit gespeicherter Adresse
+                                let addr_opt = {
+                                    let addrs = peer_addrs_clone.lock().await;
+                                    addrs.get(&peer_id).cloned()
+                                };
+                                
+                                if let Some(addr) = addr_opt {
+                                    let addr_with_peer = if addr.iter().any(|p| matches!(p, libp2p::multiaddr::Protocol::P2p(_))) {
+                                        addr.clone()
+                                    } else {
+                                        addr.with(libp2p::multiaddr::Protocol::P2p(peer_id_parsed))
+                                    };
+                                    
+                                    if let Err(e) = swarm.dial(addr_with_peer) {
+                                        eprintln!("Reconnect fehlgeschlagen für {}: {}", peer_id, e);
+                                    } else {
+                                        println!("Reconnect initiiert für {}, warte auf Verbindung...", peer_id);
+                                        // Warte kurz auf Verbindung
+                                        tokio::time::sleep(Duration::from_millis(500)).await;
+                                    }
+                                }
+                                
+                                // Prüfe erneut, ob Peer jetzt verbunden ist
+                                if !swarm.connected_peers().any(|p| p == &peer_id_parsed) {
+                                    eprintln!("Peer {} immer noch nicht verbunden nach Reconnect-Versuch", peer_id);
+                                    continue;
+                                }
                             }
                             
                             let request = GameMetadataRequest { game_id: game_id.clone() };
@@ -408,10 +532,37 @@ pub async fn run_discovery(
                                 }
                             };
                             
-                            // Prüfe ob Peer verbunden ist
+                            // Prüfe ob Peer verbunden ist, versuche Reconnect falls nicht
                             if !swarm.connected_peers().any(|p| p == &peer_id_parsed) {
-                                eprintln!("Peer {} nicht verbunden für Chunk Request", peer_id);
-                                continue;
+                                eprintln!("Peer {} nicht verbunden für Chunk Request, versuche Reconnect...", peer_id);
+                                
+                                // Versuche Reconnect mit gespeicherter Adresse
+                                let addr_opt = {
+                                    let addrs = peer_addrs_clone.lock().await;
+                                    addrs.get(&peer_id).cloned()
+                                };
+                                
+                                if let Some(addr) = addr_opt {
+                                    let addr_with_peer = if addr.iter().any(|p| matches!(p, libp2p::multiaddr::Protocol::P2p(_))) {
+                                        addr.clone()
+                                    } else {
+                                        addr.with(libp2p::multiaddr::Protocol::P2p(peer_id_parsed))
+                                    };
+                                    
+                                    if let Err(e) = swarm.dial(addr_with_peer) {
+                                        eprintln!("Reconnect fehlgeschlagen für {}: {}", peer_id, e);
+                                    } else {
+                                        println!("Reconnect initiiert für {}, warte auf Verbindung...", peer_id);
+                                        // Warte kurz auf Verbindung
+                                        tokio::time::sleep(Duration::from_millis(500)).await;
+                                    }
+                                }
+                                
+                                // Prüfe erneut, ob Peer jetzt verbunden ist
+                                if !swarm.connected_peers().any(|p| p == &peer_id_parsed) {
+                                    eprintln!("Peer {} immer noch nicht verbunden nach Reconnect-Versuch", peer_id);
+                                    continue;
+                                }
                             }
                             
                             let request = ChunkRequest { chunk_hash: chunk_hash.clone() };
@@ -688,6 +839,40 @@ pub async fn run_discovery(
                                 
                                 eprintln!("GameMetadata OutboundFailure für {} (RequestId: {:?}): game_id={}, error={:?}", 
                                     peer_id_str, request_id, game_id, error);
+                                
+                                // Retry-Mechanismus: Bei Timeout oder ConnectionClosed versuche Reconnect und Retry
+                                let should_retry = matches!(error, 
+                                    libp2p::request_response::OutboundFailure::Timeout |
+                                    libp2p::request_response::OutboundFailure::ConnectionClosed
+                                );
+                                
+                                if should_retry {
+                                    eprintln!("GameMetadata Request fehlgeschlagen, versuche Reconnect und Retry für {}", peer_id_str);
+                                    
+                                    // Versuche Reconnect
+                                    let addr_opt = {
+                                        let addrs = peer_addrs_clone.lock().await;
+                                        addrs.get(&peer_id_str).cloned()
+                                    };
+                                    
+                                    if let Some(addr) = addr_opt {
+                                        let addr_with_peer = if addr.iter().any(|p| matches!(p, libp2p::multiaddr::Protocol::P2p(_))) {
+                                            addr.clone()
+                                        } else {
+                                            if let Ok(peer_id_parsed) = PeerId::from_str(&peer_id_str) {
+                                                addr.with(libp2p::multiaddr::Protocol::P2p(peer_id_parsed))
+                                            } else {
+                                                addr
+                                            }
+                                        };
+                                        
+                                        if let Err(e) = swarm.dial(addr_with_peer) {
+                                            eprintln!("Reconnect fehlgeschlagen für {}: {}", peer_id_str, e);
+                                        } else {
+                                            println!("Reconnect initiiert für {}, Retry wird später versucht", peer_id_str);
+                                        }
+                                    }
+                                }
                             }
                             libp2p::request_response::Event::InboundFailure { peer, error, .. } => {
                                 eprintln!("GameMetadata InboundFailure für {}: {:?}", peer, error);
@@ -769,12 +954,47 @@ pub async fn run_discovery(
                                 eprintln!("Chunks OutboundFailure für {} (RequestId: {:?}): chunk_hash={}, game_id={}, error={:?}", 
                                     peer_id_str, request_id, chunk_hash, game_id, error);
                                 
+                                // Retry-Mechanismus: Bei Timeout oder ConnectionClosed versuche Reconnect
+                                let should_retry = matches!(error, 
+                                    libp2p::request_response::OutboundFailure::Timeout |
+                                    libp2p::request_response::OutboundFailure::ConnectionClosed
+                                );
+                                
+                                if should_retry {
+                                    eprintln!("Chunk Request fehlgeschlagen, versuche Reconnect und Retry für {}", peer_id_str);
+                                    
+                                    // Versuche Reconnect
+                                    let addr_opt = {
+                                        let addrs = peer_addrs_clone.lock().await;
+                                        addrs.get(&peer_id_str).cloned()
+                                    };
+                                    
+                                    if let Some(addr) = addr_opt {
+                                        let addr_with_peer = if addr.iter().any(|p| matches!(p, libp2p::multiaddr::Protocol::P2p(_))) {
+                                            addr.clone()
+                                        } else {
+                                            if let Ok(peer_id_parsed) = PeerId::from_str(&peer_id_str) {
+                                                addr.with(libp2p::multiaddr::Protocol::P2p(peer_id_parsed))
+                                            } else {
+                                                addr
+                                            }
+                                        };
+                                        
+                                        if let Err(e) = swarm.dial(addr_with_peer) {
+                                            eprintln!("Reconnect fehlgeschlagen für {}: {}", peer_id_str, e);
+                                        } else {
+                                            println!("Reconnect initiiert für {}, Retry wird später versucht", peer_id_str);
+                                        }
+                                    }
+                                }
+                                
                                 // Sende ChunkRequestFailed Event
                                 let event_tx_for_failure = event_tx_clone.clone();
+                                let chunk_hash_clone = chunk_hash.clone();
                                 tokio::spawn(async move {
                                     let _ = event_tx_for_failure.send(DiscoveryEvent::ChunkRequestFailed {
                                         peer_id: peer_id_str,
-                                        chunk_hash,
+                                        chunk_hash: chunk_hash_clone,
                                         error: format!("{:?}", error),
                                     }).await;
                                 });
@@ -927,37 +1147,51 @@ pub async fn run_discovery(
                         let reconnect_tx_for_spawn = reconnect_tx_clone.clone();
                         
                         tokio::spawn(async move {
-                            // Warte kurz, dann versuche Reconnect
-                            tokio::time::sleep(Duration::from_secs(2)).await;
+                            // Warte kurz, dann versuche Reconnect mit exponentieller Backoff
+                            let mut retry_count = 0;
+                            let max_retries = 5;
                             
-                            // Hole gespeicherte Multiaddr
-                            let addr_opt = {
-                                let addrs = peer_addrs_for_reconnect.lock().await;
-                                addrs.get(&peer_id_str).cloned()
-                            };
-                            
-                            if let Some(addr) = addr_opt {
-                                // Versuche Reconnect mit gespeicherter Adresse
-                                println!("Versuche Reconnect zu {} über {}", peer_id_str, addr);
-                                eprintln!("Versuche Reconnect zu {} über {}", peer_id_str, addr);
+                            while retry_count < max_retries {
+                                let wait_time = Duration::from_secs(2 * (1 << retry_count)); // Exponential backoff: 2s, 4s, 8s, 16s, 32s
+                                tokio::time::sleep(wait_time).await;
                                 
-                                // Füge Peer-ID zur Adresse hinzu, falls nicht vorhanden
-                                let addr_with_peer = if addr.iter().any(|p| matches!(p, libp2p::multiaddr::Protocol::P2p(_))) {
-                                    addr.clone()
-                                } else {
-                                    if let Ok(peer_id_parsed) = PeerId::from_str(&peer_id_str) {
-                                        addr.with(libp2p::multiaddr::Protocol::P2p(peer_id_parsed))
-                                    } else {
-                                        addr
-                                    }
+                                // Hole gespeicherte Multiaddr
+                                let addr_opt = {
+                                    let addrs = peer_addrs_for_reconnect.lock().await;
+                                    addrs.get(&peer_id_str).cloned()
                                 };
                                 
-                                // Sende Reconnect-Anfrage über Channel
-                                if let Err(e) = reconnect_tx_for_spawn.send(addr_with_peer) {
-                                    eprintln!("Fehler beim Senden von Reconnect-Anfrage: {}", e);
+                                if let Some(addr) = addr_opt {
+                                    // Versuche Reconnect mit gespeicherter Adresse
+                                    println!("Reconnect-Versuch {} zu {} über {}", retry_count + 1, peer_id_str, addr);
+                                    eprintln!("Reconnect-Versuch {} zu {} über {}", retry_count + 1, peer_id_str, addr);
+                                    
+                                    // Füge Peer-ID zur Adresse hinzu, falls nicht vorhanden
+                                    let addr_with_peer = if addr.iter().any(|p| matches!(p, libp2p::multiaddr::Protocol::P2p(_))) {
+                                        addr.clone()
+                                    } else {
+                                        if let Ok(peer_id_parsed) = PeerId::from_str(&peer_id_str) {
+                                            addr.with(libp2p::multiaddr::Protocol::P2p(peer_id_parsed))
+                                        } else {
+                                            addr
+                                        }
+                                    };
+                                    
+                                    // Sende Reconnect-Anfrage über Channel
+                                    if let Err(e) = reconnect_tx_for_spawn.send(addr_with_peer) {
+                                        eprintln!("Fehler beim Senden von Reconnect-Anfrage: {}", e);
+                                        break;
+                                    }
+                                    
+                                    retry_count += 1;
+                                } else {
+                                    println!("Keine Adresse für {} gespeichert, warte auf mDNS Discovery", peer_id_str);
+                                    break;
                                 }
-                            } else {
-                                println!("Keine Adresse für {} gespeichert, warte auf mDNS Discovery", peer_id_str);
+                            }
+                            
+                            if retry_count >= max_retries {
+                                eprintln!("Maximale Anzahl von Reconnect-Versuchen für {} erreicht", peer_id_str);
                             }
                         });
                     }

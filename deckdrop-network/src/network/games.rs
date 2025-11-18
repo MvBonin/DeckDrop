@@ -123,7 +123,8 @@ pub type GamesListBehaviour = libp2p::request_response::Behaviour<GamesListCodec
 /// Erstellt ein GamesListBehaviour
 pub fn create_games_list_behaviour() -> GamesListBehaviour {
     let config = libp2p::request_response::Config::default()
-        .with_request_timeout(Duration::from_secs(10));
+        // Robustheit: Erhöhe Timeout auf 30 Sekunden für stabilere Verbindungen
+        .with_request_timeout(Duration::from_secs(30));
     
     libp2p::request_response::Behaviour::new(
         [(String::from("/deckdrop/games-list/1.0.0"), ProtocolSupport::Full)],
@@ -285,7 +286,8 @@ pub type GameMetadataBehaviour = libp2p::request_response::Behaviour<GameMetadat
 /// Erstellt ein GameMetadataBehaviour
 pub fn create_game_metadata_behaviour() -> GameMetadataBehaviour {
     let config = libp2p::request_response::Config::default()
-        .with_request_timeout(Duration::from_secs(30)); // Längere Timeout für größere Daten
+        // Robustheit: Erhöhe Timeout auf 60 Sekunden für größere Daten und langsamere Verbindungen
+        .with_request_timeout(Duration::from_secs(60));
     
     libp2p::request_response::Behaviour::new(
         [(String::from("/deckdrop/game-metadata/1.0.0"), ProtocolSupport::Full)],
@@ -405,7 +407,9 @@ pub type ChunkBehaviour = libp2p::request_response::Behaviour<ChunkCodec>;
 /// Erstellt ein ChunkBehaviour
 pub fn create_chunk_behaviour() -> ChunkBehaviour {
     let config = libp2p::request_response::Config::default()
-        .with_request_timeout(Duration::from_secs(120)); // Längere Timeout für große Chunks (Phase 3 Optimierung: 120s für 100MB Chunks)
+        // Robustheit: Erhöhe Timeout auf 300 Sekunden (5 Minuten) für große Chunks
+        // Dies gibt genug Zeit für langsame Verbindungen und verhindert vorzeitige Timeouts
+        .with_request_timeout(Duration::from_secs(300));
     
     libp2p::request_response::Behaviour::new(
         [(String::from("/deckdrop/chunks/1.0.0"), ProtocolSupport::Full)],
@@ -838,7 +842,8 @@ pub type GameMetadataBehaviour = libp2p::request_response::Behaviour<GameMetadat
 /// Erstellt ein GameMetadataBehaviour
 pub fn create_game_metadata_behaviour() -> GameMetadataBehaviour {
     let config = libp2p::request_response::Config::default()
-        .with_request_timeout(Duration::from_secs(30)); // Längere Timeout für größere Daten
+        // Robustheit: Erhöhe Timeout auf 60 Sekunden für größere Daten und langsamere Verbindungen
+        .with_request_timeout(Duration::from_secs(60));
     
     libp2p::request_response::Behaviour::new(
         [(String::from("/deckdrop/game-metadata/1.0.0"), ProtocolSupport::Full)],
