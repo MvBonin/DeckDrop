@@ -1,11 +1,11 @@
 //! Main app structure for Iced
 
 use iced::{
-    widget::{button, column, container, row, scrollable, text, text_input, progress_bar, Column, Row, Space},
-    Alignment, Element, Length, Theme, Color, Task,
+    widget::{button, column, container, row, scrollable, text, text_input, progress_bar, Column, Space},
+    Element, Length, Theme, Color, Task,
 };
 use toml;
-use deckdrop_core::{Config, GameInfo, DownloadManifest, DownloadStatus, network_cache};
+use deckdrop_core::{Config, GameInfo, DownloadManifest, network_cache};
 use deckdrop_network::network::discovery::DiscoveryEvent;
 use deckdrop_network::network::games::NetworkGameInfo;
 use deckdrop_network::network::peer::PeerInfo;
@@ -79,6 +79,7 @@ pub struct DeckDropApp {
     pub requested_chunks: Arc<std::sync::Mutex<HashSet<String>>>, // chunk_hash -> already requested
     
     // Upload tracking (chunks being uploaded to peers)
+    #[allow(dead_code)]
     pub active_uploads: Arc<std::sync::Mutex<HashMap<String, (std::time::Instant, usize)>>>, // chunk_hash -> (start_time, chunk_size_bytes)
     pub upload_stats: Arc<std::sync::Mutex<UploadStats>>, // Upload-Statistiken
     
@@ -155,6 +156,7 @@ pub struct DownloadState {
     pub downloading_chunks_count: usize, // Anzahl der aktuell heruntergeladenen Chunks
     pub peer_count: usize, // Anzahl der Peers für diesen Download
     pub download_speed_bytes_per_sec: f64, // Download-Geschwindigkeit in Bytes/Sekunde (gleitender Durchschnitt)
+    #[allow(dead_code)]
     pub last_update_time: std::time::Instant, // Zeitpunkt der letzten Aktualisierung
     pub last_downloaded_chunks: usize, // Anzahl der heruntergeladenen Chunks bei letzter Aktualisierung
     pub speed_samples: Vec<(std::time::Instant, usize)>, // Zeitstempel und heruntergeladene Chunks für Geschwindigkeitsberechnung
@@ -163,6 +165,7 @@ pub struct DownloadState {
 /// Status information
 #[derive(Debug, Clone)]
 pub struct StatusInfo {
+    #[allow(dead_code)]
     pub is_online: bool,
     pub peer_count: usize,
     pub active_download_count: usize,
@@ -182,6 +185,7 @@ pub struct UploadStats {
 pub struct PeerPerformance {
     pub download_speed_bytes_per_sec: f64, // Download-Geschwindigkeit in Bytes/Sekunde (gleitender Durchschnitt)
     pub success_rate: f64, // Erfolgsrate: 0.0 - 1.0 (erfolgreiche / totale Requests)
+    #[allow(dead_code)]
     pub active_requests: usize, // Aktuelle Anzahl aktiver Chunk-Requests
     pub total_requests: usize, // Gesamtanzahl Requests
     pub successful_requests: usize, // Anzahl erfolgreicher Requests
@@ -194,7 +198,7 @@ pub struct PeerPerformance {
 
 /// Retry-Information für Chunk-Requests
 #[derive(Debug, Clone)]
-struct ChunkRetryInfo {
+pub struct ChunkRetryInfo {
     pub retry_count: usize, // Anzahl der bisherigen Retries
     pub last_retry_time: std::time::Instant, // Zeitpunkt des letzten Retry-Versuchs
     pub last_peer_id: String, // Letzter Peer, der versucht wurde
@@ -330,7 +334,7 @@ impl Default for DeckDropApp {
             my_games = deduplicated;
         }
         
-        let mut game_integrity_status = HashMap::new();
+        let game_integrity_status = HashMap::new();
         // Don't initialize integrity checks automatically - user will trigger them manually
         println!("[DEBUG] Default::default(): {} games loaded (integrity checks will be manual)", my_games.len());
         
@@ -506,10 +510,12 @@ pub enum Message {
 }
 
 impl DeckDropApp {
+    #[allow(dead_code)]
     pub fn new() -> Self {
         Self::default()
     }
     
+    #[allow(dead_code)]
     fn new_with_network_rx(network_event_rx: Arc<std::sync::Mutex<mpsc::Receiver<DiscoveryEvent>>>) -> Self {
         let config = Config::load();
         let mut my_games = Vec::new();
@@ -582,7 +588,7 @@ impl DeckDropApp {
             my_games = deduplicated;
         }
         
-        let mut game_integrity_status = HashMap::new();
+        let game_integrity_status = HashMap::new();
         // Don't initialize integrity checks automatically - user will trigger them manually
         println!("[DEBUG] new_with_network_rx: {} games loaded (integrity checks will be manual)", my_games.len());
         
@@ -763,7 +769,7 @@ impl DeckDropApp {
                                     Some({
                                         let progress_tracker = progress_tracker.clone();
                                         let game_path = game_path_for_check.clone();
-                                        move |current, total| {
+                                        move |current, _total| {
                                             // Update progress in shared tracker
                                             if let Ok(mut progress) = progress_tracker.lock() {
                                                 progress.insert(game_path.clone(), current);
@@ -835,7 +841,7 @@ impl DeckDropApp {
                     *tracker = None;
                 }
                 
-                let mut game_info = GameInfo {
+                let game_info = GameInfo {
                     game_id: deckdrop_core::game::generate_game_id(),
                     name: self.add_game_name.clone(),
                     version: deckdrop_core::game::initial_version(), // Immer "1" für neues Spiel
@@ -971,7 +977,7 @@ impl DeckDropApp {
                             .collect();
                         
                         if !peer_ids.is_empty() {
-                            if let Some(tx) = crate::network_bridge::get_download_request_tx() {
+                            if let Some(_tx) = crate::network_bridge::get_download_request_tx() {
                                 if let Err(e) = self.request_missing_chunks_adaptive(&game_id, &peer_ids, 10) {
                                     eprintln!("Error requesting missing chunks when resuming download for {}: {}", game_id, e);
                                 }
@@ -982,12 +988,10 @@ impl DeckDropApp {
             }
             Message::CancelDownload(game_id) => {
                 // Cancel download
-                if let Some(peers) = self.network_games.get(&game_id) {
-                    if let Some((peer_id, _)) = peers.first() {
-                        // Cancel download (local)
-                        if let Err(e) = deckdrop_core::cancel_game_download(&game_id) {
-                            eprintln!("Error canceling download for {}: {}", game_id, e);
-                        }
+                if let Some(_peers) = self.network_games.get(&game_id) {
+                    // Cancel download (local)
+                    if let Err(e) = deckdrop_core::cancel_game_download(&game_id) {
+                        eprintln!("Error canceling download for {}: {}", game_id, e);
                     }
                 }
                 // Remove from active downloads
@@ -1161,7 +1165,7 @@ impl DeckDropApp {
                 
                 // Start chunk generation in background thread
                 let game_path_clone = game_path.clone();
-                let game_info_clone = game_info.clone();
+                let _game_info_clone = game_info.clone();
                 let progress_tracker = self.add_game_progress_tracker.clone();
                 
                 // Initialize progress
@@ -1284,7 +1288,7 @@ impl DeckDropApp {
                 
                 // Check for Window operations from System-Tray (non-blocking) via global access
                 if let Some(rx) = crate::get_window_op_rx() {
-                    if let Ok(mut rx) = rx.lock() {
+                    if let Ok(rx) = rx.lock() {
                         while let Ok(msg) = rx.try_recv() {
                             // Verarbeite Window-Operationen direkt
                             match msg {
@@ -1537,7 +1541,7 @@ impl DeckDropApp {
         Task::none()
     }
 
-    pub fn view(&self) -> Element<Message> {
+    pub fn view(&self) -> Element<'_, Message> {
         // Main layout
         let content = if self.show_license_dialog {
             self.view_license_dialog()
@@ -1588,7 +1592,7 @@ impl DeckDropApp {
             .into()
     }
     
-    fn view_status_bar(&self) -> Element<Message> {
+    fn view_status_bar(&self) -> Element<'_, Message> {
         // Lade Upload-Statistiken
         let upload_stats = if let Ok(stats) = self.upload_stats.lock() {
             stats.clone()
@@ -2009,7 +2013,6 @@ impl DeckDropApp {
                 eprintln!("ChunkRequestFailed: {} from {}: {}", chunk_hash, peer_id, error);
                 
                 // Robustheit: Circuit Breaker - Blockiere Peer bei zu vielen Fehlern
-                let mut should_block_peer = false;
                 if let Ok(mut perf_map) = self.peer_performance.lock() {
                     let perf = perf_map.entry(peer_id.clone()).or_insert_with(PeerPerformance::default);
                     perf.total_requests += 1;
@@ -2020,7 +2023,6 @@ impl DeckDropApp {
                     // Robustheit: Circuit Breaker - Blockiere früher (nach 2 Fehlern) um Crash zu verhindern
                     if perf.success_rate < 0.5 || perf.consecutive_failures >= 2 {
                         perf.blocked_until = Some(std::time::Instant::now() + std::time::Duration::from_secs(300)); // 5 Minuten
-                        should_block_peer = true;
                         eprintln!("Circuit Breaker: Peer {} blockiert für 5 Minuten (Success-Rate: {:.1}%, Consecutive Failures: {})", 
                             peer_id, perf.success_rate * 100.0, perf.consecutive_failures);
                     }
@@ -2264,7 +2266,7 @@ impl DeckDropApp {
         
         // Berechne Upload-Geschwindigkeit (vereinfachte Schätzung)
         let (upload_speed_bytes_per_sec, last_update_time, last_uploaded_bytes) = {
-            if let Ok(mut stats) = self.upload_stats.lock() {
+            if let Ok(stats) = self.upload_stats.lock() {
                 let elapsed = stats.last_update_time.elapsed().as_secs_f64();
                 
                 // Schätze Upload-Geschwindigkeit basierend auf aktiven Uploads
@@ -2572,7 +2574,7 @@ impl DeckDropApp {
     }
     
     /// Shows tabs
-    fn view_tabs(&self) -> Element<Message> {
+    fn view_tabs(&self) -> Element<'_, Message> {
         row![
             button("My Games")
                 .on_press(Message::TabChanged(Tab::MyGames))
@@ -2608,7 +2610,7 @@ impl DeckDropApp {
     }
     
     /// Shows current tab
-    fn view_current_tab(&self) -> Element<Message> {
+    fn view_current_tab(&self) -> Element<'_, Message> {
         match self.current_tab {
             Tab::MyGames => self.view_my_games(),
             Tab::NetworkGames => self.view_network_games(),
@@ -2619,7 +2621,7 @@ impl DeckDropApp {
     }
     
     /// Shows "My Games" tab
-    fn view_my_games(&self) -> Element<Message> {
+    fn view_my_games(&self) -> Element<'_, Message> {
         let mut games_column = Column::new()
             .spacing(scale(8.0))
             .padding(scale(8.0));
@@ -2878,7 +2880,7 @@ impl DeckDropApp {
     }
     
     /// Shows "Network Games" tab
-    fn view_network_games(&self) -> Element<Message> {
+    fn view_network_games(&self) -> Element<'_, Message> {
         let mut games_column = Column::new()
             .spacing(scale(8.0))
             .padding(scale(8.0));
@@ -3102,7 +3104,7 @@ impl DeckDropApp {
     }
     
     /// Shows "Peers" tab
-    fn view_peers(&self) -> Element<Message> {
+    fn view_peers(&self) -> Element<'_, Message> {
         let mut peers_column = Column::new()
             .spacing(scale(8.0))
             .padding(scale(8.0));
@@ -3160,7 +3162,7 @@ impl DeckDropApp {
     }
     
     /// Shows "Settings" tab
-    fn view_settings_tab(&self) -> Element<Message> {
+    fn view_settings_tab(&self) -> Element<'_, Message> {
         let version = env!("CARGO_PKG_VERSION");
         column![
             text("Settings").size(scale_text(20.0)),
@@ -3189,7 +3191,7 @@ impl DeckDropApp {
     }
     
     /// Shows license dialog
-    fn view_license_dialog(&self) -> Element<Message> {
+    fn view_license_dialog(&self) -> Element<'_, Message> {
         // Make the entire dialog scrollable and responsive
         scrollable(
             container(
@@ -3229,7 +3231,7 @@ impl DeckDropApp {
     }
     
     /// Shows settings dialog
-    fn view_settings(&self) -> Element<Message> {
+    fn view_settings(&self) -> Element<'_, Message> {
         container(
             column![
                 text("Settings").size(scale_text(24.0)),
@@ -3270,7 +3272,7 @@ impl DeckDropApp {
     }
     
     /// Shows "Add Game" dialog
-    fn view_add_game_dialog(&self) -> Element<Message> {
+    fn view_add_game_dialog(&self) -> Element<'_, Message> {
         container(
             scrollable(
                 column![
@@ -3393,7 +3395,7 @@ impl DeckDropApp {
     }
     
     /// Shows game details view
-    fn view_game_details(&self) -> Element<Message> {
+    fn view_game_details(&self) -> Element<'_, Message> {
         if let Some((game_path, game_info)) = &self.current_game_details {
             // Check if this game is currently downloading
             // Try to find by game_id first (for network games), then by path (for local games)

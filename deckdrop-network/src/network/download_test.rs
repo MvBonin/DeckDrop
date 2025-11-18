@@ -103,11 +103,11 @@ file_size = {}
         });
         
         // Erstelle Event-Channels
-        let (event_tx1, mut event_rx1) = mpsc::channel::<DiscoveryEvent>(32);
+        let (event_tx1, _event_rx1) = mpsc::channel::<DiscoveryEvent>(32);
         let (event_tx2, mut event_rx2) = mpsc::channel::<DiscoveryEvent>(32);
         
         // Erstelle Download-Request-Channels
-        let (download_request_tx1, download_request_rx1) = tokio::sync::mpsc::unbounded_channel::<DownloadRequest>();
+        let (_download_request_tx1, download_request_rx1) = tokio::sync::mpsc::unbounded_channel::<DownloadRequest>();
         let (download_request_tx2_to_swarm, download_request_rx2_to_swarm) = tokio::sync::mpsc::unbounded_channel::<DownloadRequest>();
         
         // Starte Discovery für beide Peers

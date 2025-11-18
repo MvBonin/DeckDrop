@@ -7,9 +7,7 @@ mod window_control;
 use app::{DeckDropApp, Message};
 use iced::application;
 use std::sync::Arc;
-use tokio::sync::mpsc;
 use std::env;
-use std::path::PathBuf;
 use std::sync::mpsc as std_mpsc;
 
 /// Globaler Window-Operation-Receiver (für einfachen Zugriff)
@@ -97,7 +95,7 @@ fn main() -> iced::Result {
     network_bridge::set_metadata_update_tx(network_bridge.metadata_update_tx);
     
     // Erstelle Channel für Window-Operationen vom System-Tray
-    let (window_op_tx, window_op_rx) = std_mpsc::channel::<Message>();
+    let (_window_op_tx, window_op_rx) = std_mpsc::channel::<Message>();
     let window_op_rx = Arc::new(std::sync::Mutex::new(window_op_rx));
     
     // Setze globalen Window-Operation-Receiver (für Zugriff in app.rs)
@@ -118,7 +116,6 @@ fn main() -> iced::Result {
         // Periodischer Tick für Event-Polling (alle 100ms)
         // Window-Operationen werden über den Tick-Mechanismus in app.rs abgefragt
         use iced::Subscription;
-        use iced::futures::StreamExt;
         use iced::futures::stream;
         use std::time::Duration;
         use futures_timer::Delay;

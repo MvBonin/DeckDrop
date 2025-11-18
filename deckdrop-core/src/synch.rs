@@ -2,8 +2,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, Arc};
-use std::collections::hash_map::Entry;
 
 /// Manifest-Struktur für Download-Status
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -963,19 +961,13 @@ file_size = {}
     
     #[test]
     fn test_validate_chunk_size() {
-        let temp_dir = TempDir::new().unwrap();
-        let game_path = temp_dir.path().join("game");
-        fs::create_dir_all(&game_path).unwrap();
-        
-        // Erstelle Test-Datei (200MB für 2 Chunks à 100MB)
+        // Verwende eine kleine Test-Datei (200MB für 2 Chunks à 100MB)
+        // Die validate_chunk_size Funktion verwendet eine fest codierte CHUNK_SIZE von 100MB
         const CHUNK_SIZE: usize = 100 * 1024 * 1024; // 100MB
-        let test_data = vec![42u8; 200 * 1024 * 1024];
-        let test_file_path = game_path.join("test.bin");
-        fs::write(&test_file_path, &test_data).unwrap();
+        let file_size = 200 * 1024 * 1024; // 200MB
         
-        let file_hash = crate::gamechecker::calculate_file_hash(&test_file_path).unwrap();
-        
-        // Erstelle Manifest
+        // Erstelle Manifest ohne tatsächliche Datei (nur für Validierung)
+        let file_hash = "test_file_hash_1234567890abcdef";
         let chunks_toml = format!(
             r#"[[file]]
 path = "test.bin"
@@ -983,13 +975,13 @@ file_hash = "{}"
 chunk_count = 2
 file_size = {}
 "#,
-            file_hash, test_data.len()
+            file_hash, file_size
         );
         
         let manifest = DownloadManifest::from_chunks_toml(
             "test-game".to_string(),
             "Test Game".to_string(),
-            game_path.to_string_lossy().to_string(),
+            "/tmp/test".to_string(),
             &chunks_toml,
         ).unwrap();
         

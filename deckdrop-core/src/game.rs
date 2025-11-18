@@ -201,7 +201,7 @@ where
         }
         
         // Öffne Datei und berechne Hash der gesamten Datei
-        let mut file = fs::File::open(&file_path)?;
+        let file = fs::File::open(&file_path)?;
         let file_size = file.metadata()?.len();
         
         // Berechne Anzahl der Chunks (aufrunden)

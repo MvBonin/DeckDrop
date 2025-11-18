@@ -37,6 +37,7 @@ pub fn verify_hash(file_path: &Path, expected_hash: &str) -> Result<bool, Box<dy
 struct ChunkFileEntry {
     path: String,
     file_hash: String,
+    #[allow(dead_code)]
     chunk_count: i64,
     file_size: i64,
 }

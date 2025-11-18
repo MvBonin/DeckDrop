@@ -1213,10 +1213,6 @@ pub async fn run_discovery(
                             }
                         }
                     }
-                    _ => {
-                        // Nicht abgedeckte DiscoveryBehaviourEvent-Varianten
-                        eprintln!("Warnung: Nicht abgedecktes DiscoveryBehaviourEvent: {:?}", discovery_event);
-                    }
                 }
             }
             SwarmEvent::NewListenAddr { address, .. } => {
@@ -1860,7 +1856,7 @@ mod tests {
         use tokio::time::{sleep, Duration};
         
         // Create two discovery channels
-        let (sender1, mut receiver1) = crate::network::channel::new_peer_channel();
+        let (sender1, _receiver1) = crate::network::channel::new_peer_channel();
         let (_sender2, _receiver2) = crate::network::channel::new_peer_channel();
         
         // Create event channels for PeerLost events
@@ -2382,7 +2378,6 @@ mod tests {
         // Dieser Test prüft, dass OutboundFailure Events keine Reconnect-Versuche mehr auslösen
         
         use tokio::sync::mpsc;
-        use libp2p::request_response::OutboundFailure;
         
         let (event_tx, mut event_rx) = mpsc::channel::<DiscoveryEvent>(100);
         
@@ -2521,7 +2516,7 @@ mod tests {
         assert!(peer_without_name.player_name.is_none(), "player_name sollte None sein wenn nicht vorhanden");
         
         // Test 3: PeerInfo sollte nicht "Unknown" als String haben
-        let peer_with_unknown = PeerInfo {
+        let _peer_with_unknown = PeerInfo {
             id: "test-peer-789".to_string(),
             addr: Some("192.168.1.102:8080".to_string()),
             player_name: Some("Unknown".to_string()),

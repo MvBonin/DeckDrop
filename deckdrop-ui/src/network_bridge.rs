@@ -2,11 +2,10 @@
 
 use deckdrop_network::network::discovery::{start_discovery, DiscoveryEvent, DownloadRequest, GamesLoader, GameMetadataLoader, ChunkLoader, MetadataUpdate};
 use deckdrop_network::network::games::NetworkGameInfo;
-use deckdrop_core::{Config, GameInfo, check_game_config_exists, load_games_from_directory};
+use deckdrop_core::{Config, GameInfo, check_game_config_exists};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use std::thread;
-use libp2p::identity::Keypair;
 
 /// Shared State für Network-Bridge
 pub struct NetworkBridge {
@@ -162,6 +161,7 @@ impl NetworkBridge {
                                 path: String,
                                 file_hash: String,
                                 chunk_count: i64,
+                                #[allow(dead_code)]
                                 file_size: i64,
                             }
                             
