@@ -56,6 +56,8 @@ pub enum GameIntegrityStatus {
 pub struct DeckDropApp {
     // Tabs
     pub current_tab: Tab,
+    pub previous_tab: Option<Tab>, // For back navigation from game details
+    pub current_game_details: Option<(PathBuf, GameInfo)>, // Current game being viewed in details
     
     // Daten
     pub my_games: Vec<(PathBuf, GameInfo)>,
@@ -130,6 +132,7 @@ pub enum Tab {
     NetworkGames,
     Peers,
     Settings,
+    GameDetails, // Detail view for a specific game
 }
 
 /// Download status for UI
@@ -307,6 +310,8 @@ impl Default for DeckDropApp {
         
         Self {
             current_tab: Tab::MyGames,
+            previous_tab: None,
+            current_game_details: None,
             my_games,
             network_games: HashMap::new(),
             peers: Vec::new(),
@@ -373,6 +378,8 @@ impl Default for DeckDropApp {
 pub enum Message {
     // Tab-Navigation
     TabChanged(Tab),
+    ShowGameDetails(PathBuf, GameInfo), // Show details for a game
+    BackFromDetails, // Go back from game details view
     
     // Network Events
     NetworkEvent(DiscoveryEvent),
@@ -512,6 +519,8 @@ impl DeckDropApp {
         
         Self {
             current_tab: Tab::MyGames,
+            previous_tab: None,
+            current_game_details: None,
             my_games,
             network_games: HashMap::new(),
             peers: Vec::new(),
@@ -575,12 +584,32 @@ impl DeckDropApp {
     pub fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::TabChanged(tab) => {
+                // Don't change previous_tab when switching to GameDetails (handled by ShowGameDetails)
+                if tab != Tab::GameDetails {
                 self.current_tab = tab;
+                }
                 // Initialize settings fields when Settings tab is opened
                 if tab == Tab::Settings {
                     self.settings_player_name = self.config.player_name.clone();
                     self.settings_download_path = self.config.download_path.to_string_lossy().to_string();
                 }
+            }
+            Message::ShowGameDetails(game_path, game_info) => {
+                // Store previous tab for back navigation
+                self.previous_tab = Some(self.current_tab);
+                self.current_game_details = Some((game_path, game_info));
+                self.current_tab = Tab::GameDetails;
+            }
+            Message::BackFromDetails => {
+                // Restore previous tab
+                if let Some(prev_tab) = self.previous_tab {
+                    self.current_tab = prev_tab;
+                    self.previous_tab = None;
+                } else {
+                    // Fallback to MyGames if no previous tab
+                    self.current_tab = Tab::MyGames;
+                }
+                self.current_game_details = None;
             }
             Message::GameIntegrityChecked(game_path, status) => {
                 self.game_integrity_status.insert(game_path.clone(), status);
@@ -955,7 +984,7 @@ impl DeckDropApp {
                             self.add_game_start_file = relative_str;
                         } else {
                             // Keep as-is if not within game path (user might be typing)
-                            self.add_game_start_file = start_file;
+                self.add_game_start_file = start_file;
                         }
                     } else {
                         // Already relative, keep as-is
@@ -2000,13 +2029,13 @@ impl DeckDropApp {
                         // Update status to Downloading (falls es noch Pending war)
                         if let Some(ds) = self.active_downloads.get_mut(&game_id) {
                             if matches!(ds.manifest.overall_status, deckdrop_core::DownloadStatus::Pending) {
-                                ds.manifest.overall_status = deckdrop_core::DownloadStatus::Downloading;
-                                
-                                // Save updated manifest
-                                if let Ok(manifest_path) = deckdrop_core::get_manifest_path(&game_id) {
-                                    let _ = ds.manifest.save(&manifest_path);
-                                }
+                            ds.manifest.overall_status = deckdrop_core::DownloadStatus::Downloading;
+                            
+                            // Save updated manifest
+                            if let Ok(manifest_path) = deckdrop_core::get_manifest_path(&game_id) {
+                                let _ = ds.manifest.save(&manifest_path);
                             }
+                        }
                         }
                         println!("Resumed/continued download for game: {}", game_id);
                     }
@@ -2076,6 +2105,7 @@ impl DeckDropApp {
             Tab::NetworkGames => self.view_network_games(),
             Tab::Peers => self.view_peers(),
             Tab::Settings => self.view_settings_tab(),
+            Tab::GameDetails => self.view_game_details(),
         }
     }
     
@@ -2110,6 +2140,8 @@ impl DeckDropApp {
                 let integrity_status = self.game_integrity_status.get(game_path)
                     .unwrap_or(&GameIntegrityStatus::NotChecked);
                 
+                let game_path_clone = game_path.clone();
+                let game_info_clone = game.clone();
                 let mut game_column = column![
                     row![
                         column![
@@ -2118,60 +2150,75 @@ impl DeckDropApp {
                             text(format!("Path: {}", game_path.display())).size(scale_text(10.0)),
                         ]
                         .width(Length::Fill),
-                        // Download control buttons (only show if download is active and not complete)
-                        if let Some(ds) = download_state {
-                            let game_id = ds.manifest.game_id.clone();
-                            let show_buttons = !matches!(ds.manifest.overall_status, deckdrop_core::DownloadStatus::Complete);
-                            
-                            if show_buttons {
-                                let (can_pause, can_resume) = (
-                                    matches!(ds.manifest.overall_status, deckdrop_core::DownloadStatus::Downloading),
-                                    matches!(ds.manifest.overall_status, deckdrop_core::DownloadStatus::Paused),
-                                );
+                        // Right column with buttons (all buttons have same width)
+                        column![
+                            // Details button (always on top)
+                            button("Details")
+                                .on_press(Message::ShowGameDetails(game_path_clone.clone(), game_info_clone.clone()))
+                                .style(button::primary)
+                                .width(Length::Fixed(scale(140.0))),
+                            // Download control buttons (only show if download is active and not complete)
+                            if let Some(ds) = download_state {
+                                let game_id = ds.manifest.game_id.clone();
+                                let show_buttons = !matches!(ds.manifest.overall_status, deckdrop_core::DownloadStatus::Complete);
+                                
+                                if show_buttons {
+                                    let (can_pause, can_resume) = (
+                                        matches!(ds.manifest.overall_status, deckdrop_core::DownloadStatus::Downloading),
+                                        matches!(ds.manifest.overall_status, deckdrop_core::DownloadStatus::Paused),
+                                    );
+                                    
+                                    column![
+                                        if can_pause {
+                                            button("Pause")
+                                                .on_press(Message::PauseDownload(game_id.clone()))
+                                                .style(button::secondary)
+                                                .width(Length::Fixed(scale(140.0)))
+                                        } else if can_resume {
+                                            button("Resume")
+                                                .on_press(Message::ResumeDownload(game_id.clone()))
+                                                .style(button::secondary)
+                                                .width(Length::Fixed(scale(140.0)))
+                                        } else {
+                                            button("Downloading...")
+                                                .style(button::secondary)
+                                                .width(Length::Fixed(scale(140.0)))
+                                        },
+                                        button("Cancel")
+                                            .on_press(Message::CancelDownload(game_id.clone()))
+                                            .width(Length::Fixed(scale(140.0))),
+                                    ]
+                                    .spacing(scale(4.0))
+                                } else {
+                                    column![].spacing(scale(4.0))
+                                }
+                            } else {
+                                column![].spacing(scale(4.0))
+                            },
+                            // Action buttons for completed games (not downloading)
+                            if download_state.is_none() || download_state.map(|ds| matches!(ds.manifest.overall_status, deckdrop_core::DownloadStatus::Complete)).unwrap_or(false) {
+                                let game_path_for_integrity = game_path.clone();
+                                // Check if currently checking based on status, not just start_time
+                                let is_checking = matches!(integrity_status, GameIntegrityStatus::Checking { .. });
                                 
                                 column![
-                                    if can_pause {
-                                        button("Pause")
-                                            .on_press(Message::PauseDownload(game_id.clone()))
+                                    if is_checking {
+                                        button("Checking...")
                                             .style(button::secondary)
-                                    } else if can_resume {
-                                        button("Resume")
-                                            .on_press(Message::ResumeDownload(game_id.clone()))
-                                            .style(button::secondary)
+                                            .width(Length::Fixed(scale(140.0)))
                                     } else {
-                                        button("Downloading...")
+                                        button("Check Integrity")
+                                            .on_press(Message::CheckIntegrity(game_path_for_integrity.clone()))
                                             .style(button::secondary)
+                                            .width(Length::Fixed(scale(140.0)))
                                     },
-                                    button("Cancel")
-                                        .on_press(Message::CancelDownload(game_id.clone())),
                                 ]
                                 .spacing(scale(4.0))
                             } else {
                                 column![].spacing(scale(4.0))
-                            }
-                        } else {
-                            column![].spacing(scale(4.0))
-                        },
-                        // Action buttons for completed games (not downloading)
-                        if download_state.is_none() || download_state.map(|ds| matches!(ds.manifest.overall_status, deckdrop_core::DownloadStatus::Complete)).unwrap_or(false) {
-                            let game_path_clone = game_path.clone();
-                            // Check if currently checking based on status, not just start_time
-                            let is_checking = matches!(integrity_status, GameIntegrityStatus::Checking { .. });
-                            
-                            column![
-                                if is_checking {
-                                    button("Checking...")
-                                        .style(button::secondary)
-                                } else {
-                                    button("Check Integrity")
-                                        .on_press(Message::CheckIntegrity(game_path_clone.clone()))
-                                        .style(button::secondary)
-                                },
-                            ]
-                            .spacing(scale(4.0))
-                        } else {
-                            column![].spacing(scale(4.0))
-                        },
+                            },
+                        ]
+                        .spacing(scale(4.0)),
                     ]
                     .spacing(scale(8.0)),
                 ];
@@ -2341,6 +2388,24 @@ impl DeckDropApp {
                     let download_state = self.active_downloads.get(game_id);
                     let is_downloading = download_state.is_some();
                     
+                    let game_id_clone = game_id.clone();
+                    // For network games, we need to construct a path - use download path + game_id
+                    let config = deckdrop_core::Config::load();
+                    let network_game_path = config.download_path.join(&game_id_clone);
+                    
+                    // Convert NetworkGameInfo to GameInfo for details view
+                    let game_info_for_details = deckdrop_core::GameInfo {
+                        game_id: game_info.game_id.clone(),
+                        name: game_info.name.clone(),
+                        version: game_info.version.clone(),
+                        start_file: game_info.start_file.clone(),
+                        start_args: game_info.start_args.clone(),
+                        description: game_info.description.clone(),
+                        additional_instructions: None, // NetworkGameInfo doesn't have this
+                        creator_peer_id: game_info.creator_peer_id.clone(),
+                        hash: None, // NetworkGameInfo doesn't have this
+                    };
+                    
                     let mut game_column = column![
                         row![
                             column![
@@ -2355,40 +2420,56 @@ impl DeckDropApp {
                                 })).size(scale_text(10.0)),
                             ]
                             .width(Length::Fill),
-                            if is_downloading {
-                                let (can_pause, can_resume) = if let Some(ds) = download_state {
-                                    (
-                                        matches!(ds.manifest.overall_status, deckdrop_core::DownloadStatus::Downloading),
-                                        matches!(ds.manifest.overall_status, deckdrop_core::DownloadStatus::Paused),
-                                    )
-                                } else {
-                                    (false, false)
-                                };
-                                
-                                column![
-                                    if can_pause {
-                                        button("Pause")
-                                            .on_press(Message::PauseDownload(game_id.clone()))
-                                            .style(button::secondary)
-                                    } else if can_resume {
-                                        button("Resume")
-                                            .on_press(Message::ResumeDownload(game_id.clone()))
-                                            .style(button::secondary)
+                            // Right column with buttons (all buttons have same width)
+                            column![
+                                // Details button (always on top)
+                                button("Details")
+                                    .on_press(Message::ShowGameDetails(network_game_path.clone(), game_info_for_details.clone()))
+                                    .style(button::primary)
+                                    .width(Length::Fixed(scale(140.0))),
+                                // Download buttons
+                                if is_downloading {
+                                    let (can_pause, can_resume) = if let Some(ds) = download_state {
+                                        (
+                                            matches!(ds.manifest.overall_status, deckdrop_core::DownloadStatus::Downloading),
+                                            matches!(ds.manifest.overall_status, deckdrop_core::DownloadStatus::Paused),
+                                        )
                                     } else {
-                                        button("Downloading...")
-                                            .style(button::secondary)
-                                    },
-                                    button("Cancel")
-                                        .on_press(Message::CancelDownload(game_id.clone())),
-                                ]
-                                .spacing(scale(4.0))
-                            } else {
-                                column![
-                                    button("Get this game")
-                                        .on_press(Message::DownloadGame(game_id.clone()))
-                                        .style(button::primary),
-                                ]
-                            },
+                                        (false, false)
+                                    };
+                                    
+                                    column![
+                                        if can_pause {
+                                            button("Pause")
+                                                .on_press(Message::PauseDownload(game_id_clone.clone()))
+                                                .style(button::secondary)
+                                                .width(Length::Fixed(scale(140.0)))
+                                        } else if can_resume {
+                                            button("Resume")
+                                                .on_press(Message::ResumeDownload(game_id_clone.clone()))
+                                                .style(button::secondary)
+                                                .width(Length::Fixed(scale(140.0)))
+                                        } else {
+                                            button("Downloading...")
+                                                .style(button::secondary)
+                                                .width(Length::Fixed(scale(140.0)))
+                                        },
+                                        button("Cancel")
+                                            .on_press(Message::CancelDownload(game_id_clone.clone()))
+                                            .width(Length::Fixed(scale(140.0))),
+                                    ]
+                                    .spacing(scale(4.0))
+                                } else {
+                                    column![
+                                        button("Get this game")
+                                            .on_press(Message::DownloadGame(game_id_clone.clone()))
+                                            .style(button::primary)
+                                            .width(Length::Fixed(scale(140.0))),
+                                    ]
+                                    .spacing(scale(4.0))
+                                },
+                            ]
+                            .spacing(scale(4.0)),
                         ]
                         .spacing(scale(8.0)),
                     ];
@@ -2695,9 +2776,9 @@ impl DeckDropApp {
                         column![
                             text("Game Executable:").size(scale_text(14.0)),
                             row![
-                                text_input("Relative to the game path", &self.add_game_start_file)
-                                    .on_input(Message::AddGameStartFileChanged)
-                                    .padding(scale(8.0)),
+                            text_input("Relative to the game path", &self.add_game_start_file)
+                                .on_input(Message::AddGameStartFileChanged)
+                                .padding(scale(8.0)),
                                 if self.add_game_path.is_empty() {
                                     button("Browse...")
                                         .padding(scale(8.0))
@@ -2769,6 +2850,210 @@ impl DeckDropApp {
         .height(Length::Fill)
         .style(container_box_style)
         .into()
+    }
+    
+    /// Shows game details view
+    fn view_game_details(&self) -> Element<Message> {
+        if let Some((game_path, game_info)) = &self.current_game_details {
+            // Check if this game is currently downloading
+            let download_state = self.active_downloads.values().find(|ds| {
+                PathBuf::from(&ds.manifest.game_path) == *game_path
+            });
+            
+            let integrity_status = self.game_integrity_status.get(game_path)
+                .unwrap_or(&GameIntegrityStatus::NotChecked);
+            
+            let mut details_column = column![
+                // Header with back button
+                row![
+                    button("← Back")
+                        .on_press(Message::BackFromDetails)
+                        .style(button::secondary),
+                    Space::with_width(Length::Fill),
+                    text("Game Details").size(scale_text(24.0)),
+                    Space::with_width(Length::Fill),
+                ]
+                .spacing(scale(8.0)),
+                Space::with_height(Length::Fixed(scale(15.0))),
+                // Game information
+                container(
+                    column![
+                        text(&game_info.name).size(scale_text(20.0)),
+                        Space::with_height(Length::Fixed(scale(8.0))),
+                        row![
+                            text("Version:").size(scale_text(14.0)),
+                            Space::with_width(Length::Fixed(scale(8.0))),
+                            text(&game_info.version).size(scale_text(14.0)),
+                        ],
+                        Space::with_height(Length::Fixed(scale(8.0))),
+                        row![
+                            text("Game ID:").size(scale_text(14.0)),
+                            Space::with_width(Length::Fixed(scale(8.0))),
+                            text(&game_info.game_id).size(scale_text(12.0)),
+                        ],
+                        Space::with_height(Length::Fixed(scale(8.0))),
+                        row![
+                            text("Path:").size(scale_text(14.0)),
+                            Space::with_width(Length::Fixed(scale(8.0))),
+                            text(game_path.display().to_string()).size(scale_text(12.0)),
+                        ],
+                        Space::with_height(Length::Fixed(scale(8.0))),
+                        row![
+                            text("Start File:").size(scale_text(14.0)),
+                            Space::with_width(Length::Fixed(scale(8.0))),
+                            text(&game_info.start_file).size(scale_text(12.0)),
+                        ],
+                        if let Some(ref start_args) = game_info.start_args {
+                            column![
+                                Space::with_height(Length::Fixed(scale(8.0))),
+                                row![
+                                    text("Start Args:").size(scale_text(14.0)),
+                                    Space::with_width(Length::Fixed(scale(8.0))),
+                                    text(start_args).size(scale_text(12.0)),
+                                ],
+                            ]
+                        } else {
+                            column![]
+                        },
+                        if let Some(ref description) = game_info.description {
+                            column![
+                                Space::with_height(Length::Fixed(scale(8.0))),
+                                text("Description:").size(scale_text(14.0)),
+                                Space::with_height(Length::Fixed(scale(4.0))),
+                                text(description).size(scale_text(12.0)),
+                            ]
+                        } else {
+                            column![]
+                        },
+                        if let Some(ref instructions) = game_info.additional_instructions {
+                            column![
+                                Space::with_height(Length::Fixed(scale(8.0))),
+                                text("Additional Instructions:").size(scale_text(14.0)),
+                                Space::with_height(Length::Fixed(scale(4.0))),
+                                text(instructions).size(scale_text(12.0)),
+                            ]
+                        } else {
+                            column![]
+                        },
+                        if let Some(ref creator_peer_id) = game_info.creator_peer_id {
+                            column![
+                                Space::with_height(Length::Fixed(scale(8.0))),
+                                row![
+                                    text("Creator Peer ID:").size(scale_text(14.0)),
+                                    Space::with_width(Length::Fixed(scale(8.0))),
+                                    text(creator_peer_id).size(scale_text(12.0)),
+                                ],
+                            ]
+                        } else {
+                            column![]
+                        },
+                        if let Some(ref hash) = game_info.hash {
+                            column![
+                                Space::with_height(Length::Fixed(scale(8.0))),
+                                row![
+                                    text("Chunks Hash:").size(scale_text(14.0)),
+                                    Space::with_width(Length::Fixed(scale(8.0))),
+                                    text(hash).size(scale_text(10.0)),
+                                ],
+                            ]
+                        } else {
+                            column![]
+                        },
+                        Space::with_height(Length::Fixed(scale(15.0))),
+                        // Integrity status
+                        row![
+                            text("Integrity Status:").size(scale_text(14.0)),
+                            Space::with_width(Length::Fixed(scale(8.0))),
+                            match integrity_status {
+                                GameIntegrityStatus::NotChecked => {
+                                    text("Not checked").size(scale_text(12.0))
+                                        .style(|_theme: &Theme| {
+                                            iced::widget::text::Style {
+                                                color: Some(Color::from_rgba(0.7, 0.7, 0.7, 1.0)),
+                                            }
+                                        })
+                                }
+                                GameIntegrityStatus::Checking { current, total } => {
+                                    if *total > 0 {
+                                        text(format!("Checking... ({}/{})", current, total)).size(scale_text(12.0))
+                                            .style(|_theme: &Theme| {
+                                                iced::widget::text::Style {
+                                                    color: Some(Color::from_rgba(0.7, 0.7, 0.7, 1.0)),
+                                                }
+                                            })
+                                    } else {
+                                        text("Checking...").size(scale_text(12.0))
+                                            .style(|_theme: &Theme| {
+                                                iced::widget::text::Style {
+                                                    color: Some(Color::from_rgba(0.7, 0.7, 0.7, 1.0)),
+                                                }
+                                            })
+                                    }
+                                }
+                                GameIntegrityStatus::Intact => {
+                                    text("Game files intact").size(scale_text(12.0))
+                                        .style(|_theme: &Theme| {
+                                            iced::widget::text::Style {
+                                                color: Some(Color::from_rgba(0.0, 1.0, 0.0, 1.0)),
+                                            }
+                                        })
+                                }
+                                GameIntegrityStatus::Changed => {
+                                    text("Game files have changed").size(scale_text(12.0))
+                                        .style(|_theme: &Theme| {
+                                            iced::widget::text::Style {
+                                                color: Some(Color::from_rgba(1.0, 0.7, 0.0, 1.0)),
+                                            }
+                                        })
+                                }
+                                GameIntegrityStatus::Error(ref e) => {
+                                    text(format!("Error: {}", e)).size(scale_text(12.0))
+                                        .style(|_theme: &Theme| {
+                                            iced::widget::text::Style {
+                                                color: Some(Color::from_rgba(1.0, 0.0, 0.0, 1.0)),
+                                            }
+                                        })
+                                }
+                            },
+                        ],
+                        // Download status if downloading
+                        if let Some(ds) = download_state {
+                            column![
+                                Space::with_height(Length::Fixed(scale(15.0))),
+                                text("Download Status:").size(scale_text(14.0)),
+                                Space::with_height(Length::Fixed(scale(4.0))),
+                                text(format!("Status: {:?}", ds.manifest.overall_status)).size(scale_text(12.0)),
+                                text(format!("Progress: {:.1}%", ds.progress_percent)).size(scale_text(12.0)),
+                                text(format!("Chunks: {}/{}", ds.manifest.progress.downloaded_chunks, ds.manifest.progress.total_chunks)).size(scale_text(12.0)),
+                            ]
+                        } else {
+                            column![]
+                        },
+                    ]
+                    .spacing(scale(8.0))
+                    .padding(scale(15.0))
+                )
+                .style(container_box_style),
+            ]
+            .spacing(scale(15.0))
+            .padding(scale(15.0));
+            
+            scrollable(details_column)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into()
+        } else {
+            // Fallback if no game details available
+            column![
+                button("← Back")
+                    .on_press(Message::BackFromDetails)
+                    .style(button::secondary),
+                text("No game details available").size(scale_text(16.0)),
+            ]
+            .spacing(scale(15.0))
+            .padding(scale(15.0))
+            .into()
+        }
     }
 }
 
