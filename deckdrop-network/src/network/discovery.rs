@@ -264,9 +264,9 @@ pub async fn run_discovery(
     // Use the same identity for the swarm
     // Konfiguriere yamux mit KeepAlive, um Verbindungen am Leben zu halten
     // Performance-Optimierung: Größere Buffer für höheren Durchsatz
-    let mut yamux_config = libp2p::yamux::Config::default();
-    yamux_config.set_max_buffer_size(32 * 1024 * 1024); // 32MB Buffer für große Chunks (Phase 3 Optimierung)
-    yamux_config.set_receive_window_size(32 * 1024 * 1024); // 32MB Receive Window
+    // Hinweis: set_max_buffer_size und set_receive_window_size sind deprecated
+    // Die yamux-Konfiguration verwendet jetzt Standardwerte
+    let yamux_config = libp2p::yamux::Config::default();
     
     let mut swarm = libp2p::SwarmBuilder::with_existing_identity(id_keys)
         .with_tokio()
@@ -344,7 +344,7 @@ pub async fn run_discovery(
                         update.player_name, update.games_count);
                     
                     // Update metadata
-                    let (new_player_name, new_games_count) = {
+                    let (_new_player_name, _new_games_count) = {
                         let mut meta = metadata_clone.lock().await;
                         if let Some(ref name) = update.player_name {
                             meta.0 = Some(name.clone());
@@ -487,7 +487,7 @@ pub async fn run_discovery(
                                 // Aktualisiere PeerInfo mit identify-Daten
                                 let peer_id_str = peer_id.to_string();
                                 let mut map = peer_info_map_clone.lock().await;
-                                if let Some(mut peer_info) = map.get_mut(&peer_id_str) {
+                                if let Some(peer_info) = map.get_mut(&peer_id_str) {
                                     let mut updated = false;
                                     
                                     if let Some(name) = player_name {
@@ -733,7 +733,7 @@ pub async fn run_discovery(
                                         let peer_id_str = peer.to_string();
                                         
                                         // Entferne Request aus Tracking
-                                        let (tracked_chunk_hash, game_id, _) = {
+                                        let (_tracked_chunk_hash, game_id, _) = {
                                             let mut pending = pending_chunk_requests_clone.lock().await;
                                             pending.remove(&request_id)
                                                 .unwrap_or_else(|| (response.chunk_hash.clone(), "unknown".to_string(), peer_id_str.clone()))
@@ -877,10 +877,6 @@ pub async fn run_discovery(
                                     let _ = event_tx.send(DiscoveryEvent::PeerLost(peer_id.to_string())).await;
                                 }
                             }
-                            _ => {
-                                println!("Unbekanntes mDNS Event: {:?}", mdns_event);
-                                eprintln!("Unbekanntes mDNS Event: {:?}", mdns_event);
-                            }
                         }
                     }
                 }
@@ -926,7 +922,7 @@ pub async fn run_discovery(
                         eprintln!("Verbindung zu {} geschlossen, versuche Reconnect...", peer_id_str);
                         
                         // Versuche manuell Reconnect mit gespeicherter Multiaddr
-                        let peer_id_for_reconnect = peer_id.clone();
+                        let _peer_id_for_reconnect = peer_id.clone();
                         let peer_addrs_for_reconnect = peer_addrs_clone.clone();
                         let reconnect_tx_for_spawn = reconnect_tx_clone.clone();
                         

@@ -47,13 +47,13 @@ impl Config {
         let main_keypair_path = directories::ProjectDirs::from("com", "deckdrop", "deckdrop")
             .map(|dirs| dirs.config_dir().join("peer_id.key"));
         
-        let mut peer_id_loaded = false;
-        
         // Wenn kein Peer-ID-Unterordner gesetzt ist, versuche die Keypair-Datei im Hauptverzeichnis zu finden
         if Self::get_peer_id_subdir().is_none() {
+            let mut peer_id_loaded = false;
+            
             if let Some(ref main_path) = main_keypair_path {
                 if main_path.exists() {
-                    if let Some(peer_id) = Self::load_peer_id_from_keypair_file(main_path) {
+                    if let Some(_peer_id) = Self::load_peer_id_from_keypair_file(main_path) {
                         // Keypair im Hauptverzeichnis gefunden - verwende Hauptverzeichnis
                         peer_id_loaded = true;
                     }
@@ -73,7 +73,6 @@ impl Config {
                                     if let Some(peer_id) = Self::load_peer_id_from_keypair_file(&keypair_path) {
                                         // Keypair in Unterordner gefunden - setze Unterordner
                                         Self::set_peer_id_subdir(&peer_id);
-                                        peer_id_loaded = true;
                                         break;
                                     }
                                 }
@@ -82,10 +81,8 @@ impl Config {
                     }
                 }
             }
-        } else {
-            // Peer-ID-Unterordner ist bereits gesetzt (z.B. durch --random-id)
-            peer_id_loaded = true;
         }
+        // Wenn Peer-ID-Unterordner bereits gesetzt ist (z.B. durch --random-id), wird die Suche übersprungen
         
         let config_path = Self::config_path();
         

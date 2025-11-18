@@ -103,10 +103,10 @@ fn main() -> iced::Result {
     // Setze globalen Window-Operation-Receiver (für Zugriff in app.rs)
     set_window_op_rx(window_op_rx.clone());
     
-    // Initialisiere System-Tray-Icon
-    if let Err(e) = init_system_tray(window_op_tx) {
-        eprintln!("Warnung: System-Tray-Icon konnte nicht initialisiert werden: {}", e);
-    }
+    // System-Tray-Icon ist deaktiviert (tray-icon Abhängigkeit entfernt, um libxdo zu vermeiden)
+    // Die Anwendung funktioniert weiterhin ohne Tray-Icon
+    // window_op_tx wird nicht mehr verwendet, aber window_op_rx wird noch für andere Zwecke benötigt
+    eprintln!("Info: System-Tray-Icon ist deaktiviert");
     
     application(
         "DeckDrop",
@@ -142,88 +142,6 @@ fn main() -> iced::Result {
     .run()
 }
 
-/// Initialisiert das System-Tray-Icon
-fn init_system_tray(window_op_tx: std_mpsc::Sender<Message>) -> Result<(), Box<dyn std::error::Error>> {
-    use tray_icon::{TrayIconBuilder, menu::{Menu, MenuItem}};
-    use image::ImageReader;
-    
-    // Lade Icon aus assets
-    let icon_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().join("assets").join("deckdrop.png");
-    
-    // Lade Icon
-    let icon = if icon_path.exists() {
-        // Lade PNG mit image crate
-        let img = ImageReader::open(&icon_path)?.decode()?;
-        let rgba = img.to_rgba8();
-        let width = rgba.width();
-        let height = rgba.height();
-        tray_icon::Icon::from_rgba(rgba.into_raw(), width, height)?
-    } else {
-        // Fallback: Erstelle ein einfaches Icon
-        eprintln!("Warnung: Icon nicht gefunden unter {:?}, verwende Standard-Icon", icon_path);
-        // Erstelle ein einfaches 16x16 Icon
-        let rgba = vec![255u8; 16 * 16 * 4];
-        tray_icon::Icon::from_rgba(rgba, 16, 16)?
-    };
-    
-    // Erstelle Menü
-    let menu = Menu::new();
-    
-    let show_item = MenuItem::new("Fenster anzeigen", true, None);
-    let hide_item = MenuItem::new("Fenster verstecken", true, None);
-    let quit_item = MenuItem::new("Beenden", true, None);
-    
-    // Speichere IDs vor dem move
-    let show_id = show_item.id();
-    let hide_id = hide_item.id();
-    let quit_id = quit_item.id();
-    
-    menu.append(&show_item)?;
-    menu.append(&hide_item)?;
-    menu.append(&quit_item)?;
-    
-    // Erstelle Tray-Icon
-    let _tray_icon = TrayIconBuilder::new()
-        .with_icon(icon)
-        .with_tooltip("DeckDrop")
-        .with_menu(Box::new(menu))
-        .build()?;
-    
-    // Starte Thread für Tray-Events
-    // Die IDs werden vor dem move kopiert
-    let show_id_clone = show_id.clone();
-    let hide_id_clone = hide_id.clone();
-    let quit_id_clone = quit_id.clone();
-    std::thread::spawn(move || {
-        use tray_icon::{TrayIconEvent, menu::MenuEvent};
-        
-        loop {
-            // Prüfe auf Tray-Icon-Events
-            if let Ok(event) = TrayIconEvent::receiver().try_recv() {
-                match event {
-                    TrayIconEvent::Click { .. } => {
-                        // Bei Klick: Fenster anzeigen/verstecken umschalten
-                        let _ = window_op_tx.send(Message::ShowWindow);
-                    }
-                    _ => {}
-                }
-            }
-            
-            // Prüfe auf Menü-Events
-            if let Ok(event) = MenuEvent::receiver().try_recv() {
-                if event.id == show_id_clone {
-                    let _ = window_op_tx.send(Message::ShowWindow);
-                } else if event.id == hide_id_clone {
-                    let _ = window_op_tx.send(Message::HideWindow);
-                } else if event.id == quit_id_clone {
-                    let _ = window_op_tx.send(Message::Quit);
-                }
-            }
-            
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
-    });
-    
-    Ok(())
-}
+// System-Tray-Icon-Funktionalität wurde entfernt, um die libxdo-Abhängigkeit zu vermeiden
+// Die init_system_tray Funktion wurde entfernt, da tray-icon nicht mehr verwendet wird
 
