@@ -167,7 +167,7 @@ fn init_system_tray(window_op_tx: std_mpsc::Sender<Message>) -> Result<(), Box<d
     };
     
     // Erstelle Menü
-    let mut menu = Menu::new();
+    let menu = Menu::new();
     
     let show_item = MenuItem::new("Fenster anzeigen", true, None);
     let hide_item = MenuItem::new("Fenster verstecken", true, None);

@@ -36,7 +36,7 @@ impl Config {
     }
     
     /// Gibt den aktuellen Peer-ID-Unterordner zurück
-    fn get_peer_id_subdir() -> Option<String> {
+    pub fn get_peer_id_subdir() -> Option<String> {
         PEER_ID_SUBDIR.get().and_then(|s| s.clone())
     }
     

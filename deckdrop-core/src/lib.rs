@@ -9,6 +9,7 @@
 pub mod config;
 pub mod game;
 pub mod gamechecker;
+pub mod network_cache;
 pub mod synch;
 
 // Re-export wichtige Typen für einfacheren Zugriff

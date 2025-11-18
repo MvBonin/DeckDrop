@@ -5,7 +5,7 @@ use iced::{
     Alignment, Element, Length, Theme, Color, Task,
 };
 use toml;
-use deckdrop_core::{Config, GameInfo, DownloadManifest, DownloadStatus};
+use deckdrop_core::{Config, GameInfo, DownloadManifest, DownloadStatus, network_cache};
 use deckdrop_network::network::discovery::DiscoveryEvent;
 use deckdrop_network::network::games::NetworkGameInfo;
 use deckdrop_network::network::peer::PeerInfo;
@@ -317,12 +317,28 @@ impl Default for DeckDropApp {
         // Don't initialize integrity checks automatically - user will trigger them manually
         println!("[DEBUG] Default::default(): {} games loaded (integrity checks will be manual)", my_games.len());
         
+        // Lade gecachte Network-Games beim Start
+        let mut network_games = HashMap::new();
+        if let Ok(cached_games) = network_cache::load_all_cached_network_games() {
+            for cached_game in cached_games {
+                let game_id = cached_game.game_id.clone();
+                let network_game_info = cached_game.to_network_game_info();
+                // Konvertiere peer_ids zu Vec<(peer_id, game_info)>
+                let peer_games: Vec<(String, NetworkGameInfo)> = cached_game.peer_ids
+                    .iter()
+                    .map(|peer_id| (peer_id.clone(), network_game_info.clone()))
+                    .collect();
+                // Zeige auch Spiele ohne aktive Peers an (offline)
+                network_games.insert(game_id, peer_games);
+            }
+        }
+        
         Self {
             current_tab: Tab::MyGames,
             previous_tab: None,
             current_game_details: None,
             my_games,
-            network_games: HashMap::new(),
+            network_games,
             peers: Vec::new(),
             active_downloads: HashMap::new(),
             processing_chunks: Arc::new(std::sync::Mutex::new(HashSet::new())),
@@ -466,6 +482,9 @@ pub enum Message {
     EditGameAdditionalInstructionsChanged(String),
     SaveGameEdit,
     CancelGameEdit,
+    
+    // Network Games Cache
+    ClearNetworkCache,
 }
 
 impl DeckDropApp {
@@ -549,12 +568,28 @@ impl DeckDropApp {
         // Don't initialize integrity checks automatically - user will trigger them manually
         println!("[DEBUG] new_with_network_rx: {} games loaded (integrity checks will be manual)", my_games.len());
         
+        // Lade gecachte Network-Games beim Start
+        let mut network_games = HashMap::new();
+        if let Ok(cached_games) = network_cache::load_all_cached_network_games() {
+            for cached_game in cached_games {
+                let game_id = cached_game.game_id.clone();
+                let network_game_info = cached_game.to_network_game_info();
+                // Konvertiere peer_ids zu Vec<(peer_id, game_info)>
+                let peer_games: Vec<(String, NetworkGameInfo)> = cached_game.peer_ids
+                    .iter()
+                    .map(|peer_id| (peer_id.clone(), network_game_info.clone()))
+                    .collect();
+                // Zeige auch Spiele ohne aktive Peers an (offline)
+                network_games.insert(game_id, peer_games);
+            }
+        }
+        
         Self {
             current_tab: Tab::MyGames,
             previous_tab: None,
             current_game_details: None,
             my_games,
-            network_games: HashMap::new(),
+            network_games,
             peers: Vec::new(),
             active_downloads,
             processing_chunks: Arc::new(std::sync::Mutex::new(HashSet::new())),
@@ -1465,6 +1500,20 @@ impl DeckDropApp {
                 self.edit_game_description = String::new();
                 self.edit_game_additional_instructions = String::new();
             }
+            Message::ClearNetworkCache => {
+                // Lösche alle gecachten Network-Games
+                if let Err(e) = network_cache::clear_all_cached_network_games() {
+                    eprintln!("Fehler beim Löschen des Network-Cache: {}", e);
+                }
+                // Entferne alle offline-Spiele aus der UI (behalte nur Spiele mit aktiven Peers)
+                self.network_games.retain(|_, games| {
+                    games.retain(|(peer_id, _)| {
+                        // Prüfe, ob dieser Peer noch online ist
+                        self.peers.iter().any(|p| p.id == *peer_id)
+                    });
+                    !games.is_empty()
+                });
+            }
         }
         Task::none()
     }
@@ -1629,7 +1678,14 @@ impl DeckDropApp {
             DiscoveryEvent::PeerLost(peer_id) => {
                 self.peers.retain(|p| p.id != peer_id);
                 self.status.peer_count = self.peers.len();
-                // Also remove games from this peer
+                // Entferne Peer-ID aus Cache für alle Spiele dieses Peers
+                let game_ids_to_update: Vec<String> = self.network_games.keys().cloned().collect();
+                for game_id in game_ids_to_update {
+                    if let Err(e) = network_cache::remove_peer_from_cached_game(&game_id, &peer_id) {
+                        eprintln!("Fehler beim Entfernen von Peer aus gecachtem Spiel: {}", e);
+                    }
+                }
+                // Entferne Peer aus UI-State
                 self.network_games.retain(|_, games| {
                     games.retain(|(pid, _)| pid != &peer_id);
                     !games.is_empty()
@@ -1638,6 +1694,11 @@ impl DeckDropApp {
             DiscoveryEvent::GamesListReceived { peer_id, games } => {
                 for game in games {
                     let game_id = game.game_id.clone();
+                    // Speichere im Cache
+                    if let Err(e) = network_cache::update_network_game_peer(&game_id, &peer_id, &game) {
+                        eprintln!("Fehler beim Speichern von Network-Game im Cache: {}", e);
+                    }
+                    // Aktualisiere UI-State
                     self.network_games
                         .entry(game_id)
                         .or_insert_with(Vec::new)
@@ -2599,8 +2660,17 @@ impl DeckDropApp {
             .spacing(scale(8.0))
             .padding(scale(8.0));
         
+        // Header mit Titel und Clear Cache Button
         games_column = games_column.push(
-            text("Network Games").size(scale_text(20.0))
+            row![
+                text("Network Games").size(scale_text(20.0)),
+                Space::with_width(Length::Fill),
+                button("Clear Cache")
+                    .on_press(Message::ClearNetworkCache)
+                    .style(button::secondary)
+                    .width(Length::Fixed(scale(150.0))),
+            ]
+            .width(Length::Fill)
         );
         
         if self.network_games.is_empty() {
@@ -2631,18 +2701,36 @@ impl DeckDropApp {
                         hash: None, // NetworkGameInfo doesn't have this
                     };
                     
+                    // Bestimme Online/Offline-Status und Peer-Anzahl
+                    let unique_peers: std::collections::HashSet<_> = games.iter()
+                        .map(|(peer_id, _)| peer_id)
+                        .collect();
+                    let peer_count = unique_peers.len();
+                    let is_online = peer_count > 0;
+                    
                     let mut game_column = column![
                         row![
                             column![
                                 text(&game_info.name).size(scale_text(16.0)),
                                 text(format!("Version: {}", game_info.version)).size(scale_text(12.0)),
-                                text(format!("From: {} Peer(s)", {
-                                    // Zähle eindeutige Peer-IDs
-                                    let unique_peers: std::collections::HashSet<_> = games.iter()
-                                        .map(|(peer_id, _)| peer_id)
-                                        .collect();
-                                    unique_peers.len()
-                                })).size(scale_text(10.0)),
+                                // Status und Peer-Anzahl
+                                if is_online {
+                                    text(format!("🟢 Online - {} Peer(s)", peer_count))
+                                        .size(scale_text(10.0))
+                                        .style(|_theme: &Theme| {
+                                            iced::widget::text::Style {
+                                                color: Some(Color::from_rgba(0.0, 0.8, 0.0, 1.0)),
+                                            }
+                                        })
+                                } else {
+                                    text("🔴 Offline")
+                                        .size(scale_text(10.0))
+                                        .style(|_theme: &Theme| {
+                                            iced::widget::text::Style {
+                                                color: Some(Color::from_rgba(0.8, 0.0, 0.0, 1.0)),
+                                            }
+                                        })
+                                },
                             ]
                             .width(Length::Fill),
                             // Right column with buttons (all buttons have same width)
