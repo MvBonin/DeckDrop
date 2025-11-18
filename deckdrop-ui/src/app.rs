@@ -390,6 +390,7 @@ pub enum Message {
     AddGameNameChanged(String),
     AddGameVersionChanged(String),
     AddGameStartFileChanged(String),
+    BrowseStartFile,
     AddGameStartArgsChanged(String),
     AddGameDescriptionChanged(String),
     AddGameAdditionalInstructionsChanged(String),
@@ -943,7 +944,54 @@ impl DeckDropApp {
                 self.add_game_version = version;
             }
             Message::AddGameStartFileChanged(start_file) => {
-                self.add_game_start_file = start_file;
+                // If user enters an absolute path that's within game_path, convert to relative
+                if !start_file.is_empty() && !self.add_game_path.is_empty() {
+                    let start_file_path = PathBuf::from(&start_file);
+                    if start_file_path.is_absolute() {
+                        let game_path = PathBuf::from(&self.add_game_path);
+                        if let Ok(relative_path) = start_file_path.strip_prefix(&game_path) {
+                            // Convert to forward slashes for cross-platform compatibility
+                            let relative_str = relative_path.to_string_lossy().replace('\\', "/");
+                            self.add_game_start_file = relative_str;
+                        } else {
+                            // Keep as-is if not within game path (user might be typing)
+                            self.add_game_start_file = start_file;
+                        }
+                    } else {
+                        // Already relative, keep as-is
+                        self.add_game_start_file = start_file;
+                    }
+                } else {
+                    self.add_game_start_file = start_file;
+                }
+            }
+            Message::BrowseStartFile => {
+                if self.add_game_path.is_empty() {
+                    // Button should be disabled, but handle gracefully
+                    return Task::none();
+                }
+                
+                let game_path = PathBuf::from(&self.add_game_path);
+                if !game_path.exists() {
+                    eprintln!("Error: Game path does not exist: {}", game_path.display());
+                    return Task::none();
+                }
+                
+                // Open file dialog starting from game path
+                if let Some(selected_file) = rfd::FileDialog::new()
+                    .set_title("Select Game Executable")
+                    .set_directory(&game_path)
+                    .pick_file()
+                {
+                    // Convert to relative path from game_path
+                    if let Ok(relative_path) = selected_file.strip_prefix(&game_path) {
+                        // Convert to forward slashes for cross-platform compatibility
+                        let relative_str = relative_path.to_string_lossy().replace('\\', "/");
+                        self.add_game_start_file = relative_str;
+                    } else {
+                        eprintln!("Error: Selected file is not within game path");
+                    }
+                }
             }
             Message::AddGameStartArgsChanged(args) => {
                 self.add_game_start_args = args;
@@ -2646,9 +2694,21 @@ impl DeckDropApp {
                         // Right column
                         column![
                             text("Game Executable:").size(scale_text(14.0)),
-                            text_input("Relative to the game path", &self.add_game_start_file)
-                                .on_input(Message::AddGameStartFileChanged)
-                                .padding(scale(8.0)),
+                            row![
+                                text_input("Relative to the game path", &self.add_game_start_file)
+                                    .on_input(Message::AddGameStartFileChanged)
+                                    .padding(scale(8.0)),
+                                if self.add_game_path.is_empty() {
+                                    button("Browse...")
+                                        .padding(scale(8.0))
+                                        .style(button::secondary)
+                                } else {
+                                    button("Browse...")
+                                        .on_press(Message::BrowseStartFile)
+                                        .padding(scale(8.0))
+                                },
+                            ]
+                            .spacing(scale(8.0)),
                             // Progress bar for chunk generation
                             if let Some((current, total, file_name)) = &self.add_game_progress {
                                 if *total > 0 {
