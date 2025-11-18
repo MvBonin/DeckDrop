@@ -44,6 +44,7 @@ fn format_size(bytes: u64) -> String {
 /// Game integrity status
 #[derive(Debug, Clone, PartialEq)]
 pub enum GameIntegrityStatus {
+    NotChecked,
     Checking { current: usize, total: usize },
     Intact,
     Changed,
@@ -301,35 +302,8 @@ impl Default for DeckDropApp {
         }
         
         let mut game_integrity_status = HashMap::new();
-        // Initialize all games as "Checking" - get total file count immediately
-        println!("[DEBUG] Default::default(): Initializing integrity status for {} games", my_games.len());
-        for (game_path, _) in &my_games {
-            let chunks_toml_path = game_path.join("deckdrop_chunks.toml");
-            let total = if chunks_toml_path.exists() {
-                if let Ok(content) = std::fs::read_to_string(&chunks_toml_path) {
-                    if let Ok(parsed) = toml::from_str::<toml::Value>(&content) {
-                        if let Some(files) = parsed.get("file").and_then(|f| f.as_array()) {
-                            files.len()
-                        } else {
-                            println!("[DEBUG] No 'file' array found in chunks.toml for {}", game_path.display());
-                            0
-                        }
-                    } else {
-                        println!("[DEBUG] Failed to parse chunks.toml for {}", game_path.display());
-                        0
-                    }
-                } else {
-                    println!("[DEBUG] Failed to read chunks.toml for {}", game_path.display());
-                    0
-                }
-            } else {
-                println!("[DEBUG] chunks.toml does not exist for {}", game_path.display());
-                0
-            };
-            println!("[DEBUG] Default::default(): Initialized game {}: total={}", game_path.display(), total);
-            game_integrity_status.insert(game_path.clone(), GameIntegrityStatus::Checking { current: 0, total });
-        }
-        println!("[DEBUG] Default::default(): Initialized {} games with integrity status", game_integrity_status.len());
+        // Don't initialize integrity checks automatically - user will trigger them manually
+        println!("[DEBUG] Default::default(): {} games loaded (integrity checks will be manual)", my_games.len());
         
         Self {
             current_tab: Tab::MyGames,
@@ -446,6 +420,9 @@ pub enum Message {
     // Progress update for integrity checks
     UpdateIntegrityProgress(PathBuf, usize), // game_path, current
     
+    // Start integrity check manually
+    CheckIntegrity(PathBuf), // game_path
+    
     // Progress update for adding games (chunk generation)
     UpdateAddGameProgress(usize, usize, String), // current, total, current_file
     AddGameChunksGenerated(PathBuf, Result<String, String>), // game_path, hash_result
@@ -529,35 +506,8 @@ impl DeckDropApp {
         }
         
         let mut game_integrity_status = HashMap::new();
-        // Initialize all games as "Checking" - get total file count immediately
-        println!("[DEBUG] new_with_network_rx: Initializing integrity status for {} games", my_games.len());
-        for (game_path, _) in &my_games {
-            let chunks_toml_path = game_path.join("deckdrop_chunks.toml");
-            let total = if chunks_toml_path.exists() {
-                if let Ok(content) = std::fs::read_to_string(&chunks_toml_path) {
-                    if let Ok(parsed) = toml::from_str::<toml::Value>(&content) {
-                        if let Some(files) = parsed.get("file").and_then(|f| f.as_array()) {
-                            files.len()
-                        } else {
-                            println!("[DEBUG] No 'file' array found in chunks.toml for {}", game_path.display());
-                            0
-                        }
-                    } else {
-                        println!("[DEBUG] Failed to parse chunks.toml for {}", game_path.display());
-                        0
-                    }
-                } else {
-                    println!("[DEBUG] Failed to read chunks.toml for {}", game_path.display());
-                    0
-                }
-            } else {
-                println!("[DEBUG] chunks.toml does not exist for {}", game_path.display());
-                0
-            };
-            println!("[DEBUG] Initialized game {}: total={}", game_path.display(), total);
-            game_integrity_status.insert(game_path.clone(), GameIntegrityStatus::Checking { current: 0, total });
-        }
-        println!("[DEBUG] new_with_network_rx: Initialized {} games with integrity status", game_integrity_status.len());
+        // Don't initialize integrity checks automatically - user will trigger them manually
+        println!("[DEBUG] new_with_network_rx: {} games loaded (integrity checks will be manual)", my_games.len());
         
         Self {
             current_tab: Tab::MyGames,
@@ -636,6 +586,111 @@ impl DeckDropApp {
                 // Remove start time when check is complete
                 self.integrity_check_start_time.remove(&game_path);
             }
+            Message::CheckIntegrity(game_path) => {
+                // Check if already checking
+                if self.integrity_check_start_time.contains_key(&game_path) {
+                    return Task::none(); // Already checking
+                }
+                
+                // Get total file count from chunks.toml
+                let chunks_toml_path = game_path.join("deckdrop_chunks.toml");
+                let total = if chunks_toml_path.exists() {
+                    if let Ok(content) = std::fs::read_to_string(&chunks_toml_path) {
+                        if let Ok(parsed) = toml::from_str::<toml::Value>(&content) {
+                            if let Some(files) = parsed.get("file").and_then(|f| f.as_array()) {
+                                files.len()
+                            } else {
+                                0
+                            }
+                        } else {
+                            0
+                        }
+                    } else {
+                        0
+                    }
+                } else {
+                    0
+                };
+                
+                // Set status to Checking
+                self.game_integrity_status.insert(game_path.clone(), GameIntegrityStatus::Checking { current: 0, total });
+                
+                // Set start time for progress tracking
+                self.integrity_check_start_time.insert(game_path.clone(), std::time::Instant::now());
+                
+                // Start the actual integrity check with progress tracking in a separate thread
+                let game_path_for_check = game_path.clone();
+                let progress_tracker = self.integrity_check_progress.clone();
+                let results_tracker = self.integrity_check_results.clone();
+                
+                // Add to progress tracker immediately to mark as started
+                if let Ok(mut progress) = self.integrity_check_progress.lock() {
+                    progress.insert(game_path_for_check.clone(), 0);
+                }
+                
+                std::thread::spawn(move || {
+                    // Perform light check (fast, checks for file changes)
+                    let result = deckdrop_core::light_check_game(&game_path_for_check);
+                    match result {
+                        Ok(light_result) => {
+                            if light_result.missing_files.is_empty() && light_result.extra_files.is_empty() {
+                                // All files match, do full integrity check with progress
+                                let integrity_result = deckdrop_core::verify_game_integrity_with_progress(
+                                    &game_path_for_check,
+                                    Some({
+                                        let progress_tracker = progress_tracker.clone();
+                                        let game_path = game_path_for_check.clone();
+                                        move |current, total| {
+                                            // Update progress in shared tracker
+                                            if let Ok(mut progress) = progress_tracker.lock() {
+                                                progress.insert(game_path.clone(), current);
+                                            }
+                                        }
+                                    })
+                                );
+                                
+                                // Determine final status
+                                let final_status = match integrity_result {
+                                    Ok(result) => {
+                                        if result.failed_files.is_empty() && result.missing_files.is_empty() {
+                                            GameIntegrityStatus::Intact
+                                        } else {
+                                            GameIntegrityStatus::Changed
+                                        }
+                                    }
+                                    Err(_) => GameIntegrityStatus::Changed,
+                                };
+                                
+                                // Store result and clear progress tracker
+                                if let Ok(mut results) = results_tracker.lock() {
+                                    results.insert(game_path_for_check.clone(), final_status);
+                                }
+                                // Clear progress tracker - this signals that the check is complete
+                                if let Ok(mut progress) = progress_tracker.lock() {
+                                    progress.remove(&game_path_for_check);
+                                }
+                            } else {
+                                // Files changed - store result and clear progress tracker
+                                if let Ok(mut results) = results_tracker.lock() {
+                                    results.insert(game_path_for_check.clone(), GameIntegrityStatus::Changed);
+                                }
+                                if let Ok(mut progress) = progress_tracker.lock() {
+                                    progress.remove(&game_path_for_check);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            // Error - store result and clear progress tracker
+                            if let Ok(mut results) = results_tracker.lock() {
+                                results.insert(game_path_for_check.clone(), GameIntegrityStatus::Error(e.to_string()));
+                            }
+                            if let Ok(mut progress) = progress_tracker.lock() {
+                                progress.remove(&game_path_for_check);
+                            }
+                        }
+                    }
+                });
+            }
             Message::UpdateAddGameProgress(current, total, file_name) => {
                 self.add_game_progress = Some((current, total, file_name));
             }
@@ -710,38 +765,8 @@ impl DeckDropApp {
                 // Mark the newly added game as "Intact" immediately (we just generated chunks, so we know it's valid)
                 self.game_integrity_status.insert(game_path.clone(), GameIntegrityStatus::Intact);
                 
-                // Initialize integrity status for other games as "Checking" - get total file count immediately
-                // Only set to "Checking" if not already set (preserve existing status)
-                for (other_game_path, _) in &self.my_games {
-                    // Skip the newly added game (already set to Intact above)
-                    if other_game_path == &game_path {
-                        continue;
-                    }
-                    
-                    // Only initialize if not already set
-                    if !self.game_integrity_status.contains_key(other_game_path) {
-                        let chunks_toml_path = other_game_path.join("deckdrop_chunks.toml");
-                        let total = if chunks_toml_path.exists() {
-                            if let Ok(content) = std::fs::read_to_string(&chunks_toml_path) {
-                                if let Ok(parsed) = toml::from_str::<toml::Value>(&content) {
-                                    if let Some(files) = parsed.get("file").and_then(|f| f.as_array()) {
-                                        files.len()
-                                    } else {
-                                        0
-                                    }
-                                } else {
-                                    0
-                                }
-                            } else {
-                                0
-                            }
-                        } else {
-                            0
-                        };
-                        self.game_integrity_status.insert(other_game_path.clone(), GameIntegrityStatus::Checking { current: 0, total });
-                        // Don't set start time here - it will be set when the check actually starts
-                    }
-                }
+                // Don't initialize integrity status for other games - they will show "NotChecked" by default
+                // User can trigger integrity check manually via button
                 
                 // Close dialog and reset form
                 self.show_add_game_dialog = false;
@@ -879,26 +904,8 @@ impl DeckDropApp {
                             if !game_exists {
                                 self.my_games.push((game_path.clone(), game_info));
                                 
-                                // Initialisiere Integrity-Status
-                                let chunks_toml_path = game_path.join("deckdrop_chunks.toml");
-                                let total = if chunks_toml_path.exists() {
-                                    if let Ok(content) = std::fs::read_to_string(&chunks_toml_path) {
-                                        if let Ok(parsed) = toml::from_str::<toml::Value>(&content) {
-                                            if let Some(files) = parsed.get("file").and_then(|f| f.as_array()) {
-                                                files.len()
-                                            } else {
-                                                0
-                                            }
-                                        } else {
-                                            0
-                                        }
-                                    } else {
-                                        0
-                                    }
-                                } else {
-                                    0
-                                };
-                                self.game_integrity_status.insert(game_path.clone(), GameIntegrityStatus::Checking { current: 0, total });
+                                // Don't initialize integrity status - will show "NotChecked" by default
+                                // User can trigger integrity check manually via button
                                 
                                 // Dedupliziere Spiele nach game_id
                                 self.deduplicate_games_by_id();
@@ -1171,139 +1178,13 @@ impl DeckDropApp {
                         // Only update if still checking
                         if matches!(current_status, GameIntegrityStatus::Checking { .. }) {
                             *current_status = final_status;
-                            // Remove start time
-                            self.integrity_check_start_time.remove(&game_path);
                         }
                     }
+                    // Always remove start time when check completes (regardless of status match)
+                    self.integrity_check_start_time.remove(&game_path);
                 }
                 
-                // THEN: Check if we need to start an integrity check
-                // This ensures the check starts immediately, not after simulated progress
-                // Only check games that:
-                // 1. Have status Checking with current == 0
-                // 2. Are NOT already in the progress tracker (check already running)
-                // 3. Do NOT have a start_time set (check already started)
-                let games_to_check: Vec<PathBuf> = {
-                    let progress_tracker_locked = self.integrity_check_progress.lock().ok();
-                    self.game_integrity_status
-                        .iter()
-                        .filter(|(path, status)| {
-                            if let GameIntegrityStatus::Checking { current, total } = status {
-                                // Must have total > 0 and current == 0
-                                if *total > 0 && *current == 0 {
-                                    // Check if already in progress tracker
-                                    let in_progress = if let Some(ref progress) = progress_tracker_locked {
-                                        progress.contains_key(*path)
-                                    } else {
-                                        false
-                                    };
-                                    // Check if start_time is already set
-                                    let already_started = self.integrity_check_start_time.contains_key(*path);
-                                    // Only start if not already running
-                                    !in_progress && !already_started
-                                } else {
-                                    false
-                                }
-                            } else {
-                                false
-                            }
-                        })
-                        .map(|(path, _)| path.clone())
-                        .collect()
-                };
-                
-                // If we have games to check, start the check immediately
-                if !games_to_check.is_empty() {
-                    // Start integrity check for first game that needs checking
-                    let game_path = games_to_check[0].clone();
-                    
-                    // Get the total file count (should already be set during initialization)
-                    let total = if let Some(GameIntegrityStatus::Checking { total, .. }) = self.game_integrity_status.get(&game_path) {
-                        *total
-                    } else {
-                        0
-                    };
-                    
-                    // Set start time for progress tracking (marks that check has started)
-                    self.integrity_check_start_time.insert(game_path.clone(), std::time::Instant::now());
-                    
-                    // Start the actual integrity check with progress tracking in a separate thread
-                    // This prevents blocking the UI thread
-                    let game_path_for_check = game_path.clone();
-                    let progress_tracker = self.integrity_check_progress.clone();
-                    
-                    // Spawn the integrity check in a separate thread
-                    let results_tracker = self.integrity_check_results.clone();
-                    // Add to progress tracker immediately to mark as started
-                    if let Ok(mut progress) = self.integrity_check_progress.lock() {
-                        progress.insert(game_path_for_check.clone(), 0);
-                    }
-                    std::thread::spawn(move || {
-                        // Perform light check (fast, checks for file changes)
-                        let result = deckdrop_core::light_check_game(&game_path_for_check);
-                        match result {
-                            Ok(light_result) => {
-                                if light_result.missing_files.is_empty() && light_result.extra_files.is_empty() {
-                                    // All files match, do full integrity check with progress
-                                    let integrity_result = deckdrop_core::verify_game_integrity_with_progress(
-                                        &game_path_for_check,
-                                        Some({
-                                            let progress_tracker = progress_tracker.clone();
-                                            let game_path = game_path_for_check.clone();
-                                            move |current, total| {
-                                                // Update progress in shared tracker
-                                                if let Ok(mut progress) = progress_tracker.lock() {
-                                                    progress.insert(game_path.clone(), current);
-                                                }
-                                            }
-                                        })
-                                    );
-                                    
-                                    // Determine final status
-                                    let final_status = match integrity_result {
-                                        Ok(result) => {
-                                            if result.failed_files.is_empty() && result.missing_files.is_empty() {
-                                                GameIntegrityStatus::Intact
-                                            } else {
-                                                GameIntegrityStatus::Changed
-                                            }
-                                        }
-                                        Err(_) => GameIntegrityStatus::Changed,
-                                    };
-                                    
-                                    // Store result and clear progress tracker
-                                    if let Ok(mut results) = results_tracker.lock() {
-                                        results.insert(game_path_for_check.clone(), final_status);
-                                    }
-                                    // Clear progress tracker - this signals that the check is complete
-                                    if let Ok(mut progress) = progress_tracker.lock() {
-                                        progress.remove(&game_path_for_check);
-                                    }
-                                } else {
-                                    // Files changed - store result and clear progress tracker
-                                    if let Ok(mut results) = results_tracker.lock() {
-                                        results.insert(game_path_for_check.clone(), GameIntegrityStatus::Changed);
-                                    }
-                                    if let Ok(mut progress) = progress_tracker.lock() {
-                                        progress.remove(&game_path_for_check);
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                // Error - store result and clear progress tracker
-                                if let Ok(mut results) = results_tracker.lock() {
-                                    results.insert(game_path_for_check.clone(), GameIntegrityStatus::Error(e.to_string()));
-                                }
-                                if let Ok(mut progress) = progress_tracker.lock() {
-                                    progress.remove(&game_path_for_check);
-                                }
-                            }
-                        }
-                    });
-                    
-                    // Return immediately - progress will be updated via Tick
-                    return Task::none();
-                }
+                // Integrity checks are now manual - no automatic checking
                 
                 // Don't create additional Tick tasks - the subscription in main.rs already sends Ticks every 100ms
                 // This prevents task cascades that slow down the application
@@ -1361,7 +1242,7 @@ impl DeckDropApp {
         
         // Status-Text
         let status_text = if upload_stats.active_upload_count > 0 {
-            format!("Upload: {} Chunks | Speed: {}", upload_stats.active_upload_count, speed_text)
+            format!("Upload: {} Chunks (active) | Speed: {}", upload_stats.active_upload_count, speed_text)
         } else {
             "Upload: Idle".to_string()
         };
@@ -1786,10 +1667,18 @@ impl DeckDropApp {
     
     /// Updates upload statistics
     fn update_upload_stats(&mut self) {
-        // Schätze aktive Uploads basierend auf aktiven Downloads anderer Peers
+        // Schätze aktive Uploads basierend auf der Anzahl der Peers
+        // Jeder Peer kann theoretisch Chunks von uns anfordern
         // Da wir keinen direkten Zugriff auf die Netzwerk-Schicht haben,
-        // schätzen wir die Uploads basierend auf der Anzahl der Peers und aktiven Downloads
-        let active_upload_count = self.status.peer_count.min(self.status.active_download_count);
+        // schätzen wir die Uploads basierend auf der Anzahl der verbundenen Peers
+        // (jeder Peer könnte theoretisch Chunks anfordern)
+        let active_upload_count = if self.status.peer_count > 0 {
+            // Schätze: Jeder Peer könnte 1-2 Chunks gleichzeitig anfordern
+            // Verwende eine konservative Schätzung
+            self.status.peer_count
+        } else {
+            0
+        };
         
         // Berechne Upload-Geschwindigkeit (vereinfachte Schätzung)
         let (upload_speed_bytes_per_sec, last_update_time, last_uploaded_bytes) = {
@@ -1967,30 +1856,8 @@ impl DeckDropApp {
                 // Deduplicate games by game_id
                 self.deduplicate_games_by_id();
                 
-                // Initialize integrity status for all games
-                for (game_path, _) in &self.my_games {
-                    if !self.game_integrity_status.contains_key(game_path) {
-                        let chunks_toml_path = game_path.join("deckdrop_chunks.toml");
-                        let total = if chunks_toml_path.exists() {
-                            if let Ok(content) = std::fs::read_to_string(&chunks_toml_path) {
-                                if let Ok(parsed) = toml::from_str::<toml::Value>(&content) {
-                                    if let Some(files) = parsed.get("file").and_then(|f| f.as_array()) {
-                                        files.len()
-                                    } else {
-                                        0
-                                    }
-                                } else {
-                                    0
-                                }
-                            } else {
-                                0
-                            }
-                        } else {
-                            0
-                        };
-                        self.game_integrity_status.insert(game_path.clone(), GameIntegrityStatus::Checking { current: 0, total });
-                    }
-                }
+                // Don't initialize integrity status - games will show "NotChecked" by default
+                // User can trigger integrity check manually via button
             }
         }
         
@@ -2011,28 +1878,8 @@ impl DeckDropApp {
                             if let Ok(game_info) = deckdrop_core::GameInfo::load_from_path(manifest_dir) {
                                 self.my_games.push((game_path.clone(), game_info));
                                 
-                                // Initialize integrity status for downloading game (only if not already set)
-                                if !self.game_integrity_status.contains_key(&game_path) {
-                                    let chunks_toml_path = game_path.join("deckdrop_chunks.toml");
-                                    let total = if chunks_toml_path.exists() {
-                                        if let Ok(content) = std::fs::read_to_string(&chunks_toml_path) {
-                                            if let Ok(parsed) = toml::from_str::<toml::Value>(&content) {
-                                                if let Some(files) = parsed.get("file").and_then(|f| f.as_array()) {
-                                                    files.len()
-                                                } else {
-                                                    0
-                                                }
-                                            } else {
-                                                0
-                                            }
-                                        } else {
-                                            0
-                                        }
-                                    } else {
-                                        0
-                                    };
-                                    self.game_integrity_status.insert(game_path, GameIntegrityStatus::Checking { current: 0, total });
-                                }
+                                // Don't initialize integrity status - will show "NotChecked" by default
+                                // User can trigger integrity check manually via button
                             }
                         }
                     }
@@ -2128,7 +1975,14 @@ impl DeckDropApp {
             }
         });
         
-        self.status.active_download_count = self.active_downloads.len();
+        // Count only active downloads (not Complete, not Cancelled)
+        self.status.active_download_count = self.active_downloads.values()
+            .filter(|ds| {
+                !matches!(ds.manifest.overall_status, 
+                    deckdrop_core::DownloadStatus::Complete | 
+                    deckdrop_core::DownloadStatus::Cancelled)
+            })
+            .count();
     }
     
     /// Shows tabs
@@ -2206,7 +2060,7 @@ impl DeckDropApp {
                 });
                 
                 let integrity_status = self.game_integrity_status.get(game_path)
-                    .unwrap_or(&GameIntegrityStatus::Checking { current: 0, total: 0 });
+                    .unwrap_or(&GameIntegrityStatus::NotChecked);
                 
                 let mut game_column = column![
                     row![
@@ -2247,6 +2101,26 @@ impl DeckDropApp {
                             } else {
                                 column![].spacing(scale(4.0))
                             }
+                        } else {
+                            column![].spacing(scale(4.0))
+                        },
+                        // Action buttons for completed games (not downloading)
+                        if download_state.is_none() || download_state.map(|ds| matches!(ds.manifest.overall_status, deckdrop_core::DownloadStatus::Complete)).unwrap_or(false) {
+                            let game_path_clone = game_path.clone();
+                            // Check if currently checking based on status, not just start_time
+                            let is_checking = matches!(integrity_status, GameIntegrityStatus::Checking { .. });
+                            
+                            column![
+                                if is_checking {
+                                    button("Checking...")
+                                        .style(button::secondary)
+                                } else {
+                                    button("Check Integrity")
+                                        .on_press(Message::CheckIntegrity(game_path_clone.clone()))
+                                        .style(button::secondary)
+                                },
+                            ]
+                            .spacing(scale(4.0))
                         } else {
                             column![].spacing(scale(4.0))
                         },
@@ -2355,6 +2229,7 @@ impl DeckDropApp {
                 
                 if show_integrity {
                     let (status_text, status_color) = match integrity_status {
+                        GameIntegrityStatus::NotChecked => ("Integrity not checked".to_string(), Color::from_rgba(0.7, 0.7, 0.7, 1.0)),
                         GameIntegrityStatus::Checking { current, total } => {
                             if *total > 0 {
                                 // Show current/total, but if current is 0, show "Starting..."
