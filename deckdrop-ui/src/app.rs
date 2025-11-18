@@ -1275,7 +1275,33 @@ impl DeckDropApp {
         let content = if self.show_license_dialog {
             self.view_license_dialog()
         } else if self.show_settings {
-            self.view_settings()
+            column![
+                container(
+                    row![
+                        Space::with_width(Length::Fill),
+                        container(
+                            column![
+                                self.view_settings(),
+                                Space::with_height(Length::Fill),
+                            ]
+                            .width(Length::Fill)
+                            .height(Length::Fill)
+                        )
+                        .width(Length::Fixed(500.0))
+                        .height(Length::Fill),
+                        Space::with_width(Length::Fill),
+                    ]
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                )
+                .width(Length::Fill)
+                .height(Length::Fill),
+                self.view_status_bar(),
+            ]
+            .spacing(scale(8.0))
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
         } else if self.show_add_game_dialog {
             self.view_add_game_dialog()
         } else {
@@ -2701,19 +2727,19 @@ impl DeckDropApp {
                 text("Player Name:").size(scale_text(14.0)),
                 text_input("Player Name", &self.settings_player_name)
                     .on_input(Message::SettingsPlayerNameChanged)
-                    .padding(10),
+                    .padding(scale(8.0)),
                 Space::with_height(Length::Fixed(scale(8.0))),
                 text("Download Path:").size(scale_text(14.0)),
                 row![
                     text_input("Download Path", &self.settings_download_path)
                         .on_input(Message::SettingsDownloadPathChanged)
-                        .padding(10),
+                        .padding(scale(8.0)),
                     button("Browse...")
                         .on_press(Message::BrowseDownloadPath)
-                        .padding(10),
+                        .padding(scale(8.0)),
                 ]
                 .spacing(scale(8.0)),
-                Space::with_height(20),
+                Space::with_height(Length::Fixed(scale(20.0))),
                 row![
                     button("Cancel")
                         .on_press(Message::CancelSettings),
@@ -2724,8 +2750,8 @@ impl DeckDropApp {
                 ]
                 .width(Length::Fill),
             ]
-            .spacing(15)
-            .padding(30)
+            .spacing(scale(8.0))
+            .padding(scale(8.0))
         )
         .width(Length::Fixed(500.0))
         .height(Length::Shrink)
@@ -2856,238 +2882,335 @@ impl DeckDropApp {
     fn view_game_details(&self) -> Element<Message> {
         if let Some((game_path, game_info)) = &self.current_game_details {
             // Check if this game is currently downloading
-            let download_state = self.active_downloads.values().find(|ds| {
-                PathBuf::from(&ds.manifest.game_path) == *game_path
-            });
+            // Try to find by game_id first (for network games), then by path (for local games)
+            let download_state = self.active_downloads.get(&game_info.game_id)
+                .or_else(|| {
+                    self.active_downloads.values().find(|ds| {
+                        PathBuf::from(&ds.manifest.game_path) == *game_path
+                    })
+                });
             
             let integrity_status = self.game_integrity_status.get(game_path)
                 .unwrap_or(&GameIntegrityStatus::NotChecked);
             
-            let mut details_column = column![
-                // Header with back button
-                row![
-                    button("← Back")
-                        .on_press(Message::BackFromDetails)
-                        .style(button::secondary),
-                    Space::with_width(Length::Fill),
-                ]
-                .spacing(scale(8.0))
-                .width(Length::Fill),
-                Space::with_height(Length::Fixed(scale(20.0))),
-                // Game title - large and prominent
-                container(
-                    text(&game_info.name).size(scale_text(32.0))
-                )
-                .width(Length::Fill)
-                .padding(scale(20.0))
-                .style(container_box_style),
-                Space::with_height(Length::Fixed(scale(20.0))),
-                // Main content in two columns for better use of space
-                row![
-                    // Left column - Basic Information
-                    container(
-                        column![
-                            text("Basic Information").size(scale_text(18.0)),
-                            Space::with_height(Length::Fixed(scale(15.0))),
-                            row![
-                                text("Version:").size(scale_text(14.0)).width(Length::Fixed(scale(150.0))),
-                                text(&game_info.version).size(scale_text(14.0)),
-                            ]
-                            .width(Length::Fill),
-                            Space::with_height(Length::Fixed(scale(12.0))),
-                            row![
-                                text("Game ID:").size(scale_text(14.0)).width(Length::Fixed(scale(150.0))),
-                                text(&game_info.game_id).size(scale_text(12.0)),
-                            ]
-                            .width(Length::Fill),
-                            Space::with_height(Length::Fixed(scale(12.0))),
-                            column![
-                                text("Path:").size(scale_text(14.0)),
-                                Space::with_height(Length::Fixed(scale(4.0))),
-                                text(game_path.display().to_string()).size(scale_text(12.0)),
-                            ]
-                            .width(Length::Fill),
-                            Space::with_height(Length::Fixed(scale(12.0))),
-                            row![
-                                text("Start File:").size(scale_text(14.0)).width(Length::Fixed(scale(150.0))),
-                                text(&game_info.start_file).size(scale_text(12.0)),
-                            ]
-                            .width(Length::Fill),
-                            if let Some(ref start_args) = game_info.start_args {
-                                column![
-                                    Space::with_height(Length::Fixed(scale(12.0))),
-                                    row![
-                                        text("Start Args:").size(scale_text(14.0)).width(Length::Fixed(scale(150.0))),
-                                        text(start_args).size(scale_text(12.0)),
-                                    ]
-                                    .width(Length::Fill),
-                                ]
-                            } else {
-                                column![]
-                            },
-                        ]
+            // Check if this is a local game (exists in my_games)
+            let is_local_game = self.my_games.iter().any(|(path, _)| path == game_path);
+            let is_checking = matches!(integrity_status, GameIntegrityStatus::Checking { .. });
+            
+            // Check if this is a network game that we don't have locally
+            let is_network_game = !is_local_game && self.network_games.contains_key(&game_info.game_id);
+            let is_downloading = download_state.is_some();
+            
+            let details_column = column![
+                // Header with back button and action buttons (outside the frame)
+                {
+                    let mut header_row = row![
+                        button("← Back")
+                            .on_press(Message::BackFromDetails)
+                            .style(button::secondary),
+                        Space::with_width(Length::Fill),
+                    ];
+                    
+                    // Add action buttons (right-aligned)
+                    if is_local_game {
+                        // Local game: show Check Integrity button
+                        if is_checking {
+                            header_row = header_row.push(button("Checking...")
+                                .style(button::secondary));
+                        } else {
+                            header_row = header_row.push(button("Check Integrity")
+                                .on_press(Message::CheckIntegrity(game_path.clone()))
+                                .style(button::secondary));
+                        }
+                    } else if is_network_game && !is_downloading {
+                        // Network game without download: show Download button
+                        header_row = header_row.push(button("Download")
+                            .on_press(Message::DownloadGame(game_info.game_id.clone()))
+                            .style(button::primary));
+                    }
+                    
+                    header_row
                         .spacing(scale(8.0))
                         .width(Length::Fill)
-                        .padding(scale(20.0))
-                    )
-                    .width(Length::Fill)
-                    .style(container_box_style),
-                    Space::with_width(Length::Fixed(scale(20.0))),
-                    // Right column - Status and Metadata
-                    container(
-                        column![
-                            text("Status & Metadata").size(scale_text(18.0)),
-                            Space::with_height(Length::Fixed(scale(15.0))),
-                            // Integrity status
+                },
+                Space::with_height(Length::Fixed(scale(15.0))),
+                // Content with frame
+                container(
+                    column![
+                        Space::with_height(Length::Fixed(scale(20.0))),
+                        // Game title - large and prominent
+                        text(&game_info.name).size(scale_text(36.0)),
+                        Space::with_height(Length::Fixed(scale(8.0))),
+                        text(&game_info.version).size(scale_text(16.0))
+                            .style(|_theme: &Theme| {
+                                iced::widget::text::Style {
+                                    color: Some(Color::from_rgba(0.7, 0.7, 0.7, 1.0)),
+                                }
+                            }),
+                        Space::with_height(Length::Fixed(scale(30.0))),
+                        // Main content in two columns for better use of space
+                        row![
+                            // Left column - Basic Information
                             column![
-                                text("Integrity Status:").size(scale_text(14.0)),
-                                Space::with_height(Length::Fixed(scale(8.0))),
-                                match integrity_status {
-                                    GameIntegrityStatus::NotChecked => {
-                                        text("Not checked").size(scale_text(14.0))
-                                            .style(|_theme: &Theme| {
-                                                iced::widget::text::Style {
-                                                    color: Some(Color::from_rgba(0.7, 0.7, 0.7, 1.0)),
-                                                }
-                                            })
-                                    }
-                                    GameIntegrityStatus::Checking { current, total } => {
-                                        if *total > 0 {
-                                            text(format!("Checking... ({}/{})", current, total)).size(scale_text(14.0))
-                                                .style(|_theme: &Theme| {
-                                                    iced::widget::text::Style {
-                                                        color: Some(Color::from_rgba(0.7, 0.7, 0.7, 1.0)),
-                                                    }
-                                                })
-                                        } else {
-                                            text("Checking...").size(scale_text(14.0))
-                                                .style(|_theme: &Theme| {
-                                                    iced::widget::text::Style {
-                                                        color: Some(Color::from_rgba(0.7, 0.7, 0.7, 1.0)),
-                                                    }
-                                                })
+                                text("Information").size(scale_text(20.0))
+                                    .style(|_theme: &Theme| {
+                                        iced::widget::text::Style {
+                                            color: Some(Color::from_rgba(0.9, 0.9, 0.9, 1.0)),
                                         }
-                                    }
-                                    GameIntegrityStatus::Intact => {
-                                        text("Game files intact").size(scale_text(14.0))
-                                            .style(|_theme: &Theme| {
-                                                iced::widget::text::Style {
-                                                    color: Some(Color::from_rgba(0.0, 1.0, 0.0, 1.0)),
-                                                }
-                                            })
-                                    }
-                                    GameIntegrityStatus::Changed => {
-                                        text("Game files have changed").size(scale_text(14.0))
-                                            .style(|_theme: &Theme| {
-                                                iced::widget::text::Style {
-                                                    color: Some(Color::from_rgba(1.0, 0.7, 0.0, 1.0)),
-                                                }
-                                            })
-                                    }
-                                    GameIntegrityStatus::Error(ref e) => {
-                                        text(format!("Error: {}", e)).size(scale_text(14.0))
-                                            .style(|_theme: &Theme| {
-                                                iced::widget::text::Style {
-                                                    color: Some(Color::from_rgba(1.0, 0.0, 0.0, 1.0)),
-                                                }
-                                            })
-                                    }
+                                    }),
+                                Space::with_height(Length::Fixed(scale(20.0))),
+                                row![
+                                    text("Game ID").size(scale_text(13.0))
+                                        .style(|_theme: &Theme| {
+                                            iced::widget::text::Style {
+                                                color: Some(Color::from_rgba(0.6, 0.6, 0.6, 1.0)),
+                                            }
+                                        })
+                                        .width(Length::Fixed(scale(140.0))),
+                                    text(&game_info.game_id).size(scale_text(13.0)),
+                                ]
+                                .width(Length::Fill),
+                                Space::with_height(Length::Fixed(scale(16.0))),
+                                column![
+                                    text("Path").size(scale_text(13.0))
+                                        .style(|_theme: &Theme| {
+                                            iced::widget::text::Style {
+                                                color: Some(Color::from_rgba(0.6, 0.6, 0.6, 1.0)),
+                                            }
+                                        }),
+                                    Space::with_height(Length::Fixed(scale(6.0))),
+                                    text(game_path.display().to_string()).size(scale_text(13.0)),
+                                ]
+                                .width(Length::Fill),
+                                Space::with_height(Length::Fixed(scale(16.0))),
+                                row![
+                                    text("Start File").size(scale_text(13.0))
+                                        .style(|_theme: &Theme| {
+                                            iced::widget::text::Style {
+                                                color: Some(Color::from_rgba(0.6, 0.6, 0.6, 1.0)),
+                                            }
+                                        })
+                                        .width(Length::Fixed(scale(140.0))),
+                                    text(&game_info.start_file).size(scale_text(13.0)),
+                                ]
+                                .width(Length::Fill),
+                                if let Some(ref start_args) = game_info.start_args {
+                                    column![
+                                        Space::with_height(Length::Fixed(scale(16.0))),
+                                        column![
+                                            text("Start Args").size(scale_text(13.0))
+                                                .style(|_theme: &Theme| {
+                                                    iced::widget::text::Style {
+                                                        color: Some(Color::from_rgba(0.6, 0.6, 0.6, 1.0)),
+                                                    }
+                                                }),
+                                            Space::with_height(Length::Fixed(scale(6.0))),
+                                            text(start_args).size(scale_text(13.0)),
+                                        ]
+                                        .width(Length::Fill),
+                                    ]
+                                } else {
+                                    column![]
                                 },
                             ]
                             .width(Length::Fill),
-                            // Download status if downloading
-                            if let Some(ds) = download_state {
-                                column![
-                                    Space::with_height(Length::Fixed(scale(20.0))),
-                                    text("Download Status:").size(scale_text(14.0)),
-                                    Space::with_height(Length::Fixed(scale(8.0))),
-                                    text(format!("Status: {:?}", ds.manifest.overall_status)).size(scale_text(12.0)),
-                                    Space::with_height(Length::Fixed(scale(4.0))),
-                                    text(format!("Progress: {:.1}%", ds.progress_percent)).size(scale_text(12.0)),
-                                    Space::with_height(Length::Fixed(scale(4.0))),
-                                    text(format!("Chunks: {}/{}", ds.manifest.progress.downloaded_chunks, ds.manifest.progress.total_chunks)).size(scale_text(12.0)),
-                                ]
-                                .width(Length::Fill)
-                            } else {
-                                column![]
-                            },
-                            if let Some(ref creator_peer_id) = game_info.creator_peer_id {
-                                column![
-                                    Space::with_height(Length::Fixed(scale(20.0))),
-                                    text("Creator Peer ID:").size(scale_text(14.0)),
-                                    Space::with_height(Length::Fixed(scale(4.0))),
-                                    text(creator_peer_id).size(scale_text(12.0)),
-                                ]
-                                .width(Length::Fill)
-                            } else {
-                                column![]
-                            },
-                            if let Some(ref hash) = game_info.hash {
-                                column![
-                                    Space::with_height(Length::Fixed(scale(20.0))),
-                                    text("Chunks Hash:").size(scale_text(14.0)),
-                                    Space::with_height(Length::Fixed(scale(4.0))),
-                                    text(hash).size(scale_text(10.0)),
-                                ]
-                                .width(Length::Fill)
-                            } else {
-                                column![]
-                            },
-                        ]
-                        .spacing(scale(8.0))
-                        .width(Length::Fill)
-                        .padding(scale(20.0))
-                    )
-                    .width(Length::Fill)
-                    .style(container_box_style),
-                ]
-                .width(Length::Fill),
-                // Description and Instructions - full width
-                if game_info.description.is_some() || game_info.additional_instructions.is_some() {
-                    column![
-                        Space::with_height(Length::Fixed(scale(20.0))),
-                        if let Some(ref description) = game_info.description {
-                            container(
-                                column![
-                                    text("Description").size(scale_text(18.0)),
-                                    Space::with_height(Length::Fixed(scale(12.0))),
-                                    text(description).size(scale_text(14.0)),
-                                ]
-                                .spacing(scale(8.0))
-                                .width(Length::Fill)
-                                .padding(scale(20.0))
-                            )
-                            .width(Length::Fill)
-                            .style(container_box_style)
-                        } else {
-                            container(column![]).width(Length::Fill)
-                        },
-                        if let Some(ref instructions) = game_info.additional_instructions {
+                            Space::with_width(Length::Fixed(scale(40.0))),
+                            // Right column - Status and Metadata
                             column![
+                                text("Status").size(scale_text(20.0))
+                                    .style(|_theme: &Theme| {
+                                        iced::widget::text::Style {
+                                            color: Some(Color::from_rgba(0.9, 0.9, 0.9, 1.0)),
+                                        }
+                                    }),
                                 Space::with_height(Length::Fixed(scale(20.0))),
-                                container(
+                                // Integrity status (only for local games)
+                                if is_local_game {
                                     column![
-                                        text("Additional Instructions").size(scale_text(18.0)),
-                                        Space::with_height(Length::Fixed(scale(12.0))),
-                                        text(instructions).size(scale_text(14.0)),
+                                        text("Integrity").size(scale_text(13.0))
+                                            .style(|_theme: &Theme| {
+                                                iced::widget::text::Style {
+                                                    color: Some(Color::from_rgba(0.6, 0.6, 0.6, 1.0)),
+                                                }
+                                            }),
+                                        Space::with_height(Length::Fixed(scale(6.0))),
+                                        match integrity_status {
+                                            GameIntegrityStatus::NotChecked => {
+                                                text("Not checked").size(scale_text(14.0))
+                                                    .style(|_theme: &Theme| {
+                                                        iced::widget::text::Style {
+                                                            color: Some(Color::from_rgba(0.7, 0.7, 0.7, 1.0)),
+                                                        }
+                                                    })
+                                            }
+                                            GameIntegrityStatus::Checking { current, total } => {
+                                                if *total > 0 {
+                                                    text(format!("Checking... ({}/{})", current, total)).size(scale_text(14.0))
+                                                        .style(|_theme: &Theme| {
+                                                            iced::widget::text::Style {
+                                                                color: Some(Color::from_rgba(0.7, 0.7, 0.7, 1.0)),
+                                                            }
+                                                        })
+                                                } else {
+                                                    text("Checking...").size(scale_text(14.0))
+                                                        .style(|_theme: &Theme| {
+                                                            iced::widget::text::Style {
+                                                                color: Some(Color::from_rgba(0.7, 0.7, 0.7, 1.0)),
+                                                            }
+                                                        })
+                                                }
+                                            }
+                                            GameIntegrityStatus::Intact => {
+                                                text("Game files intact").size(scale_text(14.0))
+                                                    .style(|_theme: &Theme| {
+                                                        iced::widget::text::Style {
+                                                            color: Some(Color::from_rgba(0.0, 1.0, 0.0, 1.0)),
+                                                        }
+                                                    })
+                                            }
+                                            GameIntegrityStatus::Changed => {
+                                                text("Game files have changed").size(scale_text(14.0))
+                                                    .style(|_theme: &Theme| {
+                                                        iced::widget::text::Style {
+                                                            color: Some(Color::from_rgba(1.0, 0.7, 0.0, 1.0)),
+                                                        }
+                                                    })
+                                            }
+                                            GameIntegrityStatus::Error(ref e) => {
+                                                text(format!("Error: {}", e)).size(scale_text(14.0))
+                                                    .style(|_theme: &Theme| {
+                                                        iced::widget::text::Style {
+                                                            color: Some(Color::from_rgba(1.0, 0.0, 0.0, 1.0)),
+                                                        }
+                                                    })
+                                            }
+                                        },
                                     ]
-                                    .spacing(scale(8.0))
                                     .width(Length::Fill)
-                                    .padding(scale(20.0))
-                                )
-                                .width(Length::Fill)
-                                .style(container_box_style)
+                                } else {
+                                    column![]
+                                },
+                                // Download status if downloading
+                                if let Some(ds) = download_state {
+                                    // Calculate downloaded and total sizes (same logic as in network games list)
+                                    let total_bytes: u64 = ds.manifest.chunks.values()
+                                        .filter_map(|chunk_info| chunk_info.file_size)
+                                        .sum();
+                                    
+                                    let downloaded_bytes = if total_bytes > 0 && ds.manifest.progress.total_chunks > 0 {
+                                        // Use proportional calculation based on actual total size
+                                        (total_bytes as f64 * (ds.manifest.progress.downloaded_chunks as f64 / ds.manifest.progress.total_chunks as f64)) as u64
+                                    } else {
+                                        // Fallback: assume 100MB per chunk
+                                        const CHUNK_SIZE_BYTES: u64 = 100 * 1024 * 1024;
+                                        (ds.manifest.progress.downloaded_chunks as u64) * CHUNK_SIZE_BYTES
+                                    };
+                                    
+                                    let total_bytes_final = if total_bytes > 0 {
+                                        total_bytes
+                                    } else {
+                                        // Fallback: estimate from chunk count
+                                        const CHUNK_SIZE_BYTES: u64 = 100 * 1024 * 1024;
+                                        (ds.manifest.progress.total_chunks as u64) * CHUNK_SIZE_BYTES
+                                    };
+                                    
+                                    let downloaded_size_str = format_size(downloaded_bytes);
+                                    let total_size_str = format_size(total_bytes_final);
+                                    
+                                    column![
+                                        Space::with_height(Length::Fixed(scale(24.0))),
+                                        text("Download").size(scale_text(13.0))
+                                            .style(|_theme: &Theme| {
+                                                iced::widget::text::Style {
+                                                    color: Some(Color::from_rgba(0.6, 0.6, 0.6, 1.0)),
+                                                }
+                                            }),
+                                        Space::with_height(Length::Fixed(scale(6.0))),
+                                        text(format!("Status: {:?}", ds.manifest.overall_status)).size(scale_text(13.0)),
+                                        Space::with_height(Length::Fixed(scale(4.0))),
+                                        text(format!("Progress: {:.1}%", ds.progress_percent)).size(scale_text(13.0)),
+                                        Space::with_height(Length::Fixed(scale(4.0))),
+                                        text(format!("Size: {} / {}", downloaded_size_str, total_size_str)).size(scale_text(13.0)),
+                                        Space::with_height(Length::Fixed(scale(4.0))),
+                                        text(format!("Chunks: {}/{}", ds.manifest.progress.downloaded_chunks, ds.manifest.progress.total_chunks)).size(scale_text(13.0)),
+                                    ]
+                                    .width(Length::Fill)
+                                } else {
+                                    column![]
+                                },
+                                if let Some(ref creator_peer_id) = game_info.creator_peer_id {
+                                    column![
+                                        Space::with_height(Length::Fixed(scale(24.0))),
+                                        text("Creator Peer ID").size(scale_text(13.0))
+                                            .style(|_theme: &Theme| {
+                                                iced::widget::text::Style {
+                                                    color: Some(Color::from_rgba(0.6, 0.6, 0.6, 1.0)),
+                                                }
+                                            }),
+                                        Space::with_height(Length::Fixed(scale(6.0))),
+                                        text(creator_peer_id).size(scale_text(13.0)),
+                                    ]
+                                    .width(Length::Fill)
+                                } else {
+                                    column![]
+                                },
+                               
+                            ]
+                            .width(Length::Fill),
+                        ]
+                        .width(Length::Fill),
+                        // Description and Instructions - full width
+                        if game_info.description.is_some() || game_info.additional_instructions.is_some() {
+                            column![
+                                Space::with_height(Length::Fixed(scale(40.0))),
+                                if let Some(ref description) = game_info.description {
+                                    column![
+                                        text("Description").size(scale_text(20.0))
+                                            .style(|_theme: &Theme| {
+                                                iced::widget::text::Style {
+                                                    color: Some(Color::from_rgba(0.9, 0.9, 0.9, 1.0)),
+                                                }
+                                            }),
+                                        Space::with_height(Length::Fixed(scale(16.0))),
+                                        text(description).size(scale_text(14.0))
+                                            .line_height(1.6),
+                                    ]
+                                    .width(Length::Fill)
+                                } else {
+                                    column![]
+                                },
+                                if let Some(ref instructions) = game_info.additional_instructions {
+                                    column![
+                                        Space::with_height(Length::Fixed(scale(40.0))),
+                                        text("Additional Instructions").size(scale_text(20.0))
+                                            .style(|_theme: &Theme| {
+                                                iced::widget::text::Style {
+                                                    color: Some(Color::from_rgba(0.9, 0.9, 0.9, 1.0)),
+                                                }
+                                            }),
+                                        Space::with_height(Length::Fixed(scale(16.0))),
+                                        text(instructions).size(scale_text(14.0))
+                                            .line_height(1.6),
+                                    ]
+                                    .width(Length::Fill)
+                                } else {
+                                    column![]
+                                },
                             ]
                         } else {
                             column![]
                         },
+                        Space::with_height(Length::Fixed(scale(20.0))),
                     ]
-                } else {
-                    column![]
-                },
+                    .spacing(scale(0.0))
+                    .width(Length::Fill)
+                    .padding(scale(20.0))
+                )
+                .width(Length::Fill)
+                .style(container_box_style),
             ]
-            .spacing(scale(15.0))
-            .padding(scale(20.0))
+            .spacing(scale(0.0))
+            .padding(scale(15.0))
             .width(Length::Fill);
             
             scrollable(details_column)
