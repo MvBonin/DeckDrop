@@ -195,7 +195,58 @@ struct ChunkFileEntry {
     file_size: i64,         // Dateigröße in Bytes (i64 für TOML)
 }
 
-/// Speichert einen Chunk temporär
+/// Validiert einen Chunk vor der Speicherung
+/// Prüft die erwartete Größe basierend auf dem Manifest
+pub fn validate_chunk_size(
+    chunk_hash: &str,
+    chunk_data: &[u8],
+    manifest: &DownloadManifest,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Extrahiere file_hash und chunk_index aus chunk_hash (Format: "file_hash:index")
+    let parts: Vec<&str> = chunk_hash.split(':').collect();
+    if parts.len() != 2 {
+        return Err(format!("Ungültiges Chunk-Hash-Format: {}", chunk_hash).into());
+    }
+    
+    let chunk_index: usize = parts[1].parse()
+        .map_err(|_| format!("Ungültiger Chunk-Index: {}", parts[1]))?;
+    
+    // Finde die Datei im Manifest, die diesen Chunk enthält
+    let file_info = manifest.chunks.values()
+        .find(|info| info.chunk_hashes.contains(&chunk_hash.to_string()))
+        .ok_or_else(|| format!("Chunk {} nicht im Manifest gefunden", chunk_hash))?;
+    
+    // Berechne erwartete Chunk-Größe
+    if let Some(file_size) = file_info.file_size {
+        const CHUNK_SIZE: u64 = 100 * 1024 * 1024; // 100MB
+        let total_chunks = file_info.chunk_hashes.len();
+        let is_last_chunk = chunk_index == total_chunks - 1;
+        
+        let expected_size = if is_last_chunk {
+            // Letzter Chunk kann kleiner sein
+            let full_chunks_size = (total_chunks - 1) as u64 * CHUNK_SIZE;
+            file_size.saturating_sub(full_chunks_size)
+        } else {
+            CHUNK_SIZE
+        };
+        
+        let actual_size = chunk_data.len() as u64;
+        
+        // Toleranz: ±1% oder mindestens 1KB Unterschied
+        let tolerance = expected_size.max(1024) / 100;
+        if actual_size.abs_diff(expected_size) > tolerance {
+            return Err(format!(
+                "Chunk-Größe stimmt nicht überein: erwartet {} Bytes, erhalten {} Bytes (Toleranz: {})",
+                expected_size, actual_size, tolerance
+            ).into());
+        }
+    }
+    
+    Ok(())
+}
+
+/// Speichert einen Chunk temporär mit Validierung
+/// Verwendet Atomic Write (Temp-File → Rename) für Transaktions-Sicherheit
 pub fn save_chunk(chunk_hash: &str, chunk_data: &[u8], chunks_dir: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
     fs::create_dir_all(chunks_dir)?;
     
@@ -204,12 +255,31 @@ pub fn save_chunk(chunk_hash: &str, chunk_data: &[u8], chunks_dir: &Path) -> Res
     let safe_hash_name = chunk_hash.replace(':', "_");
     let chunk_path = chunks_dir.join(format!("{}.chunk", safe_hash_name));
     
+    // Transaktions-Sicherheit: Schreibe zuerst in Temp-File, dann atomic rename
+    let temp_path = chunks_dir.join(format!("{}.chunk.tmp", safe_hash_name));
+    
     // Phase 4: I/O-Buffering für bessere Performance (8MB Buffer)
     use std::io::{BufWriter, Write};
-    let file = fs::File::create(&chunk_path)?;
-    let mut writer = BufWriter::with_capacity(8 * 1024 * 1024, file); // 8MB Buffer
-    writer.write_all(chunk_data)?;
-    writer.flush()?;
+    {
+        let file = fs::File::create(&temp_path)?;
+        let mut writer = BufWriter::with_capacity(8 * 1024 * 1024, file); // 8MB Buffer
+        writer.write_all(chunk_data)?;
+        writer.flush()?;
+        // File wird hier geschlossen (Drop)
+    }
+    
+    // Validiere geschriebene Datei (Größe)
+    let written_size = fs::metadata(&temp_path)?.len();
+    if written_size != chunk_data.len() as u64 {
+        let _ = fs::remove_file(&temp_path); // Cleanup
+        return Err(format!(
+            "Chunk-Schreibfehler: erwartet {} Bytes, geschrieben {} Bytes",
+            chunk_data.len(), written_size
+        ).into());
+    }
+    
+    // Atomic Rename (atomar auf den meisten Dateisystemen)
+    fs::rename(&temp_path, &chunk_path)?;
     
     // Keine Hash-Validierung hier - wird später bei der Datei-Rekonstruktion validiert
     // (da wir nur den file_hash haben, nicht den Chunk-Hash)

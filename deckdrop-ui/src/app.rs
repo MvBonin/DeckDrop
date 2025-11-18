@@ -85,6 +85,9 @@ pub struct DeckDropApp {
     // Phase 4: Peer-Performance-Tracking für adaptive Limits
     pub peer_performance: Arc<std::sync::Mutex<HashMap<String, PeerPerformance>>>, // peer_id -> PeerPerformance
     
+    // Robustheit: Retry-Tracking für Chunk-Requests
+    pub chunk_retries: Arc<std::sync::Mutex<HashMap<String, ChunkRetryInfo>>>, // chunk_hash -> Retry-Info
+    
     // Config
     pub config: Config,
     
@@ -184,6 +187,18 @@ pub struct PeerPerformance {
     pub successful_requests: usize, // Anzahl erfolgreicher Requests
     pub last_update: std::time::Instant, // Zeitpunkt der letzten Aktualisierung
     pub speed_samples: Vec<(std::time::Instant, usize)>, // Zeitstempel und Bytes für Geschwindigkeitsberechnung
+    // Robustheit: Circuit Breaker
+    pub blocked_until: Option<std::time::Instant>, // Peer blockiert bis zu diesem Zeitpunkt (Circuit Breaker)
+    pub consecutive_failures: usize, // Anzahl aufeinanderfolgender Fehler
+}
+
+/// Retry-Information für Chunk-Requests
+#[derive(Debug, Clone)]
+struct ChunkRetryInfo {
+    pub retry_count: usize, // Anzahl der bisherigen Retries
+    pub last_retry_time: std::time::Instant, // Zeitpunkt des letzten Retry-Versuchs
+    pub last_peer_id: String, // Letzter Peer, der versucht wurde
+    pub failure_count_with_peer: usize, // Anzahl Fehler mit diesem Peer
 }
 
 impl Default for PeerPerformance {
@@ -196,6 +211,8 @@ impl Default for PeerPerformance {
             successful_requests: 0,
             last_update: std::time::Instant::now(),
             speed_samples: Vec::new(),
+            blocked_until: None, // Kein Circuit Breaker aktiv
+            consecutive_failures: 0,
         }
     }
 }
@@ -343,6 +360,7 @@ impl Default for DeckDropApp {
             active_downloads: HashMap::new(),
             processing_chunks: Arc::new(std::sync::Mutex::new(HashSet::new())),
             requested_chunks: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            chunk_retries: Arc::new(std::sync::Mutex::new(HashMap::new())), // Robustheit: Retry-Tracking
             active_uploads: Arc::new(std::sync::Mutex::new(HashMap::new())),
             upload_stats: Arc::new(std::sync::Mutex::new(UploadStats {
                 active_upload_count: 0,
@@ -594,6 +612,7 @@ impl DeckDropApp {
             active_downloads,
             processing_chunks: Arc::new(std::sync::Mutex::new(HashSet::new())),
             requested_chunks: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            chunk_retries: Arc::new(std::sync::Mutex::new(HashMap::new())), // Robustheit: Retry-Tracking
             active_uploads: Arc::new(std::sync::Mutex::new(HashMap::new())),
             upload_stats: Arc::new(std::sync::Mutex::new(UploadStats {
                 active_upload_count: 0,
@@ -1769,6 +1788,11 @@ impl DeckDropApp {
                     perf.successful_requests += 1;
                     perf.total_requests += 1;
                     perf.success_rate = perf.successful_requests as f64 / perf.total_requests.max(1) as f64;
+                    // Robustheit: Reset Circuit Breaker bei erfolgreichem Request
+                    perf.consecutive_failures = 0;
+                    if perf.success_rate > 0.7 {
+                        perf.blocked_until = None; // Entblockiere Peer bei guter Performance
+                    }
                     
                     // Tracke Download-Geschwindigkeit (5-Sekunden gleitender Durchschnitt)
                     perf.speed_samples.push((chunk_received_time, chunk_size));
@@ -1818,6 +1842,7 @@ impl DeckDropApp {
                 // Verarbeite Chunk in einem separaten Thread, um die GUI nicht zu blockieren
                 let chunk_data_clone = chunk_data.clone();
                 let requested_chunks_for_thread = self.requested_chunks.clone(); // Clone für Thread
+                let chunk_retries_for_thread = self.chunk_retries.clone(); // Clone für Thread
                 
                 // Extrahiere Peer-IDs für dieses Spiel vor dem Thread-Spawn (um Clone-Kosten zu reduzieren)
                 let game_id_for_peers = deckdrop_core::find_game_id_for_chunk(&chunk_hash).ok();
@@ -1855,7 +1880,17 @@ impl DeckDropApp {
                             if let Ok(manifest) = deckdrop_core::DownloadManifest::load(&manifest_path) {
                                 // Überspringe wenn pausiert
                                 if !matches!(manifest.overall_status, deckdrop_core::DownloadStatus::Paused) {
-                                    // Speichere Chunk (blockierende I/O-Operation)
+                                    // Robustheit: Validiere Chunk-Größe vor Speicherung
+                                    if let Err(e) = deckdrop_core::validate_chunk_size(&chunk_hash_clone, &chunk_data_clone, &manifest) {
+                                        eprintln!("Chunk-Validierung fehlgeschlagen für {}: {}", chunk_hash_clone, e);
+                                        // Entferne Chunk aus "angefordert" Set, damit Retry möglich ist
+                                        if let Ok(mut requested) = requested_chunks_for_thread.lock() {
+                                            requested.remove(&chunk_hash_clone);
+                                        }
+                                        return; // Überspringe ungültigen Chunk
+                                    }
+                                    
+                                    // Speichere Chunk (blockierende I/O-Operation mit Transaktions-Sicherheit)
                                     if let Ok(chunks_dir) = deckdrop_core::get_chunks_dir(&game_id) {
                                         if deckdrop_core::save_chunk(&chunk_hash_clone, &chunk_data_clone, &chunks_dir).is_ok() {
                                             // Aktualisiere Manifest
@@ -1962,17 +1997,177 @@ impl DeckDropApp {
                 if let Ok(mut requested) = requested_chunks_for_thread.lock() {
                     requested.remove(&chunk_hash_clone);
                 }
+                
+                // Robustheit: Entferne Retry-Info bei erfolgreichem Download
+                if let Ok(mut retries) = chunk_retries_for_thread.lock() {
+                    retries.remove(&chunk_hash_clone);
+                }
             });
             }
             DiscoveryEvent::ChunkRequestFailed { peer_id, chunk_hash, error } => {
                 eprintln!("ChunkRequestFailed: {} from {}: {}", chunk_hash, peer_id, error);
                 
-                // Phase 4: Tracke fehlgeschlagenen Request für Performance-Tracking
+                // Robustheit: Circuit Breaker - Blockiere Peer bei zu vielen Fehlern
+                let mut should_block_peer = false;
                 if let Ok(mut perf_map) = self.peer_performance.lock() {
                     let perf = perf_map.entry(peer_id.clone()).or_insert_with(PeerPerformance::default);
                     perf.total_requests += 1;
+                    perf.consecutive_failures += 1;
                     perf.success_rate = perf.successful_requests as f64 / perf.total_requests.max(1) as f64;
                     perf.last_update = std::time::Instant::now();
+                    
+                    // Circuit Breaker: Blockiere Peer bei <50% Success-Rate oder >3 aufeinanderfolgenden Fehlern
+                    if perf.success_rate < 0.5 || perf.consecutive_failures >= 3 {
+                        perf.blocked_until = Some(std::time::Instant::now() + std::time::Duration::from_secs(300)); // 5 Minuten
+                        should_block_peer = true;
+                        eprintln!("Circuit Breaker: Peer {} blockiert für 5 Minuten (Success-Rate: {:.1}%, Consecutive Failures: {})", 
+                            peer_id, perf.success_rate * 100.0, perf.consecutive_failures);
+                    }
+                }
+                
+                // Robustheit: Retry-Logik mit Exponential Backoff
+                let should_retry = {
+                    let mut retries = match self.chunk_retries.lock() {
+                        Ok(guard) => guard,
+                        Err(e) => {
+                            eprintln!("Fehler beim Locken von chunk_retries: {}", e);
+                            return; // Überspringe Retry bei Lock-Fehler
+                        }
+                    };
+                    
+                    let retry_info = retries.entry(chunk_hash.clone()).or_insert_with(|| ChunkRetryInfo {
+                        retry_count: 0,
+                        last_retry_time: std::time::Instant::now(),
+                        last_peer_id: peer_id.clone(),
+                        failure_count_with_peer: 0,
+                    });
+                    
+                    retry_info.retry_count += 1;
+                    retry_info.failure_count_with_peer += 1;
+                    
+                    // Wechsle Peer nach 2 Fehlern mit demselben Peer
+                    let should_switch_peer = retry_info.failure_count_with_peer >= 2;
+                    
+                    // Max 5 Retries pro Chunk
+                    let max_retries = 5;
+                    let can_retry = retry_info.retry_count < max_retries;
+                    
+                    if should_switch_peer {
+                        retry_info.failure_count_with_peer = 0; // Reset für neuen Peer
+                    }
+                    
+                    (can_retry, should_switch_peer)
+                };
+                
+                if should_retry.0 {
+                    // Exponential Backoff: 1s, 2s, 4s, 8s, max 30s
+                    let retry_info = {
+                        match self.chunk_retries.lock() {
+                            Ok(retries) => retries.get(&chunk_hash).cloned(),
+                            Err(e) => {
+                                eprintln!("Fehler beim Locken von chunk_retries: {}", e);
+                                None
+                            }
+                        }
+                    };
+                    
+                    if let Some(retry_info) = retry_info {
+                        let backoff_seconds = (1u64 << retry_info.retry_count.min(4)).min(30); // 1, 2, 4, 8, 16, max 30
+                        let backoff_duration = std::time::Duration::from_secs(backoff_seconds);
+                        
+                        // Robustheit: Spawn Background-Task für Retry mit Backoff
+                        let chunk_hash_for_task = chunk_hash.clone();
+                        let peer_id_for_task = peer_id.clone();
+                        let should_switch_peer = should_retry.1;
+                        let retry_count = retry_info.retry_count;
+                        let network_games_clone = self.network_games.clone();
+                        let peer_performance_clone = self.peer_performance.clone();
+                        let chunk_retries_clone = self.chunk_retries.clone();
+                        
+                        std::thread::spawn(move || {
+                            // Warte auf Backoff
+                            std::thread::sleep(backoff_duration);
+                            
+                            // Retry nach Backoff
+                            if let Ok(game_id) = deckdrop_core::find_game_id_for_chunk(&chunk_hash_for_task) {
+                                // Finde verfügbare Peers (nicht blockiert)
+                                let available_peers: Vec<String> = {
+                                    if let Some(peers) = network_games_clone.get(&game_id) {
+                                        let perf_map_guard = peer_performance_clone.lock();
+                                        let perf_map = perf_map_guard.as_ref().ok();
+                                        
+                                        peers.iter()
+                                            .filter_map(|(pid, _)| {
+                                                if let Some(perf_map) = perf_map {
+                                                    if let Some(perf) = perf_map.get(pid) {
+                                                        // Prüfe Circuit Breaker
+                                                        if let Some(blocked_until) = perf.blocked_until {
+                                                            if std::time::Instant::now() < blocked_until {
+                                                                return None; // Peer ist blockiert
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                Some(pid.clone())
+                                            })
+                                            .collect()
+                                    } else {
+                                        Vec::new()
+                                    }
+                                };
+                                
+                                if !available_peers.is_empty() {
+                                    // Wähle Peer: Wechsle bei should_switch_peer, sonst Round-Robin
+                                    let peer_index = if should_switch_peer {
+                                        // Wechsle zu anderem Peer
+                                        available_peers.iter()
+                                            .position(|p| p != &peer_id_for_task)
+                                            .unwrap_or(0)
+                                    } else {
+                                        // Round-Robin basierend auf retry_count
+                                        retry_count % available_peers.len()
+                                    };
+                                    
+                                    let retry_peer_id = &available_peers[peer_index];
+                                    
+                                    // Sende Retry-Request
+                                    if let Some(tx) = crate::network_bridge::get_download_request_tx() {
+                                        if let Err(e) = tx.send(
+                                            deckdrop_network::network::discovery::DownloadRequest::RequestChunk {
+                                                peer_id: retry_peer_id.clone(),
+                                                chunk_hash: chunk_hash_for_task.clone(),
+                                                game_id: game_id.clone(),
+                                            }
+                                        ) {
+                                            eprintln!("Fehler beim Senden von Retry-Chunk-Request für {}: {}", chunk_hash_for_task, e);
+                                        } else {
+                                            println!("Retry Chunk-Request gesendet: {} an Peer {} (Retry #{}, Backoff: {}s)", 
+                                                chunk_hash_for_task, retry_peer_id, retry_count, backoff_seconds);
+                                            
+                                            // Aktualisiere Retry-Info
+                                            if let Ok(mut retries) = chunk_retries_clone.lock() {
+                                                if let Some(info) = retries.get_mut(&chunk_hash_for_task) {
+                                                    info.last_retry_time = std::time::Instant::now();
+                                                    info.last_peer_id = retry_peer_id.clone();
+                                                }
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    eprintln!("Keine verfügbaren Peers für Retry von Chunk {}", chunk_hash_for_task);
+                                }
+                            }
+                        });
+                        
+                        eprintln!("Retry für Chunk {} geplant in {} Sekunden (Exponential Backoff, Retry #{})", 
+                            chunk_hash, backoff_seconds, retry_count);
+                    }
+                } else {
+                    let retry_count = match self.chunk_retries.lock() {
+                        Ok(retries) => retries.get(&chunk_hash).map(|r| r.retry_count).unwrap_or(0),
+                        Err(_) => 0,
+                    };
+                    eprintln!("Max Retries erreicht für Chunk {} ({} Retries)", chunk_hash, retry_count);
                 }
                 
                 // Entferne Chunk aus "angefordert" Set, damit er erneut angefordert werden kann
@@ -1991,11 +2186,42 @@ impl DeckDropApp {
         base_max_chunks_per_peer: usize,
     ) -> Result<(), Box<dyn std::error::Error>> {
         if let Some(tx) = crate::network_bridge::get_download_request_tx() {
-            // Berechne adaptive Limits für jeden Peer
+            // Robustheit: Filtere blockierte Peers (Circuit Breaker)
+            let available_peers: Vec<String> = {
+                let perf_map_guard = self.peer_performance.lock();
+                let perf_map = perf_map_guard.as_ref().ok();
+                
+                peer_ids.iter()
+                    .filter_map(|peer_id| {
+                        if let Some(perf_map) = perf_map {
+                            if let Some(perf) = perf_map.get(peer_id) {
+                                // Prüfe Circuit Breaker
+                                if let Some(blocked_until) = perf.blocked_until {
+                                    if std::time::Instant::now() < blocked_until {
+                                        eprintln!("Peer {} ist blockiert (Circuit Breaker), überspringe", peer_id);
+                                        return None; // Peer ist blockiert
+                                    } else {
+                                        // Blockierung abgelaufen, entblockiere
+                                        eprintln!("Peer {} Blockierung abgelaufen, verwende wieder", peer_id);
+                                    }
+                                }
+                            }
+                        }
+                        Some(peer_id.clone())
+                    })
+                    .collect()
+            };
+            
+            if available_peers.is_empty() {
+                eprintln!("Keine verfügbaren Peers für Spiel {} (alle blockiert)", game_id);
+                return Err("Keine verfügbaren Peers".into());
+            }
+            
+            // Berechne adaptive Limits für jeden verfügbaren Peer
             let mut peer_adaptive_limits: HashMap<String, usize> = HashMap::new();
             
             if let Ok(perf_map) = self.peer_performance.lock() {
-                for peer_id in peer_ids {
+                for peer_id in &available_peers {
                     let adaptive_limit = if let Some(perf) = perf_map.get(peer_id) {
                         perf.adaptive_max_chunks(base_max_chunks_per_peer)
                     } else {
@@ -2005,25 +2231,16 @@ impl DeckDropApp {
                 }
             } else {
                 // Fallback: Verwende Standard-Limit für alle Peers
-                for peer_id in peer_ids {
+                for peer_id in &available_peers {
                     peer_adaptive_limits.insert(peer_id.clone(), base_max_chunks_per_peer);
                 }
             }
-            
-            // Verwende den Durchschnitt der adaptiven Limits als max_chunks_per_peer
-            // (request_missing_chunks verwendet ein globales Limit, aber verteilt intelligent)
-            let avg_limit = if !peer_adaptive_limits.is_empty() {
-                let sum: usize = peer_adaptive_limits.values().sum();
-                sum / peer_adaptive_limits.len()
-            } else {
-                base_max_chunks_per_peer
-            };
             
             // Verwende das Maximum der adaptiven Limits, um schnelle Peers nicht zu limitieren
             let max_limit = peer_adaptive_limits.values().max().copied().unwrap_or(base_max_chunks_per_peer);
             
             // Verwende max_limit, damit schnelle Peers ihr volles Potential nutzen können
-            deckdrop_core::request_missing_chunks(game_id, peer_ids, &tx, max_limit)
+            deckdrop_core::request_missing_chunks(game_id, &available_peers, &tx, max_limit)
         } else {
             Err("Download request channel not available".into())
         }
