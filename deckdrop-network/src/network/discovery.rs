@@ -1103,6 +1103,10 @@ pub async fn run_discovery(
                             }
                         }
                     }
+                    _ => {
+                        // Nicht abgedeckte DiscoveryBehaviourEvent-Varianten
+                        eprintln!("Warnung: Nicht abgedecktes DiscoveryBehaviourEvent: {:?}", discovery_event);
+                    }
                 }
             }
             SwarmEvent::NewListenAddr { address, .. } => {
