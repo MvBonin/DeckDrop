@@ -95,6 +95,9 @@ pub struct DeckDropApp {
     // Robustheit: Retry-Tracking für Chunk-Requests
     pub chunk_retries: Arc<std::sync::Mutex<HashMap<String, ChunkRetryInfo>>>, // chunk_hash -> Retry-Info
     
+    // Performance-Monitoring
+    pub performance_metrics: PerformanceMetrics, // Aktuelle Performance-Metriken
+    
     // Config
     pub config: Config,
     
@@ -151,6 +154,7 @@ pub enum Tab {
     MyGames,
     NetworkGames,
     Peers,
+    Performance, // Performance monitoring tab
     Settings,
     GameDetails, // Detail view for a specific game
 }
@@ -201,6 +205,21 @@ pub struct PeerPerformance {
     // Robustheit: Circuit Breaker
     pub blocked_until: Option<std::time::Instant>, // Peer blockiert bis zu diesem Zeitpunkt (Circuit Breaker)
     pub consecutive_failures: usize, // Anzahl aufeinanderfolgender Fehler
+}
+
+/// Performance-Monitoring-Daten
+#[derive(Debug, Clone)]
+pub struct PerformanceMetrics {
+    pub total_download_speed_bytes_per_sec: f64, // Gesamte Download-Geschwindigkeit
+    pub total_upload_speed_bytes_per_sec: f64, // Gesamte Upload-Geschwindigkeit
+    pub active_downloads: usize, // Anzahl aktiver Downloads
+    pub active_uploads: usize, // Anzahl aktiver Uploads
+    pub total_chunks_downloaded: usize, // Gesamtanzahl heruntergeladener Chunks
+    pub total_chunks_uploaded: usize, // Gesamtanzahl hochgeladener Chunks
+    pub active_connections: usize, // Anzahl aktiver Verbindungen
+    pub peer_performance: Vec<(String, PeerPerformance)>, // Performance pro Peer
+    pub bandwidth_utilization_percent: f64, // Bandbreiten-Nutzung in Prozent (geschätzt)
+    pub last_update: std::time::Instant, // Zeitpunkt der letzten Aktualisierung
 }
 
 /// Retry-Information für Chunk-Requests
@@ -382,6 +401,18 @@ impl Default for DeckDropApp {
                 last_uploaded_bytes: 0,
             })),
             peer_performance: Arc::new(std::sync::Mutex::new(HashMap::new())), // Phase 4
+            performance_metrics: PerformanceMetrics {
+                total_download_speed_bytes_per_sec: 0.0,
+                total_upload_speed_bytes_per_sec: 0.0,
+                active_downloads: 0,
+                active_uploads: 0,
+                total_chunks_downloaded: 0,
+                total_chunks_uploaded: 0,
+                active_connections: 0,
+                peer_performance: Vec::new(),
+                bandwidth_utilization_percent: 0.0,
+                last_update: std::time::Instant::now(),
+            },
             game_integrity_status,
             integrity_check_start_time: HashMap::new(),
             integrity_check_progress: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -640,6 +671,18 @@ impl DeckDropApp {
                 last_uploaded_bytes: 0,
             })),
             peer_performance: Arc::new(std::sync::Mutex::new(HashMap::new())), // Phase 4
+            performance_metrics: PerformanceMetrics {
+                total_download_speed_bytes_per_sec: 0.0,
+                total_upload_speed_bytes_per_sec: 0.0,
+                active_downloads: 0,
+                active_uploads: 0,
+                total_chunks_downloaded: 0,
+                total_chunks_uploaded: 0,
+                active_connections: 0,
+                peer_performance: Vec::new(),
+                bandwidth_utilization_percent: 0.0,
+                last_update: std::time::Instant::now(),
+            },
             game_integrity_status,
             integrity_check_start_time: HashMap::new(),
             integrity_check_progress: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -705,6 +748,10 @@ impl DeckDropApp {
                 if tab == Tab::Settings {
                     self.settings_player_name = self.config.player_name.clone();
                     self.settings_download_path = self.config.download_path.to_string_lossy().to_string();
+                }
+                // Update performance metrics when Performance tab is opened
+                if tab == Tab::Performance {
+                    self.update_performance_metrics();
                 }
             }
             Message::ShowGameDetails(game_path, game_info) => {
@@ -1307,6 +1354,11 @@ impl DeckDropApp {
                     self.update_upload_stats();
                 }
                 
+                // Update performance metrics if Performance tab is active
+                if self.current_tab == Tab::Performance {
+                    self.update_performance_metrics();
+                }
+                
                 // Check for Network events (non-blocking) via global access
                 if let Some(rx) = crate::network_bridge::get_network_event_rx() {
                     if let Ok(mut rx) = rx.lock() {
@@ -1806,6 +1858,36 @@ impl DeckDropApp {
                                 }
                             }
                         }
+                    }
+                }
+            }
+            DiscoveryEvent::ChunkUploaded { peer_id: _, chunk_hash, chunk_size } => {
+                // Tracke Upload-Statistiken
+                if let Ok(mut stats) = self.upload_stats.lock() {
+                    // Aktualisiere aktive Uploads (tracke in active_uploads)
+                    let now = std::time::Instant::now();
+                    if let Ok(mut active_uploads) = self.active_uploads.lock() {
+                        active_uploads.insert(chunk_hash.clone(), (now, chunk_size));
+                    }
+                    
+                    // Berechne Upload-Geschwindigkeit (gleitender Durchschnitt über 5 Sekunden)
+                    let cutoff_time = now.checked_sub(std::time::Duration::from_secs(5))
+                        .unwrap_or(now);
+                    
+                    // Entferne alte Uploads
+                    if let Ok(mut active_uploads) = self.active_uploads.lock() {
+                        active_uploads.retain(|_, (time, _)| *time >= cutoff_time);
+                        
+                        // Berechne Gesamtgeschwindigkeit aus aktiven Uploads
+                        let total_bytes_in_window: usize = active_uploads.values()
+                            .map(|(_, size)| *size)
+                            .sum();
+                        
+                        // Geschwindigkeit = Bytes in 5 Sekunden / 5
+                        stats.upload_speed_bytes_per_sec = total_bytes_in_window as f64 / 5.0;
+                        stats.active_upload_count = active_uploads.len();
+                        stats.last_update_time = now;
+                        stats.last_uploaded_bytes += chunk_size as u64;
                     }
                 }
             }
@@ -2342,53 +2424,102 @@ impl DeckDropApp {
         }
     }
     
-    /// Updates upload statistics
-    fn update_upload_stats(&mut self) {
-        // Schätze aktive Uploads basierend auf der Anzahl der Peers
-        // Jeder Peer kann theoretisch Chunks von uns anfordern
-        // Da wir keinen direkten Zugriff auf die Netzwerk-Schicht haben,
-        // schätzen wir die Uploads basierend auf der Anzahl der verbundenen Peers
-        // (jeder Peer könnte theoretisch Chunks anfordern)
-        let active_upload_count = if self.status.peer_count > 0 {
-            // Schätze: Jeder Peer könnte 1-2 Chunks gleichzeitig anfordern
-            // Verwende eine konservative Schätzung
-            self.status.peer_count
-        } else {
-            0
-        };
+    /// Sammelt und aktualisiert Performance-Metriken
+    fn update_performance_metrics(&mut self) {
+        // Sammle Download-Statistiken
+        let mut total_download_speed = 0.0;
+        let mut active_downloads_count = 0;
+        let mut total_chunks_downloaded = 0;
         
-        // Berechne Upload-Geschwindigkeit (vereinfachte Schätzung)
-        let (upload_speed_bytes_per_sec, last_update_time, last_uploaded_bytes) = {
+        for download_state in self.active_downloads.values() {
+            if !matches!(download_state.manifest.overall_status, 
+                deckdrop_core::DownloadStatus::Complete | 
+                deckdrop_core::DownloadStatus::Cancelled) {
+                active_downloads_count += 1;
+                total_download_speed += download_state.download_speed_bytes_per_sec;
+            }
+            total_chunks_downloaded += download_state.manifest.progress.downloaded_chunks;
+        }
+        
+        // Sammle Upload-Statistiken
+        let (total_upload_speed, active_uploads_count, total_chunks_uploaded) = {
             if let Ok(stats) = self.upload_stats.lock() {
-                let elapsed = stats.last_update_time.elapsed().as_secs_f64();
-                
-                // Schätze Upload-Geschwindigkeit basierend auf aktiven Uploads
-                // Jeder aktive Upload sendet ~100MB Chunks
-                const CHUNK_SIZE_BYTES: u64 = 100 * 1024 * 1024;
-                let estimated_bytes_uploaded = (active_upload_count as u64) * CHUNK_SIZE_BYTES;
-                
-                let speed = if elapsed > 0.0 && active_upload_count > 0 {
-                    // Schätze basierend auf durchschnittlicher Upload-Zeit pro Chunk (z.B. 10 Sekunden)
-                    estimated_bytes_uploaded as f64 / 10.0
-                } else {
-                    0.0
-                };
-                
-                let new_time = std::time::Instant::now();
-                let new_bytes = stats.last_uploaded_bytes + estimated_bytes_uploaded;
-                
-                (speed, new_time, new_bytes)
+                (stats.upload_speed_bytes_per_sec, stats.active_upload_count, 0) // TODO: Track uploaded chunks
             } else {
-                (0.0, std::time::Instant::now(), 0)
+                (0.0, 0, 0)
             }
         };
         
-        // Aktualisiere Upload-Statistiken
-        if let Ok(mut stats) = self.upload_stats.lock() {
-            stats.active_upload_count = active_upload_count;
-            stats.upload_speed_bytes_per_sec = upload_speed_bytes_per_sec;
-            stats.last_update_time = last_update_time;
-            stats.last_uploaded_bytes = last_uploaded_bytes;
+        // Sammle Peer-Performance-Daten
+        let peer_performance_list: Vec<(String, PeerPerformance)> = {
+            if let Ok(perf_map) = self.peer_performance.lock() {
+                perf_map.iter()
+                    .map(|(peer_id, perf)| (peer_id.clone(), perf.clone()))
+                    .collect()
+            } else {
+                Vec::new()
+            }
+        };
+        
+        // Berechne aktive Verbindungen
+        let active_connections = {
+            if let Ok(requested) = self.requested_chunks.lock() {
+                requested.len()
+            } else {
+                0
+            }
+        };
+        
+        // Schätze Bandbreiten-Nutzung (basierend auf Gigabit Ethernet = 125 MB/s)
+        const GIGABIT_BANDWIDTH_MBPS: f64 = 125.0 * 1024.0 * 1024.0; // 125 MB/s in Bytes/s
+        let total_bandwidth_usage = total_download_speed + total_upload_speed;
+        let bandwidth_utilization = if GIGABIT_BANDWIDTH_MBPS > 0.0 {
+            (total_bandwidth_usage / GIGABIT_BANDWIDTH_MBPS * 100.0).min(100.0)
+        } else {
+            0.0
+        };
+        
+        // Aktualisiere Performance-Metriken
+        self.performance_metrics = PerformanceMetrics {
+            total_download_speed_bytes_per_sec: total_download_speed,
+            total_upload_speed_bytes_per_sec: total_upload_speed,
+            active_downloads: active_downloads_count,
+            active_uploads: active_uploads_count,
+            total_chunks_downloaded,
+            total_chunks_uploaded,
+            active_connections,
+            peer_performance: peer_performance_list,
+            bandwidth_utilization_percent: bandwidth_utilization,
+            last_update: std::time::Instant::now(),
+        };
+    }
+    
+    /// Updates upload statistics
+    fn update_upload_stats(&mut self) {
+        // Berechne Upload-Geschwindigkeit basierend auf aktiven Uploads
+        let now = std::time::Instant::now();
+        let cutoff_time = now.checked_sub(std::time::Duration::from_secs(5))
+            .unwrap_or(now);
+        
+        // Entferne alte Uploads (älter als 5 Sekunden)
+        if let Ok(mut active_uploads) = self.active_uploads.lock() {
+            active_uploads.retain(|_, (time, _)| *time >= cutoff_time);
+            
+            // Berechne aktive Uploads und Geschwindigkeit
+            let active_upload_count = active_uploads.len();
+            let total_bytes_in_window: usize = active_uploads.values()
+                .map(|(_, size)| *size)
+                .sum();
+            
+            // Geschwindigkeit = Bytes in 5 Sekunden / 5
+            let upload_speed_bytes_per_sec = total_bytes_in_window as f64 / 5.0;
+            
+            // Aktualisiere Upload-Statistiken
+            if let Ok(mut stats) = self.upload_stats.lock() {
+                stats.active_upload_count = active_upload_count;
+                stats.upload_speed_bytes_per_sec = upload_speed_bytes_per_sec;
+                stats.last_update_time = now;
+            }
         }
     }
     
@@ -2690,6 +2821,13 @@ impl DeckDropApp {
                 } else {
                     button::secondary
                 }),
+            button("Performance")
+                .on_press(Message::TabChanged(Tab::Performance))
+                .style(if self.current_tab == Tab::Performance {
+                    button::primary
+                } else {
+                    button::secondary
+                }),
             button("Settings")
                 .on_press(Message::TabChanged(Tab::Settings))
                 .style(if self.current_tab == Tab::Settings {
@@ -2708,6 +2846,7 @@ impl DeckDropApp {
             Tab::MyGames => self.view_my_games(),
             Tab::NetworkGames => self.view_network_games(),
             Tab::Peers => self.view_peers(),
+            Tab::Performance => self.view_performance(),
             Tab::Settings => self.view_settings_tab(),
             Tab::GameDetails => self.view_game_details(),
         }
@@ -3255,6 +3394,263 @@ impl DeckDropApp {
     }
     
     /// Shows "Settings" tab
+    /// Shows Performance Monitoring tab
+    fn view_performance(&self) -> Element<'_, Message> {
+        let metrics = &self.performance_metrics;
+        
+        // Format Geschwindigkeiten
+        let format_speed = |bytes_per_sec: f64| -> String {
+            if bytes_per_sec > 1_000_000.0 {
+                format!("{:.2} MB/s", bytes_per_sec / 1_000_000.0)
+            } else if bytes_per_sec > 1_000.0 {
+                format!("{:.2} KB/s", bytes_per_sec / 1_000.0)
+            } else {
+                format!("{:.0} B/s", bytes_per_sec)
+            }
+        };
+        
+        let mut content = Column::new()
+            .spacing(scale(15.0))
+            .padding(scale(15.0));
+        
+        // Header
+        content = content.push(
+            text("Performance Monitoring").size(scale_text(24.0))
+        );
+        
+        // Übersicht-Karten
+        content = content.push(
+            row![
+                // Download-Statistiken
+                container(
+                    column![
+                        text("Download").size(scale_text(18.0)),
+                        Space::with_height(Length::Fixed(scale(10.0))),
+                        text(format_speed(metrics.total_download_speed_bytes_per_sec))
+                            .size(scale_text(20.0))
+                            .style(|_theme: &Theme| {
+                                iced::widget::text::Style {
+                                    color: Some(Color::from_rgba(0.2, 0.8, 0.2, 1.0)),
+                                }
+                            }),
+                        text(format!("{} aktive Downloads", metrics.active_downloads))
+                            .size(scale_text(14.0)),
+                        text(format!("{} Chunks heruntergeladen", metrics.total_chunks_downloaded))
+                            .size(scale_text(12.0)),
+                    ]
+                    .spacing(scale(8.0))
+                    .padding(scale(15.0))
+                )
+                .style(|_theme: &Theme| {
+                    container::Style {
+                        background: Some(iced::Background::Color(Color::from_rgba(0.1, 0.1, 0.15, 1.0))),
+                        border: iced::Border {
+                            radius: 8.0.into(),
+                            width: 1.0,
+                            color: Color::from_rgba(0.3, 0.3, 0.4, 1.0),
+                        },
+                        ..Default::default()
+                    }
+                })
+                .width(Length::FillPortion(1)),
+                
+                Space::with_width(Length::Fixed(scale(15.0))),
+                
+                // Upload-Statistiken
+                container(
+                    column![
+                        text("Upload").size(scale_text(18.0)),
+                        Space::with_height(Length::Fixed(scale(10.0))),
+                        text(format_speed(metrics.total_upload_speed_bytes_per_sec))
+                            .size(scale_text(20.0))
+                            .style(|_theme: &Theme| {
+                                iced::widget::text::Style {
+                                    color: Some(Color::from_rgba(0.2, 0.6, 0.8, 1.0)),
+                                }
+                            }),
+                        text(format!("{} aktive Uploads", metrics.active_uploads))
+                            .size(scale_text(14.0)),
+                        text(format!("{} Chunks hochgeladen", metrics.total_chunks_uploaded))
+                            .size(scale_text(12.0)),
+                    ]
+                    .spacing(scale(8.0))
+                    .padding(scale(15.0))
+                )
+                .style(|_theme: &Theme| {
+                    container::Style {
+                        background: Some(iced::Background::Color(Color::from_rgba(0.1, 0.1, 0.15, 1.0))),
+                        border: iced::Border {
+                            radius: 8.0.into(),
+                            width: 1.0,
+                            color: Color::from_rgba(0.3, 0.3, 0.4, 1.0),
+                        },
+                        ..Default::default()
+                    }
+                })
+                .width(Length::FillPortion(1)),
+                
+                Space::with_width(Length::Fixed(scale(15.0))),
+                
+                // Bandbreiten-Nutzung
+                container(
+                    column![
+                        text("Bandbreite").size(scale_text(18.0)),
+                        Space::with_height(Length::Fixed(scale(10.0))),
+                        text(format!("{:.1}%", metrics.bandwidth_utilization_percent))
+                            .size(scale_text(20.0))
+                            .style(|_theme: &Theme| {
+                                iced::widget::text::Style {
+                                    color: Some(if metrics.bandwidth_utilization_percent > 80.0 {
+                                        Color::from_rgba(0.9, 0.3, 0.3, 1.0) // Rot bei hoher Nutzung
+                                    } else if metrics.bandwidth_utilization_percent > 50.0 {
+                                        Color::from_rgba(0.9, 0.7, 0.2, 1.0) // Gelb bei mittlerer Nutzung
+                                    } else {
+                                        Color::from_rgba(0.2, 0.8, 0.2, 1.0) // Grün bei niedriger Nutzung
+                                    }),
+                                }
+                            }),
+                        text(format!("{} aktive Verbindungen", metrics.active_connections))
+                            .size(scale_text(14.0)),
+                        text(format!("Max: {} Chunks", self.config.max_concurrent_chunks))
+                            .size(scale_text(12.0)),
+                    ]
+                    .spacing(scale(8.0))
+                    .padding(scale(15.0))
+                )
+                .style(|_theme: &Theme| {
+                    container::Style {
+                        background: Some(iced::Background::Color(Color::from_rgba(0.1, 0.1, 0.15, 1.0))),
+                        border: iced::Border {
+                            radius: 8.0.into(),
+                            width: 1.0,
+                            color: Color::from_rgba(0.3, 0.3, 0.4, 1.0),
+                        },
+                        ..Default::default()
+                    }
+                })
+                .width(Length::FillPortion(1)),
+            ]
+            .width(Length::Fill)
+        );
+        
+        // Peer-Performance-Tabelle
+        if !metrics.peer_performance.is_empty() {
+            content = content.push(
+                text("Peer Performance").size(scale_text(20.0))
+            );
+            
+            let mut peers_table = Column::new()
+                .spacing(scale(8.0));
+            
+            // Header
+            peers_table = peers_table.push(
+                row![
+                    text("Peer ID").size(scale_text(14.0)).width(Length::FillPortion(2)),
+                    text("Geschwindigkeit").size(scale_text(14.0)).width(Length::FillPortion(2)),
+                    text("Erfolgsrate").size(scale_text(14.0)).width(Length::FillPortion(1)),
+                    text("Requests").size(scale_text(14.0)).width(Length::FillPortion(1)),
+                    text("Status").size(scale_text(14.0)).width(Length::FillPortion(1)),
+                ]
+                .spacing(scale(10.0))
+                .padding(scale(8.0))
+            );
+            
+            // Peer-Daten
+            for (peer_id, perf) in &metrics.peer_performance {
+                let speed_text = format_speed(perf.download_speed_bytes_per_sec);
+                let success_rate_text = format!("{:.1}%", perf.success_rate * 100.0);
+                let status_text = if let Some(blocked_until) = perf.blocked_until {
+                    if std::time::Instant::now() < blocked_until {
+                        "Blockiert".to_string()
+                    } else {
+                        "Aktiv".to_string()
+                    }
+                } else {
+                    "Aktiv".to_string()
+                };
+                
+                peers_table = peers_table.push(
+                    container(
+                        row![
+                            text(peer_id.chars().take(12).collect::<String>())
+                                .size(scale_text(12.0))
+                                .width(Length::FillPortion(2)),
+                            text(speed_text)
+                                .size(scale_text(12.0))
+                                .width(Length::FillPortion(2)),
+                            text(success_rate_text)
+                                .size(scale_text(12.0))
+                                .width(Length::FillPortion(1)),
+                            text(format!("{}/{}", perf.successful_requests, perf.total_requests))
+                                .size(scale_text(12.0))
+                                .width(Length::FillPortion(1)),
+                            {
+                                let status_text_clone = status_text.clone();
+                                text(status_text)
+                                    .size(scale_text(12.0))
+                                    .style(move |_theme: &Theme| {
+                                        iced::widget::text::Style {
+                                            color: Some(if status_text_clone == "Blockiert" {
+                                                Color::from_rgba(0.9, 0.3, 0.3, 1.0)
+                                            } else {
+                                                Color::from_rgba(0.2, 0.8, 0.2, 1.0)
+                                            }),
+                                        }
+                                    })
+                                    .width(Length::FillPortion(1))
+                            },
+                        ]
+                        .spacing(scale(10.0))
+                        .padding(scale(8.0))
+                    )
+                    .style(|_theme: &Theme| {
+                        container::Style {
+                            background: Some(iced::Background::Color(Color::from_rgba(0.05, 0.05, 0.1, 1.0))),
+                            border: iced::Border {
+                                radius: 4.0.into(),
+                                width: 1.0,
+                                color: Color::from_rgba(0.2, 0.2, 0.3, 1.0),
+                            },
+                            ..Default::default()
+                        }
+                    })
+                );
+            }
+            
+            content = content.push(
+                scrollable(peers_table)
+                    .height(Length::Fixed(scale(300.0)))
+            );
+        } else {
+            content = content.push(
+                text("Keine Peer-Performance-Daten verfügbar")
+                    .size(scale_text(14.0))
+                    .style(|_theme: &Theme| {
+                        iced::widget::text::Style {
+                            color: Some(Color::from_rgba(0.6, 0.6, 0.6, 1.0)),
+                        }
+                    })
+            );
+        }
+        
+        // Letzte Aktualisierung
+        let elapsed = metrics.last_update.elapsed().as_secs();
+        content = content.push(
+            text(format!("Letzte Aktualisierung: vor {} Sekunden", elapsed))
+                .size(scale_text(10.0))
+                .style(|_theme: &Theme| {
+                    iced::widget::text::Style {
+                        color: Some(Color::from_rgba(0.5, 0.5, 0.5, 1.0)),
+                    }
+                })
+        );
+        
+        scrollable(content)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
+    }
+    
     fn view_settings_tab(&self) -> Element<'_, Message> {
         let version = env!("CARGO_PKG_VERSION");
         column![

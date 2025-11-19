@@ -172,7 +172,7 @@ impl NetworkBridge {
                                         let full_path = game_path.join(&entry.path);
                                         if let Ok(mut file) = std::fs::File::open(&full_path) {
                                             use std::io::{Read, Seek, SeekFrom};
-                                            const CHUNK_SIZE: usize = 100 * 1024 * 1024;
+                                            const CHUNK_SIZE: usize = 10 * 1024 * 1024; // 10MB
                                             let offset = (chunk_index as u64) * (CHUNK_SIZE as u64);
                                             if file.seek(SeekFrom::Start(offset)).is_ok() {
                                                 let mut buffer = vec![0u8; CHUNK_SIZE];

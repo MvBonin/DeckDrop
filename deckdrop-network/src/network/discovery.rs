@@ -50,6 +50,11 @@ pub enum DiscoveryEvent {
         chunk_hash: String,
         error: String,
     },
+    ChunkUploaded {
+        peer_id: String,
+        chunk_hash: String,
+        chunk_size: usize,
+    },
 }
 
 /// Request-Typen für Downloads (vom GTK-Thread zum Tokio-Thread)
@@ -1050,6 +1055,21 @@ pub async fn run_discovery(
                                         // Lade Chunk über den Callback, falls vorhanden
                                         let response = if let Some(ref loader) = chunk_loader_clone {
                                             if let Some(chunk_data) = loader(&request.chunk_hash) {
+                                                // Tracke Upload: Sende Event wenn Chunk erfolgreich geladen wurde
+                                                let chunk_size = chunk_data.len();
+                                                let peer_id_str = peer.to_string();
+                                                let chunk_hash_clone = request.chunk_hash.clone();
+                                                let event_tx_for_upload = event_tx_clone.clone();
+                                                
+                                                // Sende Upload-Event (asynchron, blockiert nicht)
+                                                tokio::spawn(async move {
+                                                    let _ = event_tx_for_upload.send(DiscoveryEvent::ChunkUploaded {
+                                                        peer_id: peer_id_str,
+                                                        chunk_hash: chunk_hash_clone,
+                                                        chunk_size,
+                                                    }).await;
+                                                });
+                                                
                                                 ChunkResponse { 
                                                     chunk_hash: request.chunk_hash.clone(),
                                                     chunk_data 
