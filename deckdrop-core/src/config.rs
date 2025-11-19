@@ -15,6 +15,12 @@ pub struct Config {
     pub peer_id: Option<String>,
     #[serde(default)]
     pub game_paths: Vec<PathBuf>,
+    #[serde(default = "default_max_concurrent_chunks")]
+    pub max_concurrent_chunks: usize,
+}
+
+fn default_max_concurrent_chunks() -> usize {
+    5
 }
 
 impl Default for Config {
@@ -24,6 +30,7 @@ impl Default for Config {
             download_path: PathBuf::from("~/Games"),
             peer_id: None,
             game_paths: Vec::new(),
+            max_concurrent_chunks: 5,
         }
     }
 }

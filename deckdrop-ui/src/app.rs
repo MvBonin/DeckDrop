@@ -78,6 +78,9 @@ pub struct DeckDropApp {
     // Chunk request tracking (to prevent requesting the same chunk multiple times)
     pub requested_chunks: Arc<std::sync::Mutex<HashSet<String>>>, // chunk_hash -> already requested
     
+    // Chunk download progress tracking (start time per chunk for progress calculation)
+    pub chunk_download_start_times: Arc<std::sync::Mutex<HashMap<String, std::time::Instant>>>, // chunk_hash -> start_time
+    
     // Upload tracking (chunks being uploaded to peers)
     #[allow(dead_code)]
     pub active_uploads: Arc<std::sync::Mutex<HashMap<String, (std::time::Instant, usize)>>>, // chunk_hash -> (start_time, chunk_size_bytes)
@@ -124,6 +127,7 @@ pub struct DeckDropApp {
     // Settings-Felder
     pub settings_player_name: String,
     pub settings_download_path: String,
+    pub settings_max_concurrent_chunks: String,
     
     // License Dialog fields
     pub license_player_name: String,
@@ -364,6 +368,7 @@ impl Default for DeckDropApp {
             active_downloads: HashMap::new(),
             processing_chunks: Arc::new(std::sync::Mutex::new(HashSet::new())),
             requested_chunks: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            chunk_download_start_times: Arc::new(std::sync::Mutex::new(HashMap::new())),
             chunk_retries: Arc::new(std::sync::Mutex::new(HashMap::new())), // Robustheit: Retry-Tracking
             active_uploads: Arc::new(std::sync::Mutex::new(HashMap::new())),
             upload_stats: Arc::new(std::sync::Mutex::new(UploadStats {
@@ -415,6 +420,7 @@ impl Default for DeckDropApp {
             add_game_saving: false,
             settings_player_name: config.player_name.clone(),
             settings_download_path: config.download_path.to_string_lossy().to_string(),
+            settings_max_concurrent_chunks: config.max_concurrent_chunks.to_string(),
             license_player_name: config.player_name.clone(),
             editing_game: false,
             edit_game_name: String::new(),
@@ -462,6 +468,7 @@ pub enum Message {
     OpenSettings,
     SettingsPlayerNameChanged(String),
     SettingsDownloadPathChanged(String),
+    SettingsMaxConcurrentChunksChanged(String),
     BrowseDownloadPath,
     SaveSettings,
     CancelSettings,
@@ -618,6 +625,7 @@ impl DeckDropApp {
             active_downloads,
             processing_chunks: Arc::new(std::sync::Mutex::new(HashSet::new())),
             requested_chunks: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            chunk_download_start_times: Arc::new(std::sync::Mutex::new(HashMap::new())),
             chunk_retries: Arc::new(std::sync::Mutex::new(HashMap::new())), // Robustheit: Retry-Tracking
             active_uploads: Arc::new(std::sync::Mutex::new(HashMap::new())),
             upload_stats: Arc::new(std::sync::Mutex::new(UploadStats {
@@ -669,6 +677,7 @@ impl DeckDropApp {
             add_game_saving: false,
             settings_player_name: config.player_name.clone(),
             settings_download_path: config.download_path.to_string_lossy().to_string(),
+            settings_max_concurrent_chunks: config.max_concurrent_chunks.to_string(),
             license_player_name: config.player_name.clone(),
             editing_game: false,
             edit_game_name: String::new(),
@@ -1192,12 +1201,23 @@ impl DeckDropApp {
                 self.show_settings = true;
                 self.settings_player_name = self.config.player_name.clone();
                 self.settings_download_path = self.config.download_path.to_string_lossy().to_string();
+                self.settings_max_concurrent_chunks = self.config.max_concurrent_chunks.to_string();
             }
             Message::SettingsPlayerNameChanged(name) => {
                 self.settings_player_name = name;
             }
             Message::SettingsDownloadPathChanged(path) => {
                 self.settings_download_path = path;
+            }
+            Message::SettingsMaxConcurrentChunksChanged(value) => {
+                // Validiere: Nur Zahlen zwischen 1-10
+                if let Ok(num) = value.parse::<usize>() {
+                    if num >= 1 && num <= 10 {
+                        self.settings_max_concurrent_chunks = value;
+                    }
+                } else if value.is_empty() {
+                    self.settings_max_concurrent_chunks = value;
+                }
             }
             Message::BrowseDownloadPath => {
                 if let Some(path) = rfd::FileDialog::new()
@@ -1212,6 +1232,11 @@ impl DeckDropApp {
                 let player_name_changed = self.config.player_name != self.settings_player_name;
                 self.config.player_name = self.settings_player_name.clone();
                 self.config.download_path = PathBuf::from(&self.settings_download_path);
+                // Parse and save max_concurrent_chunks (default to 5 if invalid)
+                self.config.max_concurrent_chunks = self.settings_max_concurrent_chunks.parse::<usize>()
+                    .unwrap_or(5)
+                    .max(1)
+                    .min(10);
                 if let Err(e) = self.config.save() {
                     eprintln!("Error saving settings: {}", e);
                 }
@@ -1846,7 +1871,9 @@ impl DeckDropApp {
                 // Verarbeite Chunk in einem separaten Thread, um die GUI nicht zu blockieren
                 let chunk_data_clone = chunk_data.clone();
                 let requested_chunks_for_thread = self.requested_chunks.clone(); // Clone für Thread
+                let chunk_download_start_times_for_thread = self.chunk_download_start_times.clone(); // Clone für Thread
                 let chunk_retries_for_thread = self.chunk_retries.clone(); // Clone für Thread
+                let max_concurrent_chunks = self.config.max_concurrent_chunks; // Clone für Thread
                 
                 // Extrahiere Peer-IDs für dieses Spiel vor dem Thread-Spawn (um Clone-Kosten zu reduzieren)
                 let game_id_for_peers = deckdrop_core::find_game_id_for_chunk(&chunk_hash).ok();
@@ -1891,6 +1918,10 @@ impl DeckDropApp {
                                         if let Ok(mut requested) = requested_chunks_for_thread.lock() {
                                             requested.remove(&chunk_hash_clone);
                                         }
+                                        // Entferne Startzeit für diesen Chunk
+                                        if let Ok(mut start_times) = chunk_download_start_times_for_thread.lock() {
+                                            start_times.remove(&chunk_hash_clone);
+                                        }
                                         return; // Überspringe ungültigen Chunk
                                     }
                                     
@@ -1927,16 +1958,17 @@ impl DeckDropApp {
                                                                         let missing = manifest.get_missing_chunks();
                                                                         
                                                                         // Filtere bereits angeforderte Chunks
-                                                                        // Begrenzung: Maximal 5 Chunks gleichzeitig (entspricht der Begrenzung in discovery.rs)
-                                                                        // Fordere nur neue Chunks an, wenn weniger als 5 bereits angefordert sind
+                                                                        // Begrenzung: Maximal max_concurrent_chunks Chunks gleichzeitig (entspricht der Begrenzung in discovery.rs)
+                                                                        // Fordere nur neue Chunks an, wenn weniger als max_concurrent_chunks bereits angefordert sind
+                                                                        let max_concurrent = max_concurrent_chunks;
                                                                         let new_chunks: Vec<String> = {
                                                                             if let Ok(requested) = requested_chunks_for_thread.lock() {
                                                                                 let requested_count = requested.len();
-                                                                                // Maximal 5 Chunks gleichzeitig - wenn bereits 5 angefordert, warte
-                                                                                if requested_count >= 5 {
+                                                                                // Maximal max_concurrent_chunks Chunks gleichzeitig - wenn bereits max_concurrent_chunks angefordert, warte
+                                                                                if requested_count >= max_concurrent {
                                                                                     Vec::new() // Keine neuen Requests, wenn bereits 5 aktiv
                                                                                 } else {
-                                                                                    let remaining_slots = 5 - requested_count;
+                                                                                    let remaining_slots = max_concurrent - requested_count;
                                                                                     missing.into_iter()
                                                                                         .filter(|chunk| !requested.contains(chunk))
                                                                                         .take(remaining_slots)
@@ -1947,11 +1979,18 @@ impl DeckDropApp {
                                                                             }
                                                                         };
                                                                         
-                                                                        // Markiere neue Chunks als angefordert
+                                                                        // Markiere neue Chunks als angefordert und tracke Startzeit
                                                                         if !new_chunks.is_empty() {
+                                                                            let start_time = std::time::Instant::now();
                                                                             if let Ok(mut requested) = requested_chunks_for_thread.lock() {
                                                                                 for chunk in &new_chunks {
                                                                                     requested.insert(chunk.clone());
+                                                                                }
+                                                                            }
+                                                                            // Tracke Startzeit für Progress-Berechnung
+                                                                            if let Ok(mut start_times) = chunk_download_start_times_for_thread.lock() {
+                                                                                for chunk in &new_chunks {
+                                                                                    start_times.insert(chunk.clone(), start_time);
                                                                                 }
                                                                             }
                                                                             
@@ -2001,6 +2040,10 @@ impl DeckDropApp {
                     // Entferne Chunk aus "angefordert" Set, da er jetzt empfangen wurde
                     if let Ok(mut requested) = requested_chunks_for_thread.lock() {
                         requested.remove(&chunk_hash_clone);
+                    }
+                    // Entferne Startzeit für diesen Chunk
+                    if let Ok(mut start_times) = chunk_download_start_times_for_thread.lock() {
+                        start_times.remove(&chunk_hash_clone);
                     }
                     
                     // Robustheit: Entferne Retry-Info bei erfolgreichem Download
@@ -3251,6 +3294,17 @@ impl DeckDropApp {
                         .padding(scale(8.0)),
                 ]
                 .spacing(scale(8.0)),
+                Space::with_height(Length::Fixed(scale(8.0))),
+                text("Max Concurrent Chunks (1-10):").size(scale_text(14.0)),
+                text_input("Max Concurrent Chunks", &self.settings_max_concurrent_chunks)
+                    .on_input(Message::SettingsMaxConcurrentChunksChanged)
+                    .padding(scale(8.0)),
+                text("Number of chunks that can be downloaded simultaneously").size(scale_text(10.0))
+                    .style(|_theme: &Theme| {
+                        iced::widget::text::Style {
+                            color: Some(Color::from_rgba(0.6, 0.6, 0.6, 1.0)),
+                        }
+                    }),
                 Space::with_height(Length::Fixed(scale(20.0))),
                 row![
                     button("Cancel")
@@ -3706,24 +3760,47 @@ impl DeckDropApp {
                                     let downloaded_size_str = format_size(downloaded_bytes);
                                     let total_size_str = format_size(total_bytes_final);
                                     
-                                    // Get currently downloading chunks (requested but not yet downloaded)
+                                    // Get currently downloading chunks (requested but not yet downloaded) with real progress
                                     let downloading_chunks: Vec<(String, f64)> = {
                                         if let Ok(requested) = self.requested_chunks.lock() {
-                                            let missing_chunks = ds.manifest.get_missing_chunks();
-                                            let mut chunks_with_progress: Vec<(String, f64)> = missing_chunks.iter()
-                                                .filter(|chunk| requested.contains(*chunk))
-                                                .enumerate()
-                                                .map(|(idx, chunk)| {
-                                                    // Simuliere Progress basierend auf Position (ältere Chunks haben mehr Progress)
-                                                    // Verwende einen zufälligen aber konsistenten Progress für jeden Chunk
-                                                    let progress = 30.0 + ((idx as f64 * 17.3) % 70.0);
-                                                    (chunk.clone(), progress.min(99.0))
-                                                })
-                                                .collect();
-                                            
-                                            // Sortiere nach Progress (höchster oben)
-                                            chunks_with_progress.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-                                            chunks_with_progress
+                                            if let Ok(start_times) = self.chunk_download_start_times.lock() {
+                                                let missing_chunks = ds.manifest.get_missing_chunks();
+                                                let now = std::time::Instant::now();
+                                                const CHUNK_SIZE_BYTES: u64 = 100 * 1024 * 1024; // 100MB
+                                                
+                                                // Berechne durchschnittliche Download-Geschwindigkeit aus aktiven Downloads
+                                                let avg_speed = if let Some(ds) = download_state {
+                                                    if ds.download_speed_bytes_per_sec > 0.0 {
+                                                        ds.download_speed_bytes_per_sec
+                                                    } else {
+                                                        1_000_000.0 // Fallback: 1 MB/s
+                                                    }
+                                                } else {
+                                                    1_000_000.0 // Fallback: 1 MB/s
+                                                };
+                                                
+                                                let mut chunks_with_progress: Vec<(String, f64)> = missing_chunks.iter()
+                                                    .filter(|chunk| requested.contains(*chunk))
+                                                    .map(|chunk| {
+                                                        // Berechne Progress basierend auf verstrichener Zeit und Geschwindigkeit
+                                                        if let Some(start_time) = start_times.get(chunk) {
+                                                            let elapsed_secs = now.duration_since(*start_time).as_secs_f64();
+                                                            let downloaded_bytes = elapsed_secs * avg_speed;
+                                                            let progress = (downloaded_bytes / CHUNK_SIZE_BYTES as f64 * 100.0).min(99.0).max(0.0);
+                                                            (chunk.clone(), progress)
+                                                        } else {
+                                                            // Keine Startzeit gefunden - verwende 0%
+                                                            (chunk.clone(), 0.0)
+                                                        }
+                                                    })
+                                                    .collect();
+                                                
+                                                // Sortiere nach Progress (höchster oben)
+                                                chunks_with_progress.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                                                chunks_with_progress
+                                            } else {
+                                                Vec::new()
+                                            }
                                         } else {
                                             Vec::new()
                                         }

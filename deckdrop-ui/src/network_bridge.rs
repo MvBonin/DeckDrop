@@ -68,6 +68,7 @@ impl NetworkBridge {
         
         // Lade Konfiguration
         let config = Config::load();
+        let max_concurrent_chunks = config.max_concurrent_chunks;
         let player_name = Some(config.player_name.clone());
         
         // Berechne games_count
@@ -209,6 +210,7 @@ impl NetworkBridge {
                     chunk_loader,
                     Some(download_request_rx),
                     Some(metadata_update_rx),
+                    max_concurrent_chunks,
                 ).await;
                 
                 // Halte Runtime am Leben

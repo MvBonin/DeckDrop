@@ -93,6 +93,7 @@ pub async fn start_discovery(
     chunk_loader: Option<ChunkLoader>,
     download_request_rx: Option<tokio::sync::mpsc::UnboundedReceiver<DownloadRequest>>,
     metadata_update_rx: Option<tokio::sync::mpsc::UnboundedReceiver<MetadataUpdate>>,
+    max_concurrent_chunks: usize,
 ) -> tokio::task::JoinHandle<()> {
     let (sender, mut receiver) = crate::network::channel::new_peer_channel();
     let event_tx_for_lost = event_tx.clone();
@@ -123,7 +124,7 @@ pub async fn start_discovery(
     tokio::spawn(async move {
         println!("run_discovery Task gestartet");
         eprintln!("run_discovery Task gestartet");
-        let result = run_discovery(sender, None, event_tx_for_lost, player_name_clone, games_count_clone, keypair, games_loader, game_metadata_loader, chunk_loader, download_request_rx, metadata_update_rx).await;
+        let result = run_discovery(sender, None, event_tx_for_lost, player_name_clone, games_count_clone, keypair, games_loader, game_metadata_loader, chunk_loader, download_request_rx, metadata_update_rx, max_concurrent_chunks).await;
         println!("run_discovery beendet: {:?}", result);
         eprintln!("run_discovery beendet: {:?}", result);
     })
@@ -141,6 +142,7 @@ pub async fn run_discovery(
     chunk_loader: Option<ChunkLoader>,
     mut download_request_rx: Option<tokio::sync::mpsc::UnboundedReceiver<DownloadRequest>>,
     mut metadata_update_rx: Option<tokio::sync::mpsc::UnboundedReceiver<MetadataUpdate>>,
+    max_concurrent_chunks: usize,
 ) {
     // Speichere Metadaten in Arc<Mutex> für dynamische Updates
     let metadata: Arc<tokio::sync::Mutex<(Option<String>, Option<u32>)>> = 
@@ -168,7 +170,7 @@ pub async fn run_discovery(
         Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     let active_requests_per_peer_clone = active_requests_per_peer.clone();
     
-    // Globale Begrenzung: Maximal 5 Chunk-Downloads gleichzeitig
+    // Globale Begrenzung: Maximal max_concurrent_chunks Chunk-Downloads gleichzeitig
     let active_chunk_downloads: Arc<tokio::sync::Mutex<usize>> = 
         Arc::new(tokio::sync::Mutex::new(0));
     let active_chunk_downloads_clone = active_chunk_downloads.clone();
@@ -625,13 +627,13 @@ pub async fn run_discovery(
                             eprintln!("GameMetadata Request gesendet an {} für game_id: {} (RequestId: {:?})", peer_id, game_id, request_id);
                         }
                         DownloadRequest::RequestChunk { peer_id, chunk_hash, game_id } => {
-                            // Prüfe globale Begrenzung: Maximal 5 Chunk-Downloads gleichzeitig
+                            // Prüfe globale Begrenzung: Maximal max_concurrent_chunks Chunk-Downloads gleichzeitig
                             let global_active_count = {
                                 let active = active_chunk_downloads_clone.lock().await;
                                 *active
                             };
                             
-                            if global_active_count >= 5 {
+                            if global_active_count >= max_concurrent_chunks {
                                 // Füge Request zur Warteschlange hinzu
                                 let mut queue = pending_chunk_queue_clone.lock().await;
                                 queue.push((peer_id.clone(), chunk_hash.clone(), game_id.clone()));
@@ -1119,7 +1121,7 @@ pub async fn run_discovery(
                                                 *active
                                             };
                                             
-                                            if global_active_count >= 5 {
+                                            if global_active_count >= max_concurrent_chunks {
                                                 break; // Keine Slots mehr frei
                                             }
                                             
@@ -1243,7 +1245,7 @@ pub async fn run_discovery(
                                         *active
                                     };
                                     
-                                    if global_active_count >= 5 {
+                                    if global_active_count >= max_concurrent_chunks {
                                         break; // Keine Slots mehr frei
                                     }
                                     
