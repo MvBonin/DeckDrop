@@ -3782,11 +3782,26 @@ impl DeckDropApp {
                                                 let mut chunks_with_progress: Vec<(String, f64)> = missing_chunks.iter()
                                                     .filter(|chunk| requested.contains(*chunk))
                                                     .map(|chunk| {
-                                                        // Berechne Progress basierend auf verstrichener Zeit und Geschwindigkeit
+                                                        // Berechne Progress basierend auf verstrichener Zeit
+                                                        // Verwende eine realistischere Berechnung: Progress steigt langsam an
                                                         if let Some(start_time) = start_times.get(chunk) {
                                                             let elapsed_secs = now.duration_since(*start_time).as_secs_f64();
-                                                            let downloaded_bytes = elapsed_secs * avg_speed;
-                                                            let progress = (downloaded_bytes / CHUNK_SIZE_BYTES as f64 * 100.0).min(99.0).max(0.0);
+                                                            
+                                                            // Realistische Progress-Berechnung:
+                                                            // - Erste 2 Sekunden: 0-10% (Verbindungsaufbau)
+                                                            // - Danach: basierend auf tatsächlicher Geschwindigkeit, aber konservativ
+                                                            let progress = if elapsed_secs < 2.0 {
+                                                                // Erste 2 Sekunden: linearer Anstieg von 0% auf 10%
+                                                                (elapsed_secs / 2.0 * 10.0).min(10.0)
+                                                            } else {
+                                                                // Danach: basierend auf tatsächlicher Download-Geschwindigkeit
+                                                                // Verwende konservative Schätzung: nur 70% der theoretischen Geschwindigkeit
+                                                                let effective_speed = avg_speed * 0.7;
+                                                                let downloaded_bytes = (elapsed_secs - 2.0) * effective_speed;
+                                                                let base_progress = 10.0; // Start bei 10% nach 2 Sekunden
+                                                                let additional_progress = (downloaded_bytes / CHUNK_SIZE_BYTES as f64 * 85.0).min(85.0); // Maximal 95% insgesamt
+                                                                (base_progress + additional_progress).min(95.0).max(0.0)
+                                                            };
                                                             (chunk.clone(), progress)
                                                         } else {
                                                             // Keine Startzeit gefunden - verwende 0%
@@ -3795,8 +3810,8 @@ impl DeckDropApp {
                                                     })
                                                     .collect();
                                                 
-                                                // Sortiere nach Progress (höchster oben)
-                                                chunks_with_progress.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                                                // Sortiere alphabetisch nach Chunk-Hash (stabil, keine Sprünge)
+                                                chunks_with_progress.sort_by(|a, b| a.0.cmp(&b.0));
                                                 chunks_with_progress
                                             } else {
                                                 Vec::new()

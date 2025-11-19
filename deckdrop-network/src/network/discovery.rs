@@ -5,7 +5,7 @@ use libp2p::{
 };
 use std::str::FromStr;
 use std::net::IpAddr;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Duration;
 use std::sync::Arc;
 
@@ -176,8 +176,9 @@ pub async fn run_discovery(
     let active_chunk_downloads_clone = active_chunk_downloads.clone();
     
     // Warteschlange für Chunk-Requests, die warten müssen (peer_id, chunk_hash, game_id)
-    let pending_chunk_queue: Arc<tokio::sync::Mutex<Vec<(String, String, String)>>> = 
-        Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    // Verwende VecDeque für FIFO-Verhalten (First In First Out)
+    let pending_chunk_queue: Arc<tokio::sync::Mutex<VecDeque<(String, String, String)>>> = 
+        Arc::new(tokio::sync::Mutex::new(VecDeque::new()));
     let pending_chunk_queue_clone = pending_chunk_queue.clone();
     
     // Tracking für Metadata-Requests: request_id -> (game_id, peer_id)
@@ -636,7 +637,7 @@ pub async fn run_discovery(
                             if global_active_count >= max_concurrent_chunks {
                                 // Füge Request zur Warteschlange hinzu
                                 let mut queue = pending_chunk_queue_clone.lock().await;
-                                queue.push((peer_id.clone(), chunk_hash.clone(), game_id.clone()));
+                                queue.push_back((peer_id.clone(), chunk_hash.clone(), game_id.clone()));
                                 eprintln!("Maximal 5 Chunk-Downloads aktiv ({}), füge Request zur Warteschlange hinzu: {} von {}", 
                                     global_active_count, chunk_hash, peer_id);
                                 continue;
@@ -1127,7 +1128,7 @@ pub async fn run_discovery(
                                             
                                             let next_request = {
                                                 let mut queue = pending_chunk_queue_clone.lock().await;
-                                                queue.pop()
+                                                queue.pop_front() // FIFO: Erste Element zuerst
                                             };
                                             
                                             if let Some((peer_id, chunk_hash, game_id)) = next_request {
@@ -1148,7 +1149,7 @@ pub async fn run_discovery(
                                                 if active_count >= 5 {
                                                     // Zurück in die Warteschlange, wenn Peer-Limit erreicht
                                                     let mut queue = pending_chunk_queue_clone.lock().await;
-                                                    queue.push((peer_id, chunk_hash, game_id));
+                                                    queue.push_back((peer_id, chunk_hash, game_id));
                                                     break;
                                                 }
                                                 
@@ -1156,7 +1157,7 @@ pub async fn run_discovery(
                                                 if !swarm.connected_peers().any(|p| p == &peer_id_parsed) {
                                                     // Zurück in die Warteschlange, wenn Peer nicht verbunden
                                                     let mut queue = pending_chunk_queue_clone.lock().await;
-                                                    queue.push((peer_id, chunk_hash, game_id));
+                                                    queue.push_back((peer_id, chunk_hash, game_id));
                                                     break;
                                                 }
                                                 
@@ -1251,7 +1252,7 @@ pub async fn run_discovery(
                                     
                                     let next_request = {
                                         let mut queue = pending_chunk_queue_clone.lock().await;
-                                        queue.pop()
+                                        queue.pop_front()
                                     };
                                     
                                     if let Some((peer_id, chunk_hash, game_id)) = next_request {
@@ -1272,7 +1273,7 @@ pub async fn run_discovery(
                                         if active_count >= 5 {
                                             // Zurück in die Warteschlange, wenn Peer-Limit erreicht
                                             let mut queue = pending_chunk_queue_clone.lock().await;
-                                            queue.push((peer_id, chunk_hash, game_id));
+                                            queue.push_back((peer_id, chunk_hash, game_id));
                                             break;
                                         }
                                         
@@ -1280,7 +1281,7 @@ pub async fn run_discovery(
                                         if !swarm.connected_peers().any(|p| p == &peer_id_parsed) {
                                             // Zurück in die Warteschlange, wenn Peer nicht verbunden
                                             let mut queue = pending_chunk_queue_clone.lock().await;
-                                            queue.push((peer_id, chunk_hash, game_id));
+                                            queue.push_back((peer_id, chunk_hash, game_id));
                                             break;
                                         }
                                         
