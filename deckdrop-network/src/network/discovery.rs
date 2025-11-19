@@ -168,6 +168,16 @@ pub async fn run_discovery(
         Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     let active_requests_per_peer_clone = active_requests_per_peer.clone();
     
+    // Globale Begrenzung: Maximal 5 Chunk-Downloads gleichzeitig
+    let active_chunk_downloads: Arc<tokio::sync::Mutex<usize>> = 
+        Arc::new(tokio::sync::Mutex::new(0));
+    let active_chunk_downloads_clone = active_chunk_downloads.clone();
+    
+    // Warteschlange für Chunk-Requests, die warten müssen (peer_id, chunk_hash, game_id)
+    let pending_chunk_queue: Arc<tokio::sync::Mutex<Vec<(String, String, String)>>> = 
+        Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let pending_chunk_queue_clone = pending_chunk_queue.clone();
+    
     // Tracking für Metadata-Requests: request_id -> (game_id, peer_id)
     let pending_metadata_requests: Arc<tokio::sync::Mutex<HashMap<OutboundRequestId, (String, String)>>> = 
         Arc::new(tokio::sync::Mutex::new(HashMap::new()));
@@ -615,6 +625,21 @@ pub async fn run_discovery(
                             eprintln!("GameMetadata Request gesendet an {} für game_id: {} (RequestId: {:?})", peer_id, game_id, request_id);
                         }
                         DownloadRequest::RequestChunk { peer_id, chunk_hash, game_id } => {
+                            // Prüfe globale Begrenzung: Maximal 5 Chunk-Downloads gleichzeitig
+                            let global_active_count = {
+                                let active = active_chunk_downloads_clone.lock().await;
+                                *active
+                            };
+                            
+                            if global_active_count >= 5 {
+                                // Füge Request zur Warteschlange hinzu
+                                let mut queue = pending_chunk_queue_clone.lock().await;
+                                queue.push((peer_id.clone(), chunk_hash.clone(), game_id.clone()));
+                                eprintln!("Maximal 5 Chunk-Downloads aktiv ({}), füge Request zur Warteschlange hinzu: {} von {}", 
+                                    global_active_count, chunk_hash, peer_id);
+                                continue;
+                            }
+                            
                             let peer_id_parsed = match PeerId::from_str(&peer_id) {
                                 Ok(id) => id,
                                 Err(e) => {
@@ -687,8 +712,16 @@ pub async fn run_discovery(
                                 *active.entry(peer_id.clone()).or_insert(0) += 1;
                             }
                             
-                            println!("Chunk Request gesendet an {} für hash: {} (RequestId: {:?})", peer_id, chunk_hash, request_id);
-                            eprintln!("Chunk Request gesendet an {} für hash: {} (RequestId: {:?})", peer_id, chunk_hash, request_id);
+                            // Erhöhe globale Anzahl aktiver Chunk-Downloads
+                            {
+                                let mut global_active = active_chunk_downloads_clone.lock().await;
+                                *global_active += 1;
+                            }
+                            
+                            println!("Chunk Request gesendet an {} für hash: {} (RequestId: {:?}, globale aktive Downloads: {})", 
+                                peer_id, chunk_hash, request_id, global_active_count + 1);
+                            eprintln!("Chunk Request gesendet an {} für hash: {} (RequestId: {:?}, globale aktive Downloads: {})", 
+                                peer_id, chunk_hash, request_id, global_active_count + 1);
                         }
                     }
                 }
@@ -1057,6 +1090,12 @@ pub async fn run_discovery(
                                             }
                                         }
                                         
+                                        // Reduziere globale Anzahl aktiver Chunk-Downloads
+                                        {
+                                            let mut global_active = active_chunk_downloads_clone.lock().await;
+                                            *global_active = global_active.saturating_sub(1);
+                                        }
+                                        
                                         println!("Chunk Response erhalten von {} für hash {} (RequestId: {:?}, game_id: {})", 
                                             peer_id_str, chunk_hash, request_id, game_id);
                                         eprintln!("Chunk Response erhalten von {} für hash {} (RequestId: {:?}, game_id: {})", 
@@ -1072,6 +1111,84 @@ pub async fn run_discovery(
                                                 chunk_data: response.chunk_data.clone(),
                                             }).await;
                                         });
+                                        
+                                        // Verarbeite wartende Chunk-Requests aus der Warteschlange
+                                        loop {
+                                            let global_active_count = {
+                                                let active = active_chunk_downloads_clone.lock().await;
+                                                *active
+                                            };
+                                            
+                                            if global_active_count >= 5 {
+                                                break; // Keine Slots mehr frei
+                                            }
+                                            
+                                            let next_request = {
+                                                let mut queue = pending_chunk_queue_clone.lock().await;
+                                                queue.pop()
+                                            };
+                                            
+                                            if let Some((peer_id, chunk_hash, game_id)) = next_request {
+                                                let peer_id_parsed = match PeerId::from_str(&peer_id) {
+                                                    Ok(id) => id,
+                                                    Err(_) => {
+                                                        eprintln!("Ungültige Peer-ID in Warteschlange: {}", peer_id);
+                                                        continue;
+                                                    }
+                                                };
+                                                
+                                                // Prüfe Rate-Limit pro Peer
+                                                let active_count = {
+                                                    let mut active = active_requests_per_peer_clone.lock().await;
+                                                    *active.entry(peer_id.clone()).or_insert(0)
+                                                };
+                                                
+                                                if active_count >= 5 {
+                                                    // Zurück in die Warteschlange, wenn Peer-Limit erreicht
+                                                    let mut queue = pending_chunk_queue_clone.lock().await;
+                                                    queue.push((peer_id, chunk_hash, game_id));
+                                                    break;
+                                                }
+                                                
+                                                // Prüfe ob Peer verbunden ist
+                                                if !swarm.connected_peers().any(|p| p == &peer_id_parsed) {
+                                                    // Zurück in die Warteschlange, wenn Peer nicht verbunden
+                                                    let mut queue = pending_chunk_queue_clone.lock().await;
+                                                    queue.push((peer_id, chunk_hash, game_id));
+                                                    break;
+                                                }
+                                                
+                                                // Sende Chunk-Request
+                                                let request = ChunkRequest { chunk_hash: chunk_hash.clone() };
+                                                let request_id = swarm.behaviour_mut().chunks.send_request(&peer_id_parsed, request);
+                                                
+                                                // Tracke Request-ID
+                                                {
+                                                    let mut pending = pending_chunk_requests_clone.lock().await;
+                                                    pending.insert(request_id, (chunk_hash.clone(), game_id.clone(), peer_id.clone()));
+                                                }
+                                                
+                                                // Erhöhe aktive Request-Zahl
+                                                {
+                                                    let mut active = active_requests_per_peer_clone.lock().await;
+                                                    *active.entry(peer_id.clone()).or_insert(0) += 1;
+                                                }
+                                                
+                                                // Erhöhe globale Anzahl aktiver Chunk-Downloads
+                                                {
+                                                    let mut global_active = active_chunk_downloads_clone.lock().await;
+                                                    *global_active += 1;
+                                                }
+                                                
+                                                println!("Chunk Request aus Warteschlange gesendet an {} für hash: {} (RequestId: {:?})", 
+                                                    peer_id, chunk_hash, request_id);
+                                                eprintln!("Chunk Request aus Warteschlange gesendet an {} für hash: {} (RequestId: {:?})", 
+                                                    peer_id, chunk_hash, request_id);
+                                            } else {
+                                                // Keine wartenden Requests mehr
+                                                break;
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -1087,6 +1204,12 @@ pub async fn run_discovery(
                                             active.remove(&peer_id_str);
                                         }
                                     }
+                                }
+                                
+                                // Reduziere globale Anzahl aktiver Chunk-Downloads
+                                {
+                                    let mut global_active = active_chunk_downloads_clone.lock().await;
+                                    *global_active = global_active.saturating_sub(1);
                                 }
                                 
                                 // Hole Request-Informationen aus Tracking
@@ -1112,6 +1235,84 @@ pub async fn run_discovery(
                                         error: format!("{:?}", error),
                                     }).await;
                                 });
+                                
+                                // Verarbeite wartende Chunk-Requests aus der Warteschlange
+                                loop {
+                                    let global_active_count = {
+                                        let active = active_chunk_downloads_clone.lock().await;
+                                        *active
+                                    };
+                                    
+                                    if global_active_count >= 5 {
+                                        break; // Keine Slots mehr frei
+                                    }
+                                    
+                                    let next_request = {
+                                        let mut queue = pending_chunk_queue_clone.lock().await;
+                                        queue.pop()
+                                    };
+                                    
+                                    if let Some((peer_id, chunk_hash, game_id)) = next_request {
+                                        let peer_id_parsed = match PeerId::from_str(&peer_id) {
+                                            Ok(id) => id,
+                                            Err(_) => {
+                                                eprintln!("Ungültige Peer-ID in Warteschlange: {}", peer_id);
+                                                continue;
+                                            }
+                                        };
+                                        
+                                        // Prüfe Rate-Limit pro Peer
+                                        let active_count = {
+                                            let mut active = active_requests_per_peer_clone.lock().await;
+                                            *active.entry(peer_id.clone()).or_insert(0)
+                                        };
+                                        
+                                        if active_count >= 5 {
+                                            // Zurück in die Warteschlange, wenn Peer-Limit erreicht
+                                            let mut queue = pending_chunk_queue_clone.lock().await;
+                                            queue.push((peer_id, chunk_hash, game_id));
+                                            break;
+                                        }
+                                        
+                                        // Prüfe ob Peer verbunden ist
+                                        if !swarm.connected_peers().any(|p| p == &peer_id_parsed) {
+                                            // Zurück in die Warteschlange, wenn Peer nicht verbunden
+                                            let mut queue = pending_chunk_queue_clone.lock().await;
+                                            queue.push((peer_id, chunk_hash, game_id));
+                                            break;
+                                        }
+                                        
+                                        // Sende Chunk-Request
+                                        let request = ChunkRequest { chunk_hash: chunk_hash.clone() };
+                                        let request_id = swarm.behaviour_mut().chunks.send_request(&peer_id_parsed, request);
+                                        
+                                        // Tracke Request-ID
+                                        {
+                                            let mut pending = pending_chunk_requests_clone.lock().await;
+                                            pending.insert(request_id, (chunk_hash.clone(), game_id.clone(), peer_id.clone()));
+                                        }
+                                        
+                                        // Erhöhe aktive Request-Zahl
+                                        {
+                                            let mut active = active_requests_per_peer_clone.lock().await;
+                                            *active.entry(peer_id.clone()).or_insert(0) += 1;
+                                        }
+                                        
+                                        // Erhöhe globale Anzahl aktiver Chunk-Downloads
+                                        {
+                                            let mut global_active = active_chunk_downloads_clone.lock().await;
+                                            *global_active += 1;
+                                        }
+                                        
+                                        println!("Chunk Request aus Warteschlange gesendet an {} für hash: {} (RequestId: {:?})", 
+                                            peer_id, chunk_hash, request_id);
+                                        eprintln!("Chunk Request aus Warteschlange gesendet an {} für hash: {} (RequestId: {:?})", 
+                                            peer_id, chunk_hash, request_id);
+                                    } else {
+                                        // Keine wartenden Requests mehr
+                                        break;
+                                    }
+                                }
                             }
                             libp2p::request_response::Event::InboundFailure { peer, error, .. } => {
                                 eprintln!("Chunks InboundFailure für {}: {:?}", peer, error);
