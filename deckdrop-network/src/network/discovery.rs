@@ -1898,6 +1898,7 @@ mod tests {
             None,
             None,
             None,
+            5, // max_concurrent_chunks
         ).await;
         let _handle2 = start_discovery(
             event_tx2,
@@ -1909,6 +1910,7 @@ mod tests {
             None,
             None,
             None,
+            5, // max_concurrent_chunks
         ).await;
         
         // Warte kurz, damit die Swarms initialisiert werden
@@ -2069,11 +2071,11 @@ mod tests {
         
         // Start two discovery instances in separate tasks
         let handle1 = tokio::spawn(async move {
-            run_discovery(sender1, None, event_tx1, None, None, None, None, None, None, None, None).await;
+            run_discovery(sender1, None, event_tx1, None, None, None, None, None, None, None, None, 5).await;
         });
         
         let handle2 = tokio::spawn(async move {
-            run_discovery(_sender2, None, event_tx2, None, None, None, None, None, None, None, None).await;
+            run_discovery(_sender2, None, event_tx2, None, None, None, None, None, None, None, None, 5).await;
         });
         
         // Wait a bit for discovery to start
@@ -2267,6 +2269,7 @@ mod tests {
             None,
             None,
             None,
+            5, // max_concurrent_chunks
         ).await;
         
         // Verify handle was returned
@@ -2356,6 +2359,7 @@ mod tests {
             None,
             None,
             None,
+            5, // max_concurrent_chunks
         ).await;
         let handle2 = start_discovery(
             event_tx2,
@@ -2367,6 +2371,7 @@ mod tests {
             None,
             None,
             None,
+            5, // max_concurrent_chunks
         ).await;
         
         // Warte kurz, damit die Swarms initialisiert werden

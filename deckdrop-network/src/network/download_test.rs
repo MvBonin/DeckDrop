@@ -121,6 +121,7 @@ file_size = {}
             Some(chunk_loader),
             Some(download_request_rx1),
             None,
+            5, // max_concurrent_chunks
         ).await;
         
         let _handle2 = start_discovery(
@@ -133,6 +134,7 @@ file_size = {}
             None,
             Some(download_request_rx2_to_swarm),
             None,
+            5, // max_concurrent_chunks
         ).await;
         
         // Verwende download_request_tx2_to_swarm für Requests vom Test
