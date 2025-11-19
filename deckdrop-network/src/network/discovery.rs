@@ -1970,6 +1970,7 @@ mod tests {
                         Some(DiscoveryEvent::GameMetadataReceived { .. }) => {}
                         Some(DiscoveryEvent::ChunkReceived { .. }) => {}
                         Some(DiscoveryEvent::ChunkRequestFailed { .. }) => {}
+                        Some(DiscoveryEvent::ChunkUploaded { .. }) => {}
                         Some(DiscoveryEvent::PeerLost(_)) => {}
                         None => {}
                     }
@@ -1992,6 +1993,7 @@ mod tests {
                         Some(DiscoveryEvent::GameMetadataReceived { .. }) => {}
                         Some(DiscoveryEvent::ChunkReceived { .. }) => {}
                         Some(DiscoveryEvent::ChunkRequestFailed { .. }) => {}
+                        Some(DiscoveryEvent::ChunkUploaded { .. }) => {}
                         Some(DiscoveryEvent::PeerLost(_)) => {}
                         None => {}
                     }
@@ -2495,6 +2497,9 @@ mod tests {
                         }
                         Some(DiscoveryEvent::ChunkRequestFailed { .. }) => {
                             // Ignoriere ChunkRequestFailed Events in diesem Test
+                        }
+                        Some(DiscoveryEvent::ChunkUploaded { .. }) => {
+                            // Ignoriere ChunkUploaded Events in diesem Test
                         }
                         None => break,
                     }
