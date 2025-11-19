@@ -1940,10 +1940,16 @@ impl DeckDropApp {
                                                 // Aktualisiere UI-Status (wird beim nächsten Tick gelesen)
                                                 // Das Manifest wird in update_download_progress() gelesen
                                                 
-                                                // Prüfe ob Dateien komplett sind und rekonstruiere sie (blockierende I/O)
-                                                if let Err(e) = deckdrop_core::check_and_reconstruct_files(&game_id, &manifest) {
-                                                    eprintln!("Fehler beim Rekonstruieren von Dateien: {}", e);
-                                                }
+                                                // Prüfe ob Dateien komplett sind und rekonstruiere sie im Hintergrund-Thread
+                                                let game_id_for_reconstruct = game_id.clone();
+                                                let manifest_for_reconstruct = manifest.clone();
+                                                std::thread::spawn(move || {
+                                                    if let Err(e) = deckdrop_core::check_and_reconstruct_files(&game_id_for_reconstruct, &manifest_for_reconstruct) {
+                                                        eprintln!("Fehler beim Rekonstruieren von Dateien: {}", e);
+                                                    } else {
+                                                        println!("Datei-Rekonstruktion abgeschlossen für Spiel: {}", game_id_for_reconstruct);
+                                                    }
+                                                });
                                                 
                                                 // Prüfe ob noch weitere Chunks fehlen und fordere sie an
                                                 // (nur eine begrenzte Anzahl, um Timeouts zu vermeiden)
@@ -2024,9 +2030,26 @@ impl DeckDropApp {
                                             } else {
                                                 eprintln!("Fehler beim Speichern des Manifests für Chunk {}", chunk_hash_clone);
                                             }
+                                            
+                                            // Entferne Chunk aus "angefordert" Set und Startzeit NUR wenn erfolgreich gespeichert
+                                            if let Ok(mut requested) = requested_chunks_for_thread.lock() {
+                                                requested.remove(&chunk_hash_clone);
+                                            }
+                                            if let Ok(mut start_times) = chunk_download_start_times_for_thread.lock() {
+                                                start_times.remove(&chunk_hash_clone);
+                                            }
+                                        } else {
+                                            eprintln!("Fehler beim Speichern des Chunks {}: {}", chunk_hash_clone, peer_id);
+                                            // Bei Fehler: Entferne trotzdem aus requested_chunks, damit Retry möglich ist
+                                            if let Ok(mut requested) = requested_chunks_for_thread.lock() {
+                                                requested.remove(&chunk_hash_clone);
+                                            }
+                                            if let Ok(mut start_times) = chunk_download_start_times_for_thread.lock() {
+                                                start_times.remove(&chunk_hash_clone);
+                                            }
                                         }
                                     } else {
-                                        eprintln!("Fehler beim Speichern des Chunks {}: {}", chunk_hash_clone, peer_id);
+                                        eprintln!("Fehler beim Ermitteln des Chunks-Verzeichnisses für {}", game_id);
                                     }
                                 }
                             } else {
@@ -2035,15 +2058,6 @@ impl DeckDropApp {
                         }
                     } else {
                         eprintln!("Konnte game_id für Chunk {} nicht finden", chunk_hash_clone);
-                    }
-                    
-                    // Entferne Chunk aus "angefordert" Set, da er jetzt empfangen wurde
-                    if let Ok(mut requested) = requested_chunks_for_thread.lock() {
-                        requested.remove(&chunk_hash_clone);
-                    }
-                    // Entferne Startzeit für diesen Chunk
-                    if let Ok(mut start_times) = chunk_download_start_times_for_thread.lock() {
-                        start_times.remove(&chunk_hash_clone);
                     }
                     
                     // Robustheit: Entferne Retry-Info bei erfolgreichem Download
@@ -3761,6 +3775,7 @@ impl DeckDropApp {
                                     let total_size_str = format_size(total_bytes_final);
                                     
                                     // Get currently downloading chunks (requested but not yet downloaded) with real progress
+                                    // Zeige nur Chunks, die wirklich noch fehlen (in missing_chunks)
                                     let downloading_chunks: Vec<(String, f64)> = {
                                         if let Ok(requested) = self.requested_chunks.lock() {
                                             if let Ok(start_times) = self.chunk_download_start_times.lock() {
@@ -3779,17 +3794,19 @@ impl DeckDropApp {
                                                     1_000_000.0 // Fallback: 1 MB/s
                                                 };
                                                 
+                                                // Nur Chunks anzeigen, die wirklich noch fehlen UND angefordert wurden
+                                                // Wenn ein Chunk nicht mehr in missing_chunks ist, ist er fertig und wird nicht mehr angezeigt
                                                 let mut chunks_with_progress: Vec<(String, f64)> = missing_chunks.iter()
                                                     .filter(|chunk| requested.contains(*chunk))
                                                     .map(|chunk| {
                                                         // Berechne Progress basierend auf verstrichener Zeit
-                                                        // Verwende eine realistischere Berechnung: Progress steigt langsam an
                                                         if let Some(start_time) = start_times.get(chunk) {
                                                             let elapsed_secs = now.duration_since(*start_time).as_secs_f64();
                                                             
                                                             // Realistische Progress-Berechnung:
                                                             // - Erste 2 Sekunden: 0-10% (Verbindungsaufbau)
-                                                            // - Danach: basierend auf tatsächlicher Geschwindigkeit, aber konservativ
+                                                            // - Danach: basierend auf tatsächlicher Geschwindigkeit
+                                                            // - Maximum: 99% (wird automatisch entfernt, wenn Chunk fertig ist)
                                                             let progress = if elapsed_secs < 2.0 {
                                                                 // Erste 2 Sekunden: linearer Anstieg von 0% auf 10%
                                                                 (elapsed_secs / 2.0 * 10.0).min(10.0)
@@ -3799,8 +3816,8 @@ impl DeckDropApp {
                                                                 let effective_speed = avg_speed * 0.7;
                                                                 let downloaded_bytes = (elapsed_secs - 2.0) * effective_speed;
                                                                 let base_progress = 10.0; // Start bei 10% nach 2 Sekunden
-                                                                let additional_progress = (downloaded_bytes / CHUNK_SIZE_BYTES as f64 * 85.0).min(85.0); // Maximal 95% insgesamt
-                                                                (base_progress + additional_progress).min(95.0).max(0.0)
+                                                                let additional_progress = (downloaded_bytes / CHUNK_SIZE_BYTES as f64 * 89.0).min(89.0); // Maximal 99% insgesamt
+                                                                (base_progress + additional_progress).min(99.0).max(0.0)
                                                             };
                                                             (chunk.clone(), progress)
                                                         } else {
