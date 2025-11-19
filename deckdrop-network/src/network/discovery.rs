@@ -651,13 +651,15 @@ pub async fn run_discovery(
                                 }
                             };
                             
-                            // Robustheit: Rate-Limiting - Max 5 gleichzeitige Requests pro Peer
+                            // Robustheit: Rate-Limiting - Max 10 gleichzeitige Requests pro Peer
+                            // Erhöht von 5 auf 10 für bessere Parallelisierung mit kleineren Chunks (10MB)
+                            let max_requests_per_peer = 10;
                             let active_count = {
                                 let mut active = active_requests_per_peer_clone.lock().await;
                                 *active.entry(peer_id.clone()).or_insert(0)
                             };
                             
-                            if active_count >= 5 {
+                            if active_count >= max_requests_per_peer {
                                 eprintln!("Rate-Limit erreicht für Peer {} ({} aktive Requests), überspringe Chunk-Request für {}", 
                                     peer_id, active_count, chunk_hash);
                                 continue; // Überspringe Request, wenn zu viele aktiv
@@ -1141,12 +1143,13 @@ pub async fn run_discovery(
                                                 };
                                                 
                                                 // Prüfe Rate-Limit pro Peer
+                                                let max_requests_per_peer = 10; // Erhöht von 5 auf 10
                                                 let active_count = {
                                                     let mut active = active_requests_per_peer_clone.lock().await;
                                                     *active.entry(peer_id.clone()).or_insert(0)
                                                 };
                                                 
-                                                if active_count >= 5 {
+                                                if active_count >= max_requests_per_peer {
                                                     // Zurück in die Warteschlange, wenn Peer-Limit erreicht
                                                     let mut queue = pending_chunk_queue_clone.lock().await;
                                                     queue.push_back((peer_id, chunk_hash, game_id));
@@ -1265,12 +1268,13 @@ pub async fn run_discovery(
                                         };
                                         
                                         // Prüfe Rate-Limit pro Peer
+                                        let max_requests_per_peer = 10; // Erhöht von 5 auf 10
                                         let active_count = {
                                             let mut active = active_requests_per_peer_clone.lock().await;
                                             *active.entry(peer_id.clone()).or_insert(0)
                                         };
                                         
-                                        if active_count >= 5 {
+                                        if active_count >= max_requests_per_peer {
                                             // Zurück in die Warteschlange, wenn Peer-Limit erreicht
                                             let mut queue = pending_chunk_queue_clone.lock().await;
                                             queue.push_back((peer_id, chunk_hash, game_id));

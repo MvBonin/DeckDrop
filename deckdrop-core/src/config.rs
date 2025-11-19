@@ -20,7 +20,7 @@ pub struct Config {
 }
 
 fn default_max_concurrent_chunks() -> usize {
-    5
+    15  // Erhöht von 5 auf 15 für bessere Parallelisierung mit 10MB Chunks
 }
 
 impl Default for Config {
@@ -30,7 +30,7 @@ impl Default for Config {
             download_path: PathBuf::from("~/Games"),
             peer_id: None,
             game_paths: Vec::new(),
-            max_concurrent_chunks: 5,
+            max_concurrent_chunks: 15,
         }
     }
 }

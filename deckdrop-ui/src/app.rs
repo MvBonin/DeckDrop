@@ -1941,9 +1941,10 @@ impl DeckDropApp {
                                         writing.insert(chunk_hash_clone.clone());
                                     }
                                     
-                                    // Speichere Chunk (blockierende I/O-Operation mit Transaktions-Sicherheit)
-                                    if let Ok(chunks_dir) = deckdrop_core::get_chunks_dir(&game_id) {
-                                        if deckdrop_core::save_chunk(&chunk_hash_clone, &chunk_data_clone, &chunks_dir).is_ok() {
+                                    // Schreibe Chunk direkt in die finale Datei (Piece-by-Piece Writing)
+                                    // Lade Manifest für write_chunk_to_file
+                                    if let Ok(manifest_for_write) = deckdrop_core::DownloadManifest::load(&manifest_path) {
+                                        if deckdrop_core::write_chunk_to_file(&chunk_hash_clone, &chunk_data_clone, &manifest_for_write).is_ok() {
                                             // Robustheit: Atomares Manifest-Update (verhindert Race Conditions)
                                             let chunk_hash_for_update = chunk_hash_clone.clone();
                                             if let Ok(manifest) = deckdrop_core::DownloadManifest::update_manifest_atomic(
@@ -1961,27 +1962,27 @@ impl DeckDropApp {
                                                     start_times.remove(&chunk_hash_clone);
                                                 }
                                                 
-                                                // Prüfe ob die BETROFFENE Datei komplett ist und rekonstruiere sie im Hintergrund-Thread
+                                                // Prüfe ob die BETROFFENE Datei komplett ist und validiere sie im Hintergrund-Thread
                                                 // Nur die Datei prüfen, zu der dieser Chunk gehört (effizient!)
                                                 if let Some(file_path) = deckdrop_core::find_file_for_chunk(&manifest, &chunk_hash_clone) {
-                                                    let game_id_for_reconstruct = game_id.clone();
-                                                    let manifest_for_reconstruct = manifest.clone();
-                                                    let file_path_for_reconstruct = file_path.clone();
+                                                    let game_id_for_validate = game_id.clone();
+                                                    let manifest_for_validate = manifest.clone();
+                                                    let file_path_for_validate = file_path.clone();
                                                     std::thread::spawn(move || {
                                                         // Prüfe nur diese EINE Datei (nicht alle Dateien!)
-                                                        match deckdrop_core::check_and_reconstruct_single_file(
-                                                            &game_id_for_reconstruct,
-                                                            &manifest_for_reconstruct,
-                                                            &file_path_for_reconstruct,
+                                                        match deckdrop_core::check_and_validate_single_file(
+                                                            &game_id_for_validate,
+                                                            &manifest_for_validate,
+                                                            &file_path_for_validate,
                                                         ) {
                                                             Ok(true) => {
-                                                                println!("Datei rekonstruiert: {}", file_path_for_reconstruct);
+                                                                println!("Datei validiert: {}", file_path_for_validate);
                                                             }
                                                             Ok(false) => {
                                                                 // Datei noch nicht komplett - normal, weiter warten
                                                             }
                                                             Err(e) => {
-                                                                eprintln!("Fehler beim Rekonstruieren von {}: {}", file_path_for_reconstruct, e);
+                                                                eprintln!("Fehler bei Validierung von {}: {}", file_path_for_validate, e);
                                                             }
                                                         }
                                                     });

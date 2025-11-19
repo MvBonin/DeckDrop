@@ -161,7 +161,7 @@ pub fn generate_chunks_toml<F>(game_path: &Path, progress_callback: Option<F>) -
 where
     F: Fn(usize, usize, &str),
 {
-    const CHUNK_SIZE: usize = 100 * 1024 * 1024; // 100MB
+    const CHUNK_SIZE: usize = 10 * 1024 * 1024; // 10MB (reduziert von 100MB)
     
     let chunks_toml_path = game_path.join("deckdrop_chunks.toml");
     let mut file_entries = Vec::new();
