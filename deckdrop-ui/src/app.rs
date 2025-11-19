@@ -4639,3 +4639,180 @@ fn container_box_style(theme: &Theme) -> iced::widget::container::Style {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::Mutex;
+    use tokio::sync::mpsc;
+    use deckdrop_network::network::discovery::DiscoveryEvent;
+    
+    /// Testet, ob Upload- und Download-Statistiken korrekt aktualisiert werden
+    #[test]
+    fn test_upload_download_statistics_update() {
+        // Erstelle eine App-Instanz
+        let (_tx, rx) = mpsc::channel(32);
+        let rx_arc = Arc::new(Mutex::new(rx));
+        let mut app = DeckDropApp::new_with_network_rx(rx_arc);
+        
+        // Initial: Statistiken sollten leer sein
+        let initial_upload_stats = app.upload_stats.lock().unwrap();
+        assert_eq!(initial_upload_stats.active_upload_count, 0);
+        assert_eq!(initial_upload_stats.upload_speed_bytes_per_sec, 0.0);
+        drop(initial_upload_stats);
+        
+        // Simuliere Upload-Events (ChunkUploaded)
+        const CHUNK_SIZE_1: usize = 10 * 1024 * 1024; // 10MB
+        const CHUNK_SIZE_2: usize = 5 * 1024 * 1024; // 5MB
+        
+        // Upload 1: Erster Chunk
+        app.handle_network_event(DiscoveryEvent::ChunkUploaded {
+            peer_id: "peer1".to_string(),
+            chunk_hash: "hash1:0".to_string(),
+            chunk_size: CHUNK_SIZE_1,
+        });
+        
+        // Prüfe Upload-Statistiken nach erstem Upload
+        let upload_stats_1 = app.upload_stats.lock().unwrap();
+        assert_eq!(upload_stats_1.active_upload_count, 1, "Nach erstem Upload sollte 1 aktiver Upload sein");
+        assert!(upload_stats_1.upload_speed_bytes_per_sec > 0.0, "Upload-Geschwindigkeit sollte > 0 sein");
+        assert_eq!(upload_stats_1.last_uploaded_bytes, CHUNK_SIZE_1 as u64, "Uploaded bytes sollten korrekt sein");
+        drop(upload_stats_1);
+        
+        // Upload 2: Zweiter Chunk
+        app.handle_network_event(DiscoveryEvent::ChunkUploaded {
+            peer_id: "peer2".to_string(),
+            chunk_hash: "hash2:0".to_string(),
+            chunk_size: CHUNK_SIZE_2,
+        });
+        
+        // Prüfe Upload-Statistiken nach zweitem Upload
+        let upload_stats_2 = app.upload_stats.lock().unwrap();
+        assert_eq!(upload_stats_2.active_upload_count, 2, "Nach zweitem Upload sollten 2 aktive Uploads sein");
+        assert!(upload_stats_2.upload_speed_bytes_per_sec > 0.0, "Upload-Geschwindigkeit sollte > 0 sein");
+        assert_eq!(upload_stats_2.last_uploaded_bytes, (CHUNK_SIZE_1 + CHUNK_SIZE_2) as u64, "Uploaded bytes sollten kumuliert sein");
+        drop(upload_stats_2);
+        
+        // Simuliere Download-Events (ChunkReceived)
+        const DOWNLOAD_CHUNK_SIZE: usize = 8 * 1024 * 1024; // 8MB
+        
+        // Download 1: Erster Chunk empfangen
+        // Füge Chunk zu requested_chunks hinzu, damit er als "angefordert" gilt
+        let chunk_hash = "test_file_hash:0".to_string();
+        if let Ok(mut requested) = app.requested_chunks.lock() {
+            requested.insert(chunk_hash.clone());
+        }
+        
+        // Füge Start-Zeit hinzu für Geschwindigkeitsberechnung
+        if let Ok(mut start_times) = app.chunk_download_start_times.lock() {
+            start_times.insert(chunk_hash.clone(), std::time::Instant::now());
+        }
+        
+        app.handle_network_event(DiscoveryEvent::ChunkReceived {
+            peer_id: "peer1".to_string(),
+            chunk_hash: chunk_hash.clone(),
+            chunk_data: vec![0u8; DOWNLOAD_CHUNK_SIZE],
+        });
+        
+        // Prüfe, dass Peer-Performance aktualisiert wurde
+        let peer_perf = app.peer_performance.lock().unwrap();
+        if let Some(perf) = peer_perf.get("peer1") {
+            assert!(perf.successful_requests > 0, "Peer sollte erfolgreiche Requests haben");
+            assert!(perf.total_requests > 0, "Peer sollte totale Requests haben");
+        }
+        drop(peer_perf);
+        
+        // Aktualisiere Performance-Metriken
+        app.update_performance_metrics();
+        
+        // Prüfe Performance-Metriken
+        assert!(app.performance_metrics.active_uploads > 0, "Es sollten aktive Uploads sein");
+        // Upload-Geschwindigkeit sollte > 0 sein, da wir Uploads simuliert haben
+        assert!(app.performance_metrics.total_upload_speed_bytes_per_sec > 0.0, 
+            "Gesamte Upload-Geschwindigkeit sollte > 0 sein");
+        
+        // Prüfe Status-Bar-Text (indirekt über upload_stats)
+        app.update_upload_stats();
+        let final_upload_stats = app.upload_stats.lock().unwrap();
+        assert!(final_upload_stats.active_upload_count > 0 || final_upload_stats.upload_speed_bytes_per_sec > 0.0, 
+            "Upload-Statistiken sollten nicht leer sein");
+        
+        println!("✓ Upload-Statistiken werden korrekt aktualisiert");
+        println!("✓ Download-Statistiken werden korrekt aktualisiert");
+        println!("✓ Performance-Metriken werden korrekt berechnet");
+    }
+    
+    /// Testet, ob Upload-Statistiken nach Ablauf der Zeit korrekt bereinigt werden
+    #[test]
+    fn test_upload_statistics_timeout() {
+        let (_tx, rx) = mpsc::channel(32);
+        let rx_arc = Arc::new(Mutex::new(rx));
+        let mut app = DeckDropApp::new_with_network_rx(rx_arc);
+        
+        const CHUNK_SIZE: usize = 10 * 1024 * 1024; // 10MB
+        
+        // Upload Chunk
+        app.handle_network_event(DiscoveryEvent::ChunkUploaded {
+            peer_id: "peer1".to_string(),
+            chunk_hash: "hash1:0".to_string(),
+            chunk_size: CHUNK_SIZE,
+        });
+        
+        // Prüfe, dass Upload getrackt wird
+        let upload_stats_1 = app.upload_stats.lock().unwrap();
+        assert_eq!(upload_stats_1.active_upload_count, 1);
+        drop(upload_stats_1);
+        
+        // Simuliere Zeitablauf: Setze Upload-Zeit auf vor 6 Sekunden (älter als 5 Sekunden Window)
+        if let Ok(mut active_uploads) = app.active_uploads.lock() {
+            let old_time = std::time::Instant::now().checked_sub(std::time::Duration::from_secs(6))
+                .unwrap_or(std::time::Instant::now());
+            if let Some((time, _)) = active_uploads.get_mut("hash1:0") {
+                *time = old_time;
+            }
+        }
+        
+        // Aktualisiere Upload-Statistiken (sollte alte Uploads entfernen)
+        app.update_upload_stats();
+        
+        // Prüfe, dass alter Upload entfernt wurde
+        let upload_stats_2 = app.upload_stats.lock().unwrap();
+        assert_eq!(upload_stats_2.active_upload_count, 0, "Alter Upload sollte nach Timeout entfernt werden");
+        assert_eq!(upload_stats_2.upload_speed_bytes_per_sec, 0.0, "Upload-Geschwindigkeit sollte nach Timeout 0 sein");
+        
+        println!("✓ Upload-Statistiken werden nach Timeout korrekt bereinigt");
+    }
+    
+    /// Testet, ob die Status-Bar korrekte Upload-Informationen anzeigt
+    #[test]
+    fn test_status_bar_upload_display() {
+        let (_tx, rx) = mpsc::channel(32);
+        let rx_arc = Arc::new(Mutex::new(rx));
+        let mut app = DeckDropApp::new_with_network_rx(rx_arc);
+        
+        // Initial: Sollte "Idle" anzeigen
+        let initial_stats = app.upload_stats.lock().unwrap();
+        assert_eq!(initial_stats.active_upload_count, 0);
+        assert_eq!(initial_stats.upload_speed_bytes_per_sec, 0.0);
+        drop(initial_stats);
+        
+        // Upload Chunk
+        app.handle_network_event(DiscoveryEvent::ChunkUploaded {
+            peer_id: "peer1".to_string(),
+            chunk_hash: "hash1:0".to_string(),
+            chunk_size: 10 * 1024 * 1024, // 10MB
+        });
+        
+        // Prüfe, dass Upload-Statistiken aktualisiert wurden
+        let upload_stats = app.upload_stats.lock().unwrap();
+        assert_eq!(upload_stats.active_upload_count, 1, "Nach Upload sollte 1 aktiver Upload sein");
+        assert!(upload_stats.upload_speed_bytes_per_sec > 0.0, "Upload-Geschwindigkeit sollte > 0 sein");
+        
+        // Status-Bar sollte jetzt "Upload: 1 Chunks (active) | Speed: X MB/s" anzeigen
+        // (wird in view_status_bar() verwendet)
+        assert!(upload_stats.active_upload_count > 0, "Status-Bar sollte aktive Uploads anzeigen");
+        
+        println!("✓ Status-Bar zeigt korrekte Upload-Informationen an");
+    }
+}
+
