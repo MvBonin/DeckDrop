@@ -81,6 +81,9 @@ pub struct DeckDropApp {
     // Chunk download progress tracking (start time per chunk for progress calculation)
     pub chunk_download_start_times: Arc<std::sync::Mutex<HashMap<String, std::time::Instant>>>, // chunk_hash -> start_time
     
+    // Chunks die gerade geschrieben werden (nicht mehr in requested_chunks, aber noch nicht im Manifest)
+    pub writing_chunks: Arc<std::sync::Mutex<HashSet<String>>>, // chunk_hash -> being written
+    
     // Upload tracking (chunks being uploaded to peers)
     #[allow(dead_code)]
     pub active_uploads: Arc<std::sync::Mutex<HashMap<String, (std::time::Instant, usize)>>>, // chunk_hash -> (start_time, chunk_size_bytes)
@@ -369,6 +372,7 @@ impl Default for DeckDropApp {
             processing_chunks: Arc::new(std::sync::Mutex::new(HashSet::new())),
             requested_chunks: Arc::new(std::sync::Mutex::new(HashSet::new())),
             chunk_download_start_times: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            writing_chunks: Arc::new(std::sync::Mutex::new(HashSet::new())),
             chunk_retries: Arc::new(std::sync::Mutex::new(HashMap::new())), // Robustheit: Retry-Tracking
             active_uploads: Arc::new(std::sync::Mutex::new(HashMap::new())),
             upload_stats: Arc::new(std::sync::Mutex::new(UploadStats {
@@ -626,6 +630,7 @@ impl DeckDropApp {
             processing_chunks: Arc::new(std::sync::Mutex::new(HashSet::new())),
             requested_chunks: Arc::new(std::sync::Mutex::new(HashSet::new())),
             chunk_download_start_times: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            writing_chunks: Arc::new(std::sync::Mutex::new(HashSet::new())),
             chunk_retries: Arc::new(std::sync::Mutex::new(HashMap::new())), // Robustheit: Retry-Tracking
             active_uploads: Arc::new(std::sync::Mutex::new(HashMap::new())),
             upload_stats: Arc::new(std::sync::Mutex::new(UploadStats {
@@ -1872,6 +1877,7 @@ impl DeckDropApp {
                 let chunk_data_clone = chunk_data.clone();
                 let requested_chunks_for_thread = self.requested_chunks.clone(); // Clone für Thread
                 let chunk_download_start_times_for_thread = self.chunk_download_start_times.clone(); // Clone für Thread
+                let writing_chunks_for_thread = self.writing_chunks.clone(); // Clone für Thread
                 let chunk_retries_for_thread = self.chunk_retries.clone(); // Clone für Thread
                 let max_concurrent_chunks = self.config.max_concurrent_chunks; // Clone für Thread
                 
@@ -1925,6 +1931,16 @@ impl DeckDropApp {
                                         return; // Überspringe ungültigen Chunk
                                     }
                                     
+                                    // Entferne Chunk SOFORT aus "angefordert" Set, damit er nicht mehr zu den aktiven Downloads zählt
+                                    // Der Chunk wird jetzt geschrieben, zählt aber nicht mehr zu den 5 aktiven Downloads
+                                    if let Ok(mut requested) = requested_chunks_for_thread.lock() {
+                                        requested.remove(&chunk_hash_clone);
+                                    }
+                                    // Füge Chunk zu "wird geschrieben" hinzu
+                                    if let Ok(mut writing) = writing_chunks_for_thread.lock() {
+                                        writing.insert(chunk_hash_clone.clone());
+                                    }
+                                    
                                     // Speichere Chunk (blockierende I/O-Operation mit Transaktions-Sicherheit)
                                     if let Ok(chunks_dir) = deckdrop_core::get_chunks_dir(&game_id) {
                                         if deckdrop_core::save_chunk(&chunk_hash_clone, &chunk_data_clone, &chunks_dir).is_ok() {
@@ -1937,19 +1953,39 @@ impl DeckDropApp {
                                                     Ok(())
                                                 }
                                             ) {
-                                                // Aktualisiere UI-Status (wird beim nächsten Tick gelesen)
-                                                // Das Manifest wird in update_download_progress() gelesen
+                                                // Entferne Chunk aus "wird geschrieben" und Startzeit, da er jetzt fertig ist
+                                                if let Ok(mut writing) = writing_chunks_for_thread.lock() {
+                                                    writing.remove(&chunk_hash_clone);
+                                                }
+                                                if let Ok(mut start_times) = chunk_download_start_times_for_thread.lock() {
+                                                    start_times.remove(&chunk_hash_clone);
+                                                }
                                                 
-                                                // Prüfe ob Dateien komplett sind und rekonstruiere sie im Hintergrund-Thread
-                                                let game_id_for_reconstruct = game_id.clone();
-                                                let manifest_for_reconstruct = manifest.clone();
-                                                std::thread::spawn(move || {
-                                                    if let Err(e) = deckdrop_core::check_and_reconstruct_files(&game_id_for_reconstruct, &manifest_for_reconstruct) {
-                                                        eprintln!("Fehler beim Rekonstruieren von Dateien: {}", e);
-                                                    } else {
-                                                        println!("Datei-Rekonstruktion abgeschlossen für Spiel: {}", game_id_for_reconstruct);
-                                                    }
-                                                });
+                                                // Prüfe ob die BETROFFENE Datei komplett ist und rekonstruiere sie im Hintergrund-Thread
+                                                // Nur die Datei prüfen, zu der dieser Chunk gehört (effizient!)
+                                                if let Some(file_path) = deckdrop_core::find_file_for_chunk(&manifest, &chunk_hash_clone) {
+                                                    let game_id_for_reconstruct = game_id.clone();
+                                                    let manifest_for_reconstruct = manifest.clone();
+                                                    let file_path_for_reconstruct = file_path.clone();
+                                                    std::thread::spawn(move || {
+                                                        // Prüfe nur diese EINE Datei (nicht alle Dateien!)
+                                                        match deckdrop_core::check_and_reconstruct_single_file(
+                                                            &game_id_for_reconstruct,
+                                                            &manifest_for_reconstruct,
+                                                            &file_path_for_reconstruct,
+                                                        ) {
+                                                            Ok(true) => {
+                                                                println!("Datei rekonstruiert: {}", file_path_for_reconstruct);
+                                                            }
+                                                            Ok(false) => {
+                                                                // Datei noch nicht komplett - normal, weiter warten
+                                                            }
+                                                            Err(e) => {
+                                                                eprintln!("Fehler beim Rekonstruieren von {}: {}", file_path_for_reconstruct, e);
+                                                            }
+                                                        }
+                                                    });
+                                                }
                                                 
                                                 // Prüfe ob noch weitere Chunks fehlen und fordere sie an
                                                 // (nur eine begrenzte Anzahl, um Timeouts zu vermeiden)
@@ -2029,20 +2065,19 @@ impl DeckDropApp {
                                                 }
                                             } else {
                                                 eprintln!("Fehler beim Speichern des Manifests für Chunk {}", chunk_hash_clone);
-                                            }
-                                            
-                                            // Entferne Chunk aus "angefordert" Set und Startzeit NUR wenn erfolgreich gespeichert
-                                            if let Ok(mut requested) = requested_chunks_for_thread.lock() {
-                                                requested.remove(&chunk_hash_clone);
-                                            }
-                                            if let Ok(mut start_times) = chunk_download_start_times_for_thread.lock() {
-                                                start_times.remove(&chunk_hash_clone);
+                                                // Bei Fehler: Entferne aus writing_chunks und start_times
+                                                if let Ok(mut writing) = writing_chunks_for_thread.lock() {
+                                                    writing.remove(&chunk_hash_clone);
+                                                }
+                                                if let Ok(mut start_times) = chunk_download_start_times_for_thread.lock() {
+                                                    start_times.remove(&chunk_hash_clone);
+                                                }
                                             }
                                         } else {
                                             eprintln!("Fehler beim Speichern des Chunks {}: {}", chunk_hash_clone, peer_id);
-                                            // Bei Fehler: Entferne trotzdem aus requested_chunks, damit Retry möglich ist
-                                            if let Ok(mut requested) = requested_chunks_for_thread.lock() {
-                                                requested.remove(&chunk_hash_clone);
+                                            // Bei Fehler: Entferne aus writing_chunks und start_times, damit Retry möglich ist
+                                            if let Ok(mut writing) = writing_chunks_for_thread.lock() {
+                                                writing.remove(&chunk_hash_clone);
                                             }
                                             if let Ok(mut start_times) = chunk_download_start_times_for_thread.lock() {
                                                 start_times.remove(&chunk_hash_clone);
@@ -3776,10 +3811,21 @@ impl DeckDropApp {
                                     
                                     // Get currently downloading chunks (requested but not yet downloaded) with real progress
                                     // Zeige nur Chunks, die wirklich noch fehlen (in missing_chunks)
+                                    // WICHTIG: Lade Manifest NEU, um sicherzustellen, dass fertige Chunks nicht mehr angezeigt werden
                                     let downloading_chunks: Vec<(String, f64)> = {
+                                        // Lade Manifest neu, um aktuelle missing_chunks zu bekommen
+                                        let current_missing_chunks = if let Ok(manifest_path) = deckdrop_core::get_manifest_path(&ds.manifest.game_id) {
+                                            if let Ok(current_manifest) = deckdrop_core::DownloadManifest::load(&manifest_path) {
+                                                current_manifest.get_missing_chunks()
+                                            } else {
+                                                ds.manifest.get_missing_chunks()
+                                            }
+                                        } else {
+                                            ds.manifest.get_missing_chunks()
+                                        };
+                                        
                                         if let Ok(requested) = self.requested_chunks.lock() {
                                             if let Ok(start_times) = self.chunk_download_start_times.lock() {
-                                                let missing_chunks = ds.manifest.get_missing_chunks();
                                                 let now = std::time::Instant::now();
                                                 const CHUNK_SIZE_BYTES: u64 = 100 * 1024 * 1024; // 100MB
                                                 
@@ -3796,28 +3842,26 @@ impl DeckDropApp {
                                                 
                                                 // Nur Chunks anzeigen, die wirklich noch fehlen UND angefordert wurden
                                                 // Wenn ein Chunk nicht mehr in missing_chunks ist, ist er fertig und wird nicht mehr angezeigt
-                                                let mut chunks_with_progress: Vec<(String, f64)> = missing_chunks.iter()
+                                                let mut chunks_with_progress: Vec<(String, f64)> = current_missing_chunks.iter()
                                                     .filter(|chunk| requested.contains(*chunk))
                                                     .map(|chunk| {
                                                         // Berechne Progress basierend auf verstrichener Zeit
                                                         if let Some(start_time) = start_times.get(chunk) {
                                                             let elapsed_secs = now.duration_since(*start_time).as_secs_f64();
                                                             
-                                                            // Realistische Progress-Berechnung:
-                                                            // - Erste 2 Sekunden: 0-10% (Verbindungsaufbau)
-                                                            // - Danach: basierend auf tatsächlicher Geschwindigkeit
-                                                            // - Maximum: 99% (wird automatisch entfernt, wenn Chunk fertig ist)
-                                                            let progress = if elapsed_secs < 2.0 {
-                                                                // Erste 2 Sekunden: linearer Anstieg von 0% auf 10%
-                                                                (elapsed_secs / 2.0 * 10.0).min(10.0)
+                                                            // Realistische Progress-Berechnung basierend auf tatsächlicher Download-Geschwindigkeit
+                                                            // Progress steigt kontinuierlich basierend auf verstrichener Zeit und Geschwindigkeit
+                                                            let progress = if elapsed_secs < 1.0 {
+                                                                // Erste Sekunde: 0-5% (Verbindungsaufbau)
+                                                                (elapsed_secs * 5.0).min(5.0)
                                                             } else {
                                                                 // Danach: basierend auf tatsächlicher Download-Geschwindigkeit
-                                                                // Verwende konservative Schätzung: nur 70% der theoretischen Geschwindigkeit
-                                                                let effective_speed = avg_speed * 0.7;
-                                                                let downloaded_bytes = (elapsed_secs - 2.0) * effective_speed;
-                                                                let base_progress = 10.0; // Start bei 10% nach 2 Sekunden
-                                                                let additional_progress = (downloaded_bytes / CHUNK_SIZE_BYTES as f64 * 89.0).min(89.0); // Maximal 99% insgesamt
-                                                                (base_progress + additional_progress).min(99.0).max(0.0)
+                                                                // Verwende realistische Schätzung: 80% der gemessenen Geschwindigkeit
+                                                                let effective_speed = avg_speed * 0.8;
+                                                                let downloaded_bytes = (elapsed_secs - 1.0) * effective_speed;
+                                                                let base_progress = 5.0; // Start bei 5% nach 1 Sekunde
+                                                                let additional_progress = (downloaded_bytes / CHUNK_SIZE_BYTES as f64 * 95.0).min(95.0); // Maximal 100% insgesamt
+                                                                (base_progress + additional_progress).min(100.0).max(0.0)
                                                             };
                                                             (chunk.clone(), progress)
                                                         } else {
@@ -3833,6 +3877,29 @@ impl DeckDropApp {
                                             } else {
                                                 Vec::new()
                                             }
+                                        } else {
+                                            Vec::new()
+                                        }
+                                    };
+                                    
+                                    // Get chunks that are being written (downloaded but not yet in manifest)
+                                    let writing_chunks_list: Vec<String> = {
+                                        if let Ok(writing) = self.writing_chunks.lock() {
+                                            // Lade Manifest neu, um sicherzustellen, dass fertige Chunks nicht mehr angezeigt werden
+                                            let current_missing_chunks = if let Ok(manifest_path) = deckdrop_core::get_manifest_path(&ds.manifest.game_id) {
+                                                if let Ok(current_manifest) = deckdrop_core::DownloadManifest::load(&manifest_path) {
+                                                    current_manifest.get_missing_chunks()
+                                                } else {
+                                                    ds.manifest.get_missing_chunks()
+                                                }
+                                            } else {
+                                                ds.manifest.get_missing_chunks()
+                                            };
+                                            // Nur Chunks anzeigen, die wirklich noch fehlen (in missing_chunks)
+                                            writing.iter()
+                                                .filter(|chunk| current_missing_chunks.contains(*chunk))
+                                                .cloned()
+                                                .collect()
                                         } else {
                                             Vec::new()
                                         }
@@ -3896,6 +3963,106 @@ impl DeckDropApp {
                                                                 .spacing(scale(8.0)),
                                                                 Space::with_height(Length::Fixed(scale(4.0))),
                                                                 progress_bar(0.0..=100.0, *progress as f32)
+                                                                    .width(Length::Fill)
+                                                                    .height(Length::Fixed(scale(12.0))),
+                                                            ]
+                                                            .spacing(scale(2.0))
+                                                            .width(Length::Fill)
+                                                        );
+                                                    }
+                                                    chunk_column
+                                                },
+                                            ]
+                                            .width(Length::Fill)
+                                        } else {
+                                            column![]
+                                        },
+                                        // Chunks die gerade geschrieben werden
+                                        if !writing_chunks_list.is_empty() {
+                                            column![
+                                                Space::with_height(Length::Fixed(scale(16.0))),
+                                                text("Wird geschrieben").size(scale_text(13.0))
+                                                    .style(|_theme: &Theme| {
+                                                        iced::widget::text::Style {
+                                                            color: Some(Color::from_rgba(0.6, 0.6, 0.6, 1.0)),
+                                                        }
+                                                    }),
+                                                Space::with_height(Length::Fixed(scale(8.0))),
+                                                // Zeige Chunks mit Status "Wird geschrieben" und 100% Progress
+                                                {
+                                                    let mut chunk_column = column![].spacing(scale(8.0)).width(Length::Fill);
+                                                    for chunk_hash in &writing_chunks_list {
+                                                        let chunk_short: String = if chunk_hash.len() > 16 {
+                                                            format!("{}...", &chunk_hash[..16])
+                                                        } else {
+                                                            chunk_hash.clone()
+                                                        };
+                                                        chunk_column = chunk_column.push(
+                                                            column![
+                                                                row![
+                                                                    text(chunk_short).size(scale_text(11.0))
+                                                                        .width(Length::Fill),
+                                                                    text("Wird geschrieben...").size(scale_text(11.0))
+                                                                        .style(|_theme: &Theme| {
+                                                                            iced::widget::text::Style {
+                                                                                color: Some(Color::from_rgba(1.0, 0.8, 0.0, 1.0)),
+                                                                            }
+                                                                        }),
+                                                                ]
+                                                                .width(Length::Fill)
+                                                                .spacing(scale(8.0)),
+                                                                Space::with_height(Length::Fixed(scale(4.0))),
+                                                                progress_bar(0.0..=100.0, 100.0)
+                                                                    .width(Length::Fill)
+                                                                    .height(Length::Fixed(scale(12.0))),
+                                                            ]
+                                                            .spacing(scale(2.0))
+                                                            .width(Length::Fill)
+                                                        );
+                                                    }
+                                                    chunk_column
+                                                },
+                                            ]
+                                            .width(Length::Fill)
+                                        } else {
+                                            column![]
+                                        },
+                                        // Chunks die gerade geschrieben werden
+                                        if !writing_chunks_list.is_empty() {
+                                            column![
+                                                Space::with_height(Length::Fixed(scale(16.0))),
+                                                text("Wird geschrieben").size(scale_text(13.0))
+                                                    .style(|_theme: &Theme| {
+                                                        iced::widget::text::Style {
+                                                            color: Some(Color::from_rgba(0.6, 0.6, 0.6, 1.0)),
+                                                        }
+                                                    }),
+                                                Space::with_height(Length::Fixed(scale(8.0))),
+                                                // Zeige Chunks mit Status "Wird geschrieben" und 100% Progress
+                                                {
+                                                    let mut chunk_column = column![].spacing(scale(8.0)).width(Length::Fill);
+                                                    for chunk_hash in &writing_chunks_list {
+                                                        let chunk_short: String = if chunk_hash.len() > 16 {
+                                                            format!("{}...", &chunk_hash[..16])
+                                                        } else {
+                                                            chunk_hash.clone()
+                                                        };
+                                                        chunk_column = chunk_column.push(
+                                                            column![
+                                                                row![
+                                                                    text(chunk_short).size(scale_text(11.0))
+                                                                        .width(Length::Fill),
+                                                                    text("Wird geschrieben...").size(scale_text(11.0))
+                                                                        .style(|_theme: &Theme| {
+                                                                            iced::widget::text::Style {
+                                                                                color: Some(Color::from_rgba(1.0, 0.8, 0.0, 1.0)),
+                                                                            }
+                                                                        }),
+                                                                ]
+                                                                .width(Length::Fill)
+                                                                .spacing(scale(8.0)),
+                                                                Space::with_height(Length::Fixed(scale(4.0))),
+                                                                progress_bar(0.0..=100.0, 100.0)
                                                                     .width(Length::Fill)
                                                                     .height(Length::Fixed(scale(12.0))),
                                                             ]
