@@ -50,6 +50,11 @@ pub enum DiscoveryEvent {
         chunk_hash: String,
         error: String,
     },
+    ChunkRequestSent {
+        peer_id: String,
+        chunk_hash: String,
+        game_id: String,
+    },
     ChunkUploaded {
         peer_id: String,
         chunk_hash: String,
@@ -732,6 +737,15 @@ pub async fn run_discovery(
                                 peer_id, chunk_hash, request_id, global_active_count + 1);
                             eprintln!("Chunk Request gesendet an {} für hash: {} (RequestId: {:?}, globale aktive Downloads: {})", 
                                 peer_id, chunk_hash, request_id, global_active_count + 1);
+                            
+                            // Sende Event, dass Chunk-Request erfolgreich gesendet wurde
+                            if let Err(e) = event_tx.send(DiscoveryEvent::ChunkRequestSent {
+                                peer_id: peer_id.clone(),
+                                chunk_hash: chunk_hash.clone(),
+                                game_id: game_id.clone(),
+                            }).await {
+                                eprintln!("Fehler beim Senden von ChunkRequestSent Event: {}", e);
+                            }
                         }
                     }
                 }
@@ -1222,6 +1236,15 @@ pub async fn run_discovery(
                                                     peer_id, chunk_hash, request_id);
                                                 eprintln!("Chunk Request aus Warteschlange gesendet an {} für hash: {} (RequestId: {:?})", 
                                                     peer_id, chunk_hash, request_id);
+                                                
+                                                // Sende Event, dass Chunk-Request erfolgreich gesendet wurde
+                                                if let Err(e) = event_tx.send(DiscoveryEvent::ChunkRequestSent {
+                                                    peer_id: peer_id.clone(),
+                                                    chunk_hash: chunk_hash.clone(),
+                                                    game_id: game_id.clone(),
+                                                }).await {
+                                                    eprintln!("Fehler beim Senden von ChunkRequestSent Event: {}", e);
+                                                }
                                             } else {
                                                 // Keine wartenden Requests mehr
                                                 break;
@@ -2010,6 +2033,7 @@ mod tests {
                         Some(DiscoveryEvent::GameMetadataReceived { .. }) => {}
                         Some(DiscoveryEvent::ChunkReceived { .. }) => {}
                         Some(DiscoveryEvent::ChunkRequestFailed { .. }) => {}
+                        Some(DiscoveryEvent::ChunkRequestSent { .. }) => {}
                         Some(DiscoveryEvent::ChunkUploaded { .. }) => {}
                         Some(DiscoveryEvent::PeerLost(_)) => {}
                         None => {}
@@ -2033,6 +2057,7 @@ mod tests {
                         Some(DiscoveryEvent::GameMetadataReceived { .. }) => {}
                         Some(DiscoveryEvent::ChunkReceived { .. }) => {}
                         Some(DiscoveryEvent::ChunkRequestFailed { .. }) => {}
+                        Some(DiscoveryEvent::ChunkRequestSent { .. }) => {}
                         Some(DiscoveryEvent::ChunkUploaded { .. }) => {}
                         Some(DiscoveryEvent::PeerLost(_)) => {}
                         None => {}
@@ -2537,6 +2562,9 @@ mod tests {
                         }
                         Some(DiscoveryEvent::ChunkRequestFailed { .. }) => {
                             // Ignoriere ChunkRequestFailed Events in diesem Test
+                        }
+                        Some(DiscoveryEvent::ChunkRequestSent { .. }) => {
+                            // Ignoriere ChunkRequestSent Events in diesem Test
                         }
                         Some(DiscoveryEvent::ChunkUploaded { .. }) => {
                             // Ignoriere ChunkUploaded Events in diesem Test

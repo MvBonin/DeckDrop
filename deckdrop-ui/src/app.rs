@@ -1095,7 +1095,9 @@ impl DeckDropApp {
                         
                         if !peer_ids.is_empty() {
                             if let Some(_tx) = crate::network_bridge::get_download_request_tx() {
-                                if let Err(e) = self.request_missing_chunks_adaptive(&game_id, &peer_ids, 10) {
+                                // WICHTIG: Verwende max_concurrent_chunks statt festem Wert 10
+                                let max_chunks_per_peer = self.config.max_concurrent_chunks.max(10);
+                                if let Err(e) = self.request_missing_chunks_adaptive(&game_id, &peer_ids, max_chunks_per_peer) {
                                     eprintln!("Error requesting missing chunks when resuming download for {}: {}", game_id, e);
                                 }
                             }
@@ -1969,12 +1971,16 @@ impl DeckDropApp {
                                     peer_ids
                                 };
                                 
-                                if let Err(e) = self.request_missing_chunks_adaptive(&game_id, &peer_ids, 10) {
+                                // WICHTIG: Verwende max_concurrent_chunks statt festem Wert 10
+                                // Dies stellt sicher, dass beim Start alle verfügbaren Slots gefüllt werden
+                                let max_chunks_per_peer = self.config.max_concurrent_chunks.max(10);
+                                if let Err(e) = self.request_missing_chunks_adaptive(&game_id, &peer_ids, max_chunks_per_peer) {
                                     eprintln!("Error requesting missing chunks for {}: {}", game_id, e);
                                 }
                             } else {
                                 // Fallback: Use the peer that sent the metadata
-                                if let Err(e) = self.request_missing_chunks_adaptive(&game_id, &[peer_id.clone()], 10) {
+                                let max_chunks_per_peer = self.config.max_concurrent_chunks.max(10);
+                                if let Err(e) = self.request_missing_chunks_adaptive(&game_id, &[peer_id.clone()], max_chunks_per_peer) {
                                     eprintln!("Error requesting missing chunks for {}: {}", game_id, e);
                                 }
                             }
@@ -2238,15 +2244,19 @@ impl DeckDropApp {
                                                                                         }
                                                                                     };
                                                                                     
-                                                                                    // Markiere neue Chunks als angefordert und tracke Startzeit
+                                                                                    // WICHTIG: Trage Chunks direkt nach dem Senden in requested_chunks ein
+                                                                                    // Wenn der Request fehlschlägt, wird er in ChunkRequestFailed entfernt
+                                                                                    // Dies ist robuster als auf ChunkRequestSent Events zu warten
+                                                                                    
                                                                                     if !new_chunks.is_empty() {
                                                                                         let start_time = std::time::Instant::now();
+                                                                                        // Trage Chunks direkt in requested_chunks ein, BEVOR sie gesendet werden
+                                                                                        // Wenn der Request fehlschlägt, wird er in ChunkRequestFailed entfernt
                                                                                         if let Ok(mut requested) = requested_chunks_for_thread.lock() {
                                                                                             for chunk in &new_chunks {
                                                                                                 requested.insert(chunk.clone());
                                                                                             }
                                                                                         }
-                                                                                        // Tracke Startzeit für Progress-Berechnung
                                                                                         if let Ok(mut start_times) = chunk_download_start_times_for_thread.lock() {
                                                                                             for chunk in &new_chunks {
                                                                                                 start_times.insert(chunk.clone(), start_time);
@@ -2271,7 +2281,7 @@ impl DeckDropApp {
                                                                                                 }
                                                                                             ) {
                                                                                                 eprintln!("Fehler beim Senden von Chunk-Request für {}: {}", chunk_hash, e);
-                                                                                                // Entferne Chunk aus requested_chunks bei Fehler
+                                                                                                // Bei Sendefehler entferne Chunk aus requested_chunks
                                                                                                 if let Ok(mut requested) = requested_chunks_for_thread.lock() {
                                                                                                     requested.remove(chunk_hash);
                                                                                                 }
@@ -2379,6 +2389,13 @@ impl DeckDropApp {
                                                                             }
                                                                         ) {
                                                                             eprintln!("Fehler beim Senden von Chunk-Request für {}: {}", chunk_hash, e);
+                                                                            // Entferne Chunk aus requested_chunks bei Fehler
+                                                                            if let Ok(mut requested) = requested_chunks_for_thread.lock() {
+                                                                                requested.remove(chunk_hash);
+                                                                            }
+                                                                            if let Ok(mut start_times) = chunk_download_start_times_for_thread.lock() {
+                                                                                start_times.remove(chunk_hash);
+                                                                            }
                                                                         }
                                                                     }
                                                                 }
@@ -2407,6 +2424,20 @@ impl DeckDropApp {
                         retries.remove(&chunk_hash_clone);
                     }
                 });
+            }
+            DiscoveryEvent::ChunkRequestSent { peer_id, chunk_hash, game_id: _ } => {
+                // WICHTIG: Trage Chunk in requested_chunks ein, NACHDEM er erfolgreich gesendet wurde
+                // Dies verhindert, dass Chunks in requested_chunks eingetragen werden, die nie gesendet wurden
+                let start_time = std::time::Instant::now();
+                if let Ok(mut requested) = self.requested_chunks.lock() {
+                    if !requested.contains(&chunk_hash) {
+                        requested.insert(chunk_hash.clone());
+                        eprintln!("Chunk {} in requested_chunks eingetragen (Request erfolgreich gesendet an {})", chunk_hash, peer_id);
+                    }
+                }
+                if let Ok(mut start_times) = self.chunk_download_start_times.lock() {
+                    start_times.insert(chunk_hash.clone(), start_time);
+                }
             }
             DiscoveryEvent::ChunkRequestFailed { peer_id, chunk_hash, error } => {
                 eprintln!("ChunkRequestFailed: {} from {}: {}", chunk_hash, peer_id, error);
@@ -2658,6 +2689,10 @@ impl DeckDropApp {
             
             // Verwende das Maximum der adaptiven Limits, um schnelle Peers nicht zu limitieren
             let max_limit = peer_adaptive_limits.values().max().copied().unwrap_or(base_max_chunks_per_peer);
+            
+            // WICHTIG: Chunks werden NICHT mehr vorher in requested_chunks eingetragen
+            // Stattdessen werden sie eingetragen, wenn sie tatsächlich gesendet wurden (ChunkRequestSent Event)
+            // Dies verhindert, dass Chunks in requested_chunks eingetragen werden, die nie gesendet wurden
             
             // Verwende max_limit, damit schnelle Peers ihr volles Potential nutzen können
             deckdrop_core::request_missing_chunks(game_id, &available_peers, &tx, max_limit)
@@ -3000,7 +3035,9 @@ impl DeckDropApp {
                 
                 // Request missing chunks to resume/continue download
                 if crate::network_bridge::get_download_request_tx().is_some() {
-                    if let Err(e) = self.request_missing_chunks_adaptive(&game_id, &peer_ids, 10) {
+                    // WICHTIG: Verwende max_concurrent_chunks statt festem Wert 10
+                    let max_chunks_per_peer = self.config.max_concurrent_chunks.max(10);
+                    if let Err(e) = self.request_missing_chunks_adaptive(&game_id, &peer_ids, max_chunks_per_peer) {
                         eprintln!("Error resuming download for {}: {}", game_id, e);
                     } else {
                         // Update status to Downloading (falls es noch Pending war)
@@ -3078,15 +3115,15 @@ impl DeckDropApp {
                     
                     // Wenn neue Chunks gefunden wurden, fordere sie an
                     if !new_chunks.is_empty() {
-                        
-                        // Markiere neue Chunks als angefordert
                         let start_time = std::time::Instant::now();
+                        // WICHTIG: Trage Chunks direkt nach dem Senden in requested_chunks ein
+                        // Wenn der Request fehlschlägt, wird er in ChunkRequestFailed entfernt
+                        // Dies ist robuster als auf ChunkRequestSent Events zu warten
                         if let Ok(mut requested) = self.requested_chunks.lock() {
                             for chunk in &new_chunks {
                                 requested.insert(chunk.clone());
                             }
                         }
-                        // Tracke Startzeit für Progress-Berechnung
                         if let Ok(mut start_times) = self.chunk_download_start_times.lock() {
                             for chunk in &new_chunks {
                                 start_times.insert(chunk.clone(), start_time);
@@ -3111,7 +3148,7 @@ impl DeckDropApp {
                                     }
                                 ) {
                                     eprintln!("Fehler beim Senden von Chunk-Request für {}: {}", chunk_hash, e);
-                                    // Entferne Chunk aus requested_chunks bei Fehler
+                                    // Bei Sendefehler entferne Chunk aus requested_chunks
                                     if let Ok(mut requested) = self.requested_chunks.lock() {
                                         requested.remove(chunk_hash);
                                     }

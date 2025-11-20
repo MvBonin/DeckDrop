@@ -375,10 +375,25 @@ impl ManifestDB {
             )?;
             
             if downloaded_count == total_count {
+                // Alle Chunks sind heruntergeladen - hole file_path für spätere Validierung
+                // (Validierung wird nach dem Commit durchgeführt, um Fehler zu vermeiden)
+                let file_path: Option<String> = tx.query_row(
+                    "SELECT file_path FROM files WHERE id = ?1",
+                    params![file_id],
+                    |row| row.get(0)
+                ).ok();
+                
+                // Setze Status zunächst auf Complete (wird später validiert)
                 tx.execute(
                     "UPDATE files SET status = 'Complete' WHERE id = ?1",
                     params![file_id],
                 )?;
+                
+                // Speichere file_path für spätere Validierung (außerhalb der Transaktion)
+                // TODO: Validierung nach dem Commit durchführen
+                if let Some(_file_path) = file_path {
+                    // Validierung wird später in update_download_progress durchgeführt
+                }
             } else {
                 tx.execute(
                     "UPDATE files SET status = 'Downloading' WHERE id = ?1",
@@ -431,6 +446,44 @@ impl ManifestDB {
         }
         
         tx.commit()?;
+        
+        // Validiere Dateien, die gerade als Complete markiert wurden (außerhalb der Transaktion)
+        // Hole alle Dateien, die als Complete markiert wurden
+        let conn = self.conn.lock().unwrap();
+        let files_to_validate: Vec<(i64, String, String)> = conn.prepare(
+            "SELECT f.id, f.file_path, d.game_path FROM files f 
+             JOIN downloads d ON f.game_id = d.game_id 
+             WHERE f.game_id = ?1 AND f.status = 'Complete'"
+        )?
+        .query_map(params![game_id], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+        
+        drop(conn);
+        
+        // Validiere jede Datei
+        for (file_id, file_path, _game_path) in files_to_validate {
+            if let Ok(manifest_path) = crate::synch::get_manifest_path(game_id) {
+                if let Ok(manifest) = crate::synch::DownloadManifest::load(&manifest_path) {
+                    if let Err(e) = crate::synch::check_and_validate_single_file(game_id, &manifest, &file_path) {
+                        eprintln!("⚠️ Validierung fehlgeschlagen für {}: {} - Status wird auf Downloading zurückgesetzt", file_path, e);
+                        // Setze Status zurück auf Downloading
+                        let conn = self.conn.lock().unwrap();
+                        conn.execute(
+                            "UPDATE files SET status = 'Downloading' WHERE id = ?1",
+                            params![file_id],
+                        )?;
+                        // Setze auch overall_status zurück
+                        conn.execute(
+                            "UPDATE downloads SET overall_status = 'Downloading' WHERE game_id = ?1",
+                            params![game_id],
+                        )?;
+                    }
+                }
+            }
+        }
+        
         Ok(())
     }
     

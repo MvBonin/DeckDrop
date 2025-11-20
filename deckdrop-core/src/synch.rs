@@ -343,9 +343,32 @@ impl DownloadManifest {
         }
         
         // Prüfe ob alle Chunks einer Datei vorhanden sind
-        for file_info in self.chunks.values_mut() {
+        // Sammle Dateien, die validiert werden müssen (außerhalb der mutable borrow)
+        let files_to_validate: Vec<String> = self.chunks.iter()
+            .filter(|(_, file_info)| file_info.downloaded_chunks.len() == file_info.chunk_hashes.len())
+            .map(|(file_path, _)| file_path.clone())
+            .collect();
+        
+        // Validiere Dateien (außerhalb der mutable borrow)
+        let validation_results: std::collections::HashMap<String, bool> = files_to_validate.iter()
+            .map(|file_path| {
+                let is_valid = self.validate_file_if_complete(file_path).is_ok();
+                if !is_valid {
+                    eprintln!("⚠️ Validierung fehlgeschlagen für {} - Status bleibt Downloading", file_path);
+                }
+                (file_path.clone(), is_valid)
+            })
+            .collect();
+        
+        // Setze Status entsprechend der Validierung
+        for (file_path, file_info) in self.chunks.iter_mut() {
             if file_info.downloaded_chunks.len() == file_info.chunk_hashes.len() {
-                file_info.status = DownloadStatus::Complete;
+                // Alle Chunks sind heruntergeladen - prüfe Validierung
+                if validation_results.get(file_path).copied().unwrap_or(false) {
+                    file_info.status = DownloadStatus::Complete;
+                } else {
+                    file_info.status = DownloadStatus::Downloading;
+                }
             } else {
                 file_info.status = DownloadStatus::Downloading;
             }
@@ -360,6 +383,39 @@ impl DownloadManifest {
         } else {
             self.overall_status = DownloadStatus::Downloading;
         }
+    }
+    
+    /// Validiert eine Datei, wenn alle Chunks heruntergeladen sind
+    fn validate_file_if_complete(&self, file_path: &str) -> Result<(), Box<dyn std::error::Error>> {
+        // Lade deckdrop_chunks.toml um file_hash zu erhalten
+        let manifest_path = get_manifest_path(&self.game_id)?;
+        let chunks_toml_path = manifest_path.parent()
+            .ok_or("Konnte Manifest-Verzeichnis nicht finden")?
+            .join("deckdrop_chunks.toml");
+        
+        let chunks_toml_content = fs::read_to_string(&chunks_toml_path)?;
+        #[derive(Deserialize)]
+        struct ChunksToml {
+            file: Vec<ChunkFileEntry>,
+        }
+        let chunks_toml: ChunksToml = toml::from_str(&chunks_toml_content)?;
+        
+        // Finde file_hash und file_size für diese Datei
+        let entry = chunks_toml.file.iter()
+            .find(|e| e.path == file_path)
+            .ok_or_else(|| format!("Datei {} nicht in deckdrop_chunks.toml gefunden", file_path))?;
+        let file_hash = entry.file_hash.clone();
+        let file_size = entry.file_size as u64;
+        
+        // Validiere Datei (Hash und Größe)
+        let output_path = PathBuf::from(&self.game_path).join(file_path);
+        
+        if !output_path.exists() {
+            return Err(format!("Datei {} sollte existieren, ist aber nicht vorhanden", file_path).into());
+        }
+        
+        validate_complete_file(&output_path, &file_hash, file_size)?;
+        Ok(())
     }
 }
 
@@ -755,6 +811,18 @@ pub fn request_missing_chunks(
     eprintln!("Fordere {} fehlende Chunks für Spiel {} an (max {} pro Peer)", 
         missing_chunks.len(), game_id, max_chunks_per_peer);
     
+    // WICHTIG: Begrenze die Anzahl der anzufordernden Chunks auf max_chunks_per_peer * peer_count
+    // Dies verhindert, dass zu viele Chunks auf einmal angefordert werden
+    // Die kontinuierliche Prüfung in app.rs wird weitere Chunks anfordern, wenn Slots frei werden
+    let total_max_chunks = max_chunks_per_peer * peer_ids.len().max(1);
+    let chunks_to_request: Vec<String> = missing_chunks.iter()
+        .take(total_max_chunks)
+        .cloned()
+        .collect();
+    
+    eprintln!("Fordere {} von {} fehlenden Chunks an (Limit: {} = {} pro Peer × {} Peers)", 
+        chunks_to_request.len(), missing_chunks.len(), total_max_chunks, max_chunks_per_peer, peer_ids.len());
+    
     // Optimierte Multi-Peer Parallelisierung mit Round-Robin und Load-Balancing
     let mut peer_chunk_counts: HashMap<String, usize> = HashMap::new();
     let mut peer_index = 0; // Round-Robin Index
@@ -764,7 +832,7 @@ pub fn request_missing_chunks(
         peer_chunk_counts.insert(peer_id.clone(), 0);
     }
     
-    for chunk_hash in missing_chunks.iter() {
+    for chunk_hash in chunks_to_request.iter() {
         // Round-Robin Start: Beginne mit dem nächsten Peer im Round-Robin
         let start_index = peer_index;
         let mut selected_peer = None;
