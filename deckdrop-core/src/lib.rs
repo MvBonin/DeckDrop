@@ -11,6 +11,7 @@ pub mod game;
 pub mod gamechecker;
 pub mod network_cache;
 pub mod synch;
+pub mod manifest_db;
 
 // Re-export wichtige Typen für einfacheren Zugriff
 pub use config::Config;
@@ -24,5 +25,6 @@ pub use synch::{
     check_and_validate_complete_files, check_and_validate_single_file, find_file_for_chunk, load_active_downloads,
     validate_chunk_size,
     preallocate_file, write_chunk_to_position, write_chunk_to_file, validate_complete_file,
+    mark_chunk_downloaded_sqlite,
 };
 

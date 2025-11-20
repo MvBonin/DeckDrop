@@ -2013,11 +2013,6 @@ impl DeckDropApp {
                                         return; // Überspringe ungültigen Chunk
                                     }
                                     
-                                    // Entferne Chunk SOFORT aus "angefordert" Set, damit er nicht mehr zu den aktiven Downloads zählt
-                                    // Der Chunk wird jetzt geschrieben, zählt aber nicht mehr zu den 5 aktiven Downloads
-                                    if let Ok(mut requested) = requested_chunks_for_thread.lock() {
-                                        requested.remove(&chunk_hash_clone);
-                                    }
                                     // Füge Chunk zu "wird geschrieben" hinzu
                                     if let Ok(mut writing) = writing_chunks_for_thread.lock() {
                                         writing.insert(chunk_hash_clone.clone());
@@ -2026,117 +2021,133 @@ impl DeckDropApp {
                                     // Schreibe Chunk direkt in die finale Datei (Piece-by-Piece Writing)
                                     // Lade Manifest für write_chunk_to_file
                                     if let Ok(manifest_for_write) = deckdrop_core::DownloadManifest::load(&manifest_path) {
-                                        if deckdrop_core::write_chunk_to_file(&chunk_hash_clone, &chunk_data_clone, &manifest_for_write).is_ok() {
-                                            // Robustheit: Atomares Manifest-Update (verhindert Race Conditions)
-                                            let chunk_hash_for_update = chunk_hash_clone.clone();
-                                            if let Ok(manifest) = deckdrop_core::DownloadManifest::update_manifest_atomic(
-                                                &manifest_path,
-                                                |manifest| {
-                                                    manifest.mark_chunk_downloaded(&chunk_hash_for_update);
-                                                    Ok(())
-                                                }
-                                            ) {
-                                                // Entferne Chunk aus "wird geschrieben" und Startzeit, da er jetzt fertig ist
-                                                if let Ok(mut writing) = writing_chunks_for_thread.lock() {
-                                                    writing.remove(&chunk_hash_clone);
-                                                }
-                                                if let Ok(mut start_times) = chunk_download_start_times_for_thread.lock() {
-                                                    start_times.remove(&chunk_hash_clone);
-                                                }
+                                        match deckdrop_core::write_chunk_to_file(&chunk_hash_clone, &chunk_data_clone, &manifest_for_write) {
+                                            Ok(()) => {
+                                                // Robustheit: Atomares Manifest-Update mit SQLite (verhindert Race Conditions)
+                                                // WICHTIG: Entferne Chunk erst NACH erfolgreichem Manifest-Update aus requested_chunks!
+                                                let chunk_hash_for_update = chunk_hash_clone.clone();
+                                                let manifest_path_display = manifest_path.display().to_string();
                                                 
-                                                // Prüfe ob die BETROFFENE Datei komplett ist und validiere sie im Hintergrund-Thread
-                                                // Nur die Datei prüfen, zu der dieser Chunk gehört (effizient!)
-                                                if let Some(file_path) = deckdrop_core::find_file_for_chunk(&manifest, &chunk_hash_clone) {
-                                                    let game_id_for_validate = game_id.clone();
-                                                    let manifest_for_validate = manifest.clone();
-                                                    let file_path_for_validate = file_path.clone();
-                                                    std::thread::spawn(move || {
-                                                        // Prüfe nur diese EINE Datei (nicht alle Dateien!)
-                                                        match deckdrop_core::check_and_validate_single_file(
-                                                            &game_id_for_validate,
-                                                            &manifest_for_validate,
-                                                            &file_path_for_validate,
-                                                        ) {
-                                                            Ok(true) => {
-                                                                println!("Datei validiert: {}", file_path_for_validate);
+                                                // Verwende SQLite für atomares Update
+                                                match deckdrop_core::synch::mark_chunk_downloaded_sqlite(&game_id, &chunk_hash_for_update) {
+                                                    Ok(()) => {
+                                                        // Lade Manifest für Progress-Logging
+                                                        if let Ok(manifest) = deckdrop_core::DownloadManifest::load(&manifest_path) {
+                                                            // Nur bei wichtigen Meilensteinen loggen (jeder 10. Chunk oder bei Fehlern)
+                                                            if manifest.progress.downloaded_chunks % 10 == 0 || manifest.progress.downloaded_chunks == manifest.progress.total_chunks {
+                                                                eprintln!("Manifest aktualisiert: {}/{} Chunks heruntergeladen", 
+                                                                    manifest.progress.downloaded_chunks, 
+                                                                    manifest.progress.total_chunks);
                                                             }
-                                                            Ok(false) => {
-                                                                // Datei noch nicht komplett - normal, weiter warten
+                                                            // JETZT erst: Entferne Chunk aus "angefordert" Set, NACH erfolgreichem Manifest-Update
+                                                            if let Ok(mut requested) = requested_chunks_for_thread.lock() {
+                                                                requested.remove(&chunk_hash_clone);
                                                             }
-                                                            Err(e) => {
-                                                                eprintln!("Fehler bei Validierung von {}: {}", file_path_for_validate, e);
+                                                            // Entferne Chunk aus "wird geschrieben" und Startzeit, da er jetzt fertig ist
+                                                            if let Ok(mut writing) = writing_chunks_for_thread.lock() {
+                                                                writing.remove(&chunk_hash_clone);
                                                             }
-                                                        }
-                                                    });
-                                                }
-                                                
-                                                // Prüfe ob noch weitere Chunks fehlen und fordere sie an
-                                                // (nur eine begrenzte Anzahl, um Timeouts zu vermeiden)
-                                                if matches!(manifest.overall_status, deckdrop_core::DownloadStatus::Downloading) {
-                                                    if let Some(peer_ids) = peer_ids_for_thread {
-                                                        if !peer_ids.is_empty() {
-                                                            if let Some(tx) = crate::network_bridge::get_download_request_tx() {
-                                                                // Request nur neue Chunks (nicht bereits angefordert)
-                                                                // Begrenze auf max 3 neue Requests pro Aufruf
-                                                                if let Ok(manifest_path) = deckdrop_core::get_manifest_path(&game_id) {
-                                                                    if let Ok(manifest) = deckdrop_core::DownloadManifest::load(&manifest_path) {
-                                                                        let missing = manifest.get_missing_chunks();
-                                                                        
-                                                                        // Filtere bereits angeforderte Chunks
-                                                                        // Begrenzung: Maximal max_concurrent_chunks Chunks gleichzeitig (entspricht der Begrenzung in discovery.rs)
-                                                                        // Fordere nur neue Chunks an, wenn weniger als max_concurrent_chunks bereits angefordert sind
-                                                                        let max_concurrent = max_concurrent_chunks;
-                                                                        let new_chunks: Vec<String> = {
-                                                                            if let Ok(requested) = requested_chunks_for_thread.lock() {
-                                                                                let requested_count = requested.len();
-                                                                                // Maximal max_concurrent_chunks Chunks gleichzeitig - wenn bereits max_concurrent_chunks angefordert, warte
-                                                                                if requested_count >= max_concurrent {
-                                                                                    Vec::new() // Keine neuen Requests, wenn bereits 5 aktiv
-                                                                                } else {
-                                                                                    let remaining_slots = max_concurrent - requested_count;
-                                                                                    missing.into_iter()
-                                                                                        .filter(|chunk| !requested.contains(chunk))
-                                                                                        .take(remaining_slots)
-                                                                                        .collect::<Vec<_>>()
-                                                                                }
-                                                                            } else {
-                                                                                Vec::new()
+                                                            if let Ok(mut start_times) = chunk_download_start_times_for_thread.lock() {
+                                                                start_times.remove(&chunk_hash_clone);
+                                                            }
+                                                            
+                                                            // Lade Manifest erneut für weitere Operationen
+                                                            if let Ok(manifest) = deckdrop_core::DownloadManifest::load(&manifest_path) {
+                                                                // Prüfe ob die BETROFFENE Datei komplett ist und validiere sie im Hintergrund-Thread
+                                                                // Nur die Datei prüfen, zu der dieser Chunk gehört (effizient!)
+                                                                if let Some(file_path) = deckdrop_core::find_file_for_chunk(&manifest, &chunk_hash_clone) {
+                                                                    let game_id_for_validate = game_id.clone();
+                                                                    let manifest_for_validate = manifest.clone();
+                                                                    let file_path_for_validate = file_path.clone();
+                                                                    std::thread::spawn(move || {
+                                                                        // Prüfe nur diese EINE Datei (nicht alle Dateien!)
+                                                                        match deckdrop_core::check_and_validate_single_file(
+                                                                            &game_id_for_validate,
+                                                                            &manifest_for_validate,
+                                                                            &file_path_for_validate,
+                                                                        ) {
+                                                                            Ok(true) => {
+                                                                                println!("Datei validiert: {}", file_path_for_validate);
                                                                             }
-                                                                        };
-                                                                        
-                                                                        // Markiere neue Chunks als angefordert und tracke Startzeit
-                                                                        if !new_chunks.is_empty() {
-                                                                            let start_time = std::time::Instant::now();
-                                                                            if let Ok(mut requested) = requested_chunks_for_thread.lock() {
-                                                                                for chunk in &new_chunks {
-                                                                                    requested.insert(chunk.clone());
-                                                                                }
+                                                                            Ok(false) => {
+                                                                                // Datei noch nicht komplett - normal, weiter warten
                                                                             }
-                                                                            // Tracke Startzeit für Progress-Berechnung
-                                                                            if let Ok(mut start_times) = chunk_download_start_times_for_thread.lock() {
-                                                                                for chunk in &new_chunks {
-                                                                                    start_times.insert(chunk.clone(), start_time);
-                                                                                }
+                                                                            Err(e) => {
+                                                                                eprintln!("Fehler bei Validierung von {}: {}", file_path_for_validate, e);
                                                                             }
-                                                                            
-                                                                            // Sende Requests für neue Chunks
-                                                                            // Round-Robin-Verteilung über alle verfügbaren Peers für bessere Parallelisierung
-                                                                            let peer_count = peer_ids.len();
-                                                                            for (index, chunk_hash) in new_chunks.iter().enumerate() {
-                                                                                let peer_id = if peer_count > 0 {
-                                                                                    &peer_ids[index % peer_count] // Round-Robin über Peers
-                                                                                } else {
-                                                                                    continue;
+                                                                        }
+                                                                    });
+                                                                }
+                                                        
+                                                        // Prüfe ob noch weitere Chunks fehlen und fordere sie an
+                                                        // (nur eine begrenzte Anzahl, um Timeouts zu vermeiden)
+                                                        if matches!(manifest.overall_status, deckdrop_core::DownloadStatus::Downloading) {
+                                                            if let Some(peer_ids) = peer_ids_for_thread {
+                                                                if !peer_ids.is_empty() {
+                                                                    if let Some(tx) = crate::network_bridge::get_download_request_tx() {
+                                                                        // Request nur neue Chunks (nicht bereits angefordert)
+                                                                        // Begrenze auf max 3 neue Requests pro Aufruf
+                                                                        if let Ok(manifest_path) = deckdrop_core::get_manifest_path(&game_id) {
+                                                                            if let Ok(manifest) = deckdrop_core::DownloadManifest::load(&manifest_path) {
+                                                                                let missing = manifest.get_missing_chunks();
+                                                                                
+                                                                                // Filtere bereits angeforderte Chunks
+                                                                                // Begrenzung: Maximal max_concurrent_chunks Chunks gleichzeitig (entspricht der Begrenzung in discovery.rs)
+                                                                                // Fordere nur neue Chunks an, wenn weniger als max_concurrent_chunks bereits angefordert sind
+                                                                                let max_concurrent = max_concurrent_chunks;
+                                                                                let new_chunks: Vec<String> = {
+                                                                                    if let Ok(requested) = requested_chunks_for_thread.lock() {
+                                                                                        let requested_count = requested.len();
+                                                                                        // Maximal max_concurrent_chunks Chunks gleichzeitig - wenn bereits max_concurrent_chunks angefordert, warte
+                                                                                        if requested_count >= max_concurrent {
+                                                                                            Vec::new() // Keine neuen Requests, wenn bereits 5 aktiv
+                                                                                        } else {
+                                                                                            let remaining_slots = max_concurrent - requested_count;
+                                                                                            missing.into_iter()
+                                                                                                .filter(|chunk| !requested.contains(chunk))
+                                                                                                .take(remaining_slots)
+                                                                                                .collect::<Vec<_>>()
+                                                                                        }
+                                                                                    } else {
+                                                                                        Vec::new()
+                                                                                    }
                                                                                 };
                                                                                 
-                                                                                if let Err(e) = tx.send(
-                                                                                    deckdrop_network::network::discovery::DownloadRequest::RequestChunk {
-                                                                                        peer_id: peer_id.clone(),
-                                                                                        chunk_hash: chunk_hash.clone(),
-                                                                                        game_id: game_id.clone(),
+                                                                                // Markiere neue Chunks als angefordert und tracke Startzeit
+                                                                                if !new_chunks.is_empty() {
+                                                                                    let start_time = std::time::Instant::now();
+                                                                                    if let Ok(mut requested) = requested_chunks_for_thread.lock() {
+                                                                                        for chunk in &new_chunks {
+                                                                                            requested.insert(chunk.clone());
+                                                                                        }
                                                                                     }
-                                                                                ) {
-                                                                                    eprintln!("Fehler beim Senden von Chunk-Request für {}: {}", chunk_hash, e);
+                                                                                    // Tracke Startzeit für Progress-Berechnung
+                                                                                    if let Ok(mut start_times) = chunk_download_start_times_for_thread.lock() {
+                                                                                        for chunk in &new_chunks {
+                                                                                            start_times.insert(chunk.clone(), start_time);
+                                                                                        }
+                                                                                    }
+                                                                                    
+                                                                                    // Sende Requests für neue Chunks
+                                                                                    // Round-Robin-Verteilung über alle verfügbaren Peers für bessere Parallelisierung
+                                                                                    let peer_count = peer_ids.len();
+                                                                                    for (index, chunk_hash) in new_chunks.iter().enumerate() {
+                                                                                        let peer_id = if peer_count > 0 {
+                                                                                            &peer_ids[index % peer_count] // Round-Robin über Peers
+                                                                                        } else {
+                                                                                            continue;
+                                                                                        };
+                                                                                        
+                                                                                        if let Err(e) = tx.send(
+                                                                                            deckdrop_network::network::discovery::DownloadRequest::RequestChunk {
+                                                                                                peer_id: peer_id.clone(),
+                                                                                                chunk_hash: chunk_hash.clone(),
+                                                                                                game_id: game_id.clone(),
+                                                                                            }
+                                                                                        ) {
+                                                                                            eprintln!("Fehler beim Senden von Chunk-Request für {}: {}", chunk_hash, e);
+                                                                                        }
+                                                                                    }
                                                                                 }
                                                                             }
                                                                         }
@@ -2146,8 +2157,13 @@ impl DeckDropApp {
                                                         }
                                                     }
                                                 }
-                                            } else {
-                                                eprintln!("Fehler beim Speichern des Manifests für Chunk {}", chunk_hash_clone);
+                                            }
+                                            Err(e) => {
+                                                eprintln!("❌ KRITISCH: Fehler beim Speichern des Manifests für Chunk {}: {}", chunk_hash_clone, e);
+                                                eprintln!("   → Manifest-Pfad: {}", manifest_path_display);
+                                                eprintln!("   → Chunk wurde geschrieben, aber Manifest nicht aktualisiert!");
+                                                eprintln!("   → Download wird bei {} Chunks stehen bleiben!", manifest_for_write.progress.downloaded_chunks);
+                                                eprintln!("   → Prüfe ob das Verzeichnis existiert und Schreibrechte hat!");
                                                 // Bei Fehler: Entferne aus writing_chunks und start_times
                                                 if let Ok(mut writing) = writing_chunks_for_thread.lock() {
                                                     writing.remove(&chunk_hash_clone);
@@ -2155,17 +2171,90 @@ impl DeckDropApp {
                                                 if let Ok(mut start_times) = chunk_download_start_times_for_thread.lock() {
                                                     start_times.remove(&chunk_hash_clone);
                                                 }
-                                            }
-                                        } else {
-                                            eprintln!("Fehler beim Speichern des Chunks {}: {}", chunk_hash_clone, peer_id);
-                                            // Bei Fehler: Entferne aus writing_chunks und start_times, damit Retry möglich ist
-                                            if let Ok(mut writing) = writing_chunks_for_thread.lock() {
-                                                writing.remove(&chunk_hash_clone);
-                                            }
-                                            if let Ok(mut start_times) = chunk_download_start_times_for_thread.lock() {
-                                                start_times.remove(&chunk_hash_clone);
+                                                // WICHTIG: Chunk bleibt in requested_chunks, damit er erneut angefordert werden kann
+                                                // (wurde noch nicht entfernt, da wir erst nach erfolgreichem Manifest-Update entfernen)
                                             }
                                         }
+                                    }
+                                    Err(e) => {
+                                        eprintln!("❌ KRITISCH: Fehler beim Schreiben des Chunks {} in Datei: {}", chunk_hash_clone, e);
+                                        // Bei Fehler: Entferne aus writing_chunks und start_times
+                                        if let Ok(mut writing) = writing_chunks_for_thread.lock() {
+                                            writing.remove(&chunk_hash_clone);
+                                        }
+                                        if let Ok(mut start_times) = chunk_download_start_times_for_thread.lock() {
+                                            start_times.remove(&chunk_hash_clone);
+                                        }
+                                        // WICHTIG: Chunk bleibt in requested_chunks, damit er erneut angefordert werden kann
+                                        // Entferne NICHT aus requested_chunks, damit Retry möglich ist
+                                        
+                                        // Versuche trotzdem neue Chunks anzufordern, wenn noch Slots frei sind
+                                        if matches!(manifest_for_write.overall_status, deckdrop_core::DownloadStatus::Downloading) {
+                                            if let Some(peer_ids) = peer_ids_for_thread.as_ref() {
+                                                if !peer_ids.is_empty() {
+                                                    if let Some(tx) = crate::network_bridge::get_download_request_tx() {
+                                                        if let Ok(manifest_path_for_retry) = deckdrop_core::get_manifest_path(&game_id) {
+                                                            if let Ok(manifest_for_retry) = deckdrop_core::DownloadManifest::load(&manifest_path_for_retry) {
+                                                                let missing = manifest_for_retry.get_missing_chunks();
+                                                                
+                                                                let max_concurrent = max_concurrent_chunks;
+                                                                let new_chunks: Vec<String> = {
+                                                                    if let Ok(requested) = requested_chunks_for_thread.lock() {
+                                                                        let requested_count = requested.len();
+                                                                        if requested_count >= max_concurrent {
+                                                                            Vec::new()
+                                                                        } else {
+                                                                            let remaining_slots = max_concurrent - requested_count;
+                                                                            missing.into_iter()
+                                                                                .filter(|chunk| !requested.contains(chunk))
+                                                                                .take(remaining_slots)
+                                                                                .collect::<Vec<_>>()
+                                                                        }
+                                                                    } else {
+                                                                        Vec::new()
+                                                                    }
+                                                                };
+                                                                
+                                                                if !new_chunks.is_empty() {
+                                                                    let start_time = std::time::Instant::now();
+                                                                    if let Ok(mut requested) = requested_chunks_for_thread.lock() {
+                                                                        for chunk in &new_chunks {
+                                                                            requested.insert(chunk.clone());
+                                                                        }
+                                                                    }
+                                                                    if let Ok(mut start_times) = chunk_download_start_times_for_thread.lock() {
+                                                                        for chunk in &new_chunks {
+                                                                            start_times.insert(chunk.clone(), start_time);
+                                                                        }
+                                                                    }
+                                                                    
+                                                                    let peer_count = peer_ids.len();
+                                                                    for (index, chunk_hash) in new_chunks.iter().enumerate() {
+                                                                        let peer_id = if peer_count > 0 {
+                                                                            &peer_ids[index % peer_count]
+                                                                        } else {
+                                                                            continue;
+                                                                        };
+                                                                        
+                                                                        if let Err(e) = tx.send(
+                                                                            deckdrop_network::network::discovery::DownloadRequest::RequestChunk {
+                                                                                peer_id: peer_id.clone(),
+                                                                                chunk_hash: chunk_hash.clone(),
+                                                                                game_id: game_id.clone(),
+                                                                            }
+                                                                        ) {
+                                                                            eprintln!("Fehler beim Senden von Chunk-Request für {}: {}", chunk_hash, e);
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
                                     } else {
                                         eprintln!("Fehler beim Ermitteln des Chunks-Verzeichnisses für {}", game_id);
                                     }

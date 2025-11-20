@@ -108,26 +108,155 @@ impl DownloadManifest {
         })
     }
     
-    /// Speichert das Manifest (nicht thread-safe, verwende update_manifest_atomic für thread-safe Updates)
+    /// Speichert das Manifest in SQLite (thread-safe durch SQLite-Transaktionen)
     pub fn save(&self, manifest_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
-        if let Some(parent) = manifest_path.parent() {
-            fs::create_dir_all(parent)?;
+        // Verwende game_id aus dem Manifest selbst (zuverlässiger als Pfad-Extraktion)
+        let game_id = &self.game_id;
+        
+        use crate::manifest_db::get_manifest_db;
+        let db_arc = get_manifest_db(game_id)?;
+        
+        // Verwende create_download, das INSERT OR IGNORE verwendet
+        // Für Updates: Lösche alte Daten und erstelle neu
+        let mut conn = db_arc.conn.lock().unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        
+        let tx = conn.transaction()?;
+        
+        // Lösche alte Daten (Foreign Keys löschen Chunks automatisch)
+        // Lösche zuerst Files (Chunks werden durch Foreign Key CASCADE gelöscht)
+        tx.execute("DELETE FROM files WHERE game_id = ?1", rusqlite::params![game_id])?;
+        // Dann Downloads
+        tx.execute("DELETE FROM downloads WHERE game_id = ?1", rusqlite::params![game_id])?;
+        
+        // Insert download
+        let status_str = match &self.overall_status {
+            DownloadStatus::Pending => "Pending",
+            DownloadStatus::Downloading => "Downloading",
+            DownloadStatus::Paused => "Paused",
+            DownloadStatus::Complete => "Complete",
+            DownloadStatus::Error(msg) => {
+                    // Versuche INSERT, falls fehlschlägt (weil bereits existiert), verwende UPDATE
+                    match tx.execute(
+                        "INSERT INTO downloads (game_id, game_name, game_path, overall_status, error_message, total_chunks, downloaded_chunks, percentage, created_at, updated_at)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                        rusqlite::params![
+                            self.game_id,
+                            self.game_name,
+                            self.game_path,
+                            "Error",
+                            msg,
+                            self.progress.total_chunks,
+                            self.progress.downloaded_chunks,
+                            self.progress.percentage,
+                            now,
+                            now
+                        ],
+                    ) {
+                        Ok(_) => {},
+                        Err(rusqlite::Error::SqliteFailure(err, _)) if err.code == rusqlite::ErrorCode::ConstraintViolation => {
+                            // Download existiert bereits - update
+                            tx.execute(
+                                "UPDATE downloads SET game_name = ?1, game_path = ?2, overall_status = ?3, error_message = ?4, total_chunks = ?5, downloaded_chunks = ?6, percentage = ?7, updated_at = ?8 WHERE game_id = ?9",
+                                rusqlite::params![
+                                    self.game_name,
+                                    self.game_path,
+                                    "Error",
+                                    msg,
+                                    self.progress.total_chunks,
+                                    self.progress.downloaded_chunks,
+                                    self.progress.percentage,
+                                    now,
+                                    self.game_id,
+                                ],
+                            )?;
+                        },
+                        Err(e) => return Err(e.into()),
+                    }
+                tx.commit()?;
+                return Ok(());
+            },
+            DownloadStatus::Cancelled => "Cancelled",
+        };
+        
+        // Versuche INSERT, falls fehlschlägt (weil bereits existiert), verwende UPDATE
+        match tx.execute(
+            "INSERT INTO downloads (game_id, game_name, game_path, overall_status, error_message, total_chunks, downloaded_chunks, percentage, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, ?7, ?8, ?9)",
+            rusqlite::params![
+                self.game_id,
+                self.game_name,
+                self.game_path,
+                status_str,
+                self.progress.total_chunks,
+                self.progress.downloaded_chunks,
+                self.progress.percentage,
+                now,
+                now
+            ],
+        ) {
+            Ok(_) => {},
+            Err(rusqlite::Error::SqliteFailure(err, _)) if err.code == rusqlite::ErrorCode::ConstraintViolation => {
+                // Download existiert bereits - update
+                tx.execute(
+                    "UPDATE downloads SET game_name = ?1, game_path = ?2, overall_status = ?3, error_message = NULL, total_chunks = ?4, downloaded_chunks = ?5, percentage = ?6, updated_at = ?7 WHERE game_id = ?8",
+                    rusqlite::params![
+                        self.game_name,
+                        self.game_path,
+                        status_str,
+                        self.progress.total_chunks,
+                        self.progress.downloaded_chunks,
+                        self.progress.percentage,
+                        now,
+                        self.game_id,
+                    ],
+                )?;
+            },
+            Err(e) => return Err(e.into()),
         }
         
-        // Robustheit: Atomic Write (Temp-File → Rename) für Transaktions-Sicherheit
-        let temp_path = manifest_path.with_extension("json.tmp");
+        // Insert files und chunks
+        for (file_path, file_info) in &self.chunks {
+            tx.execute(
+                "INSERT INTO files (game_id, file_path, file_size, status)
+                 VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![
+                    self.game_id,
+                    file_path,
+                    file_info.file_size.map(|s| s as i64),
+                    match file_info.status {
+                        DownloadStatus::Pending => "Pending",
+                        DownloadStatus::Downloading => "Downloading",
+                        DownloadStatus::Complete => "Complete",
+                        _ => "Pending",
+                    }
+                ],
+            )?;
+            
+            let file_id = tx.last_insert_rowid();
+            
+            for (index, chunk_hash) in file_info.chunk_hashes.iter().enumerate() {
+                let is_downloaded = if file_info.downloaded_chunks.contains(chunk_hash) { 1 } else { 0 };
+                let downloaded_at = if is_downloaded == 1 { Some(now) } else { None };
+                
+                tx.execute(
+                    "INSERT INTO chunks (file_id, chunk_hash, chunk_index, is_downloaded, downloaded_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    rusqlite::params![file_id, chunk_hash, index, is_downloaded, downloaded_at],
+                )?;
+            }
+        }
         
-        let json = serde_json::to_string_pretty(self)?;
-        fs::write(&temp_path, json)?;
-        
-        // Atomic Rename (atomar auf den meisten Dateisystemen)
-        fs::rename(&temp_path, manifest_path)?;
+        tx.commit()?;
         
         Ok(())
     }
     
     /// Atomares Update eines Manifests (thread-safe)
-    /// Führt Load-Modify-Save atomar durch, um Race Conditions zu vermeiden
+    /// Verwendet SQLite für echte ACID-Transaktionen
     pub fn update_manifest_atomic<F>(
         manifest_path: &Path,
         update_fn: F,
@@ -135,23 +264,44 @@ impl DownloadManifest {
     where
         F: FnOnce(&mut Self) -> Result<(), Box<dyn std::error::Error>>,
     {
+        // Extrahiere game_id aus dem Pfad
+        let game_id = manifest_path.parent()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| "Konnte game_id aus Manifest-Pfad nicht extrahieren".to_string())?;
+        
+        // Verwende SQLite-DB
+        use crate::manifest_db::get_manifest_db;
+        let db_arc = get_manifest_db(game_id)
+            .map_err(|e| format!("Fehler beim Öffnen der Manifest-DB: {}", e))?;
+        
         // Lade Manifest
-        let mut manifest = Self::load(manifest_path)?;
+        let mut manifest = db_arc.load_download(game_id)
+            .map_err(|e| format!("Fehler beim Laden des Manifests: {}", e))?;
         
         // Führe Update durch
-        update_fn(&mut manifest)?;
+        update_fn(&mut manifest)
+            .map_err(|e| format!("Fehler beim Update des Manifests: {}", e))?;
         
-        // Speichere atomar
-        manifest.save(manifest_path)?;
+        // Speichere zurück in die DB
+        manifest.save(manifest_path)
+            .map_err(|e| format!("Fehler beim Speichern des Manifests: {}", e))?;
         
         Ok(manifest)
     }
     
-    /// Lädt ein Manifest
+    /// Lädt ein Manifest aus SQLite
     pub fn load(manifest_path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
-        let content = fs::read_to_string(manifest_path)?;
-        let manifest: DownloadManifest = serde_json::from_str(&content)?;
-        Ok(manifest)
+        // Extrahiere game_id aus dem Pfad
+        let game_id = manifest_path.parent()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| "Konnte game_id aus Manifest-Pfad nicht extrahieren".to_string())?;
+        
+        use crate::manifest_db::get_manifest_db;
+        let db_arc = get_manifest_db(game_id)?;
+        db_arc.load_download(game_id)
+            .map_err(|e| format!("Fehler beim Laden des Manifests: {}", e).into())
     }
     
     /// Ermittelt fehlende Chunks
@@ -483,13 +633,22 @@ pub fn write_chunk_to_file(
     Ok(())
 }
 
-/// Ermittelt den Manifest-Pfad für ein Spiel
+/// Markiert einen Chunk als heruntergeladen (SQLite-Version)
+/// Diese Funktion verwendet SQLite-Transaktionen für atomare Updates
+pub fn mark_chunk_downloaded_sqlite(game_id: &str, chunk_hash: &str) -> Result<(), Box<dyn std::error::Error>> {
+    use crate::manifest_db::get_manifest_db;
+    let db_arc = get_manifest_db(game_id)?;
+    db_arc.mark_chunk_downloaded(game_id, chunk_hash)
+        .map_err(|e| format!("Fehler beim Markieren des Chunks als heruntergeladen: {}", e).into())
+}
+
+/// Ermittelt den Manifest-Pfad für ein Spiel (SQLite-Datenbank)
 pub fn get_manifest_path(game_id: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let base_dir = directories::ProjectDirs::from("com", "deckdrop", "deckdrop")
         .ok_or("Konnte Konfigurationsverzeichnis nicht bestimmen")?;
     let config_dir = base_dir.config_dir();
     let games_dir = config_dir.join("games").join(game_id);
-    Ok(games_dir.join("manifest.json"))
+    Ok(games_dir.join("manifest.db"))
 }
 
 /// Ermittelt den Chunks-Verzeichnis-Pfad für ein Spiel
@@ -522,11 +681,13 @@ pub fn start_game_download(
         deckdrop_chunks_toml,
     )?;
     
-    // Speichere Manifest
-    let manifest_path = get_manifest_path(game_id)?;
-    manifest.save(&manifest_path)?;
+    // Speichere Manifest in SQLite
+    use crate::manifest_db::get_manifest_db;
+    let db_arc = get_manifest_db(game_id)?;
+    db_arc.create_download(&manifest)?;
     
     // Speichere auch deckdrop.toml und deckdrop_chunks.toml im Manifest-Verzeichnis
+    let manifest_path = get_manifest_path(game_id)?;
     if let Some(manifest_dir) = manifest_path.parent() {
         std::fs::create_dir_all(manifest_dir)?;
         std::fs::write(manifest_dir.join("deckdrop.toml"), deckdrop_toml)?;
@@ -658,7 +819,7 @@ pub fn request_missing_chunks(
     Ok(())
 }
 
-/// Lädt alle aktiven Downloads aus dem Manifest-Verzeichnis
+/// Lädt alle aktiven Downloads aus SQLite-Datenbanken
 pub fn load_active_downloads() -> Vec<(String, DownloadManifest)> {
     let base_dir = match directories::ProjectDirs::from("com", "deckdrop", "deckdrop") {
         Some(dir) => dir,
@@ -677,13 +838,18 @@ pub fn load_active_downloads() -> Vec<(String, DownloadManifest)> {
     if let Ok(entries) = std::fs::read_dir(&games_dir) {
         for entry in entries {
             if let Ok(entry) = entry {
-                let manifest_path = entry.path().join("manifest.json");
+                let db_path = entry.path().join("manifest.db");
                 
-                if manifest_path.exists() {
-                    if let Ok(manifest) = DownloadManifest::load(&manifest_path) {
-                        // Nur Downloads, die nicht abgebrochen sind
-                        if !matches!(manifest.overall_status, DownloadStatus::Cancelled) {
-                            downloads.push((manifest.game_id.clone(), manifest));
+                if db_path.exists() {
+                    if let Some(game_id) = entry.file_name().to_str() {
+                        use crate::manifest_db::get_manifest_db;
+                        if let Ok(db_arc) = get_manifest_db(game_id) {
+                            if let Ok(manifest) = db_arc.load_download(game_id) {
+                                // Nur Downloads, die nicht abgebrochen sind
+                                if !matches!(manifest.overall_status, DownloadStatus::Cancelled) {
+                                    downloads.push((manifest.game_id.clone(), manifest));
+                                }
+                            }
                         }
                     }
                 }
@@ -694,7 +860,7 @@ pub fn load_active_downloads() -> Vec<(String, DownloadManifest)> {
     downloads
 }
 
-/// Findet die game_id für einen Chunk durch Suche in allen Manifesten
+/// Findet die game_id für einen Chunk durch Suche in allen SQLite-Datenbanken
 pub fn find_game_id_for_chunk(chunk_hash: &str) -> Result<String, Box<dyn std::error::Error>> {
     let base_dir = directories::ProjectDirs::from("com", "deckdrop", "deckdrop")
         .ok_or("Konnte Konfigurationsverzeichnis nicht bestimmen")?;
@@ -708,14 +874,19 @@ pub fn find_game_id_for_chunk(chunk_hash: &str) -> Result<String, Box<dyn std::e
     // Durchsuche alle Spiel-Verzeichnisse
     for entry in std::fs::read_dir(&games_dir)? {
         let entry = entry?;
-        let manifest_path = entry.path().join("manifest.json");
+        let db_path = entry.path().join("manifest.db");
         
-        if manifest_path.exists() {
-            if let Ok(manifest) = DownloadManifest::load(&manifest_path) {
-                // Prüfe ob dieser Chunk im Manifest ist
-                for file_info in manifest.chunks.values() {
-                    if file_info.chunk_hashes.contains(&chunk_hash.to_string()) {
-                        return Ok(manifest.game_id);
+        if db_path.exists() {
+            if let Some(game_id) = entry.file_name().to_str() {
+                use crate::manifest_db::get_manifest_db;
+                if let Ok(db_arc) = get_manifest_db(game_id) {
+                    // Prüfe ob dieser Chunk in der DB ist (sowohl fehlende als auch heruntergeladene)
+                    if let Ok(manifest) = db_arc.load_download(game_id) {
+                        for file_info in manifest.chunks.values() {
+                            if file_info.chunk_hashes.contains(&chunk_hash.to_string()) {
+                                return Ok(game_id.to_string());
+                            }
+                        }
                     }
                 }
             }
@@ -877,15 +1048,16 @@ pub fn finalize_game_download(
 
 /// Bricht einen Download ab und löscht alle Daten
 pub fn cancel_game_download(game_id: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let manifest_path = get_manifest_path(game_id)?;
-    let manifest_dir = manifest_path.parent()
-        .ok_or("Konnte Manifest-Verzeichnis nicht bestimmen")?;
+    use crate::manifest_db::get_manifest_db;
+    use rusqlite::params;
+    let db_arc = get_manifest_db(game_id)?;
     
-    // Markiere als abgebrochen
-    if let Ok(mut manifest) = DownloadManifest::load(&manifest_path) {
-        manifest.overall_status = DownloadStatus::Cancelled;
-        let _ = manifest.save(&manifest_path);
-    }
+    // Markiere als abgebrochen in SQLite
+    let conn = db_arc.conn.lock().unwrap();
+    conn.execute(
+        "UPDATE downloads SET overall_status = 'Cancelled' WHERE game_id = ?1",
+        params![game_id],
+    )?;
     
     // Lösche temporäre Chunks im Download-Ordner
     let chunks_dir = get_chunks_dir(game_id)?;
@@ -895,9 +1067,16 @@ pub fn cancel_game_download(game_id: &str) -> Result<(), Box<dyn std::error::Err
     }
     
     // Lösche Manifest-Verzeichnis (enthält nur Metadaten, keine Chunks mehr)
-    if manifest_dir.exists() {
-        std::fs::remove_dir_all(manifest_dir)?;
+    let manifest_path = get_manifest_path(game_id)?;
+    if let Some(manifest_dir) = manifest_path.parent() {
+        if manifest_dir.exists() {
+            std::fs::remove_dir_all(manifest_dir)?;
+        }
     }
+    
+    // Entferne DB-Verbindung aus dem Cache (wichtig für Tests)
+    use crate::manifest_db::remove_manifest_db_from_cache;
+    remove_manifest_db_from_cache(game_id);
     
     println!("Download abgebrochen und Daten gelöscht für Spiel: {}", game_id);
     eprintln!("Download abgebrochen und Daten gelöscht für Spiel: {}", game_id);
@@ -1194,7 +1373,10 @@ file_size = {}
     #[test]
     fn test_update_manifest_atomic() {
         let temp_dir = TempDir::new().unwrap();
-        let manifest_path = temp_dir.path().join("manifest.json");
+        // Erstelle richtige Verzeichnisstruktur: games/test-game/manifest.db
+        let game_dir = temp_dir.path().join("games").join("test-game");
+        std::fs::create_dir_all(&game_dir).unwrap();
+        let manifest_path = game_dir.join("manifest.db");
         
         // Erstelle initiales Manifest
         let chunks_toml = r#"[[file]]
@@ -1240,12 +1422,18 @@ file_size = 200000000
         let final_manifest = DownloadManifest::load(&manifest_path).unwrap();
         assert_eq!(final_manifest.progress.downloaded_chunks, 2);
         assert_eq!(final_manifest.progress.total_chunks, 2);
+        
+        // Aufräumen: Lösche Test-Spiel aus dem Konfigurationsverzeichnis
+        let _ = cancel_game_download("test-game");
     }
     
     #[test]
     fn test_manifest_save_atomic() {
         let temp_dir = TempDir::new().unwrap();
-        let manifest_path = temp_dir.path().join("manifest.json");
+        // Erstelle richtige Verzeichnisstruktur: games/test-game/manifest.db
+        let game_dir = temp_dir.path().join("games").join("test-game");
+        std::fs::create_dir_all(&game_dir).unwrap();
+        let manifest_path = game_dir.join("manifest.db");
         
         let chunks_toml = r#"[[file]]
 path = "test.bin"
@@ -1261,25 +1449,37 @@ file_size = 100000000
             chunks_toml,
         ).unwrap();
         
-        // Test: Atomic Save (Temp-File → Rename)
+        // Test: Atomic Save (SQLite)
         manifest.save(&manifest_path).unwrap();
-        assert!(manifest_path.exists());
+        // Die DB wird im Konfigurationsverzeichnis erstellt, nicht im temp_dir
+        // Prüfe dass die DB im richtigen Verzeichnis erstellt wurde
+        let base_dir = directories::ProjectDirs::from("com", "deckdrop", "deckdrop").unwrap();
+        let config_dir = base_dir.config_dir();
+        let games_dir = config_dir.join("games").join("test-game");
+        let db_path = games_dir.join("manifest.db");
+        assert!(db_path.exists(), "DB sollte erstellt werden: {}", db_path.display());
+        
+        // Prüfe dass Manifest korrekt geladen werden kann (verwende den DB-Pfad)
+        let loaded = DownloadManifest::load(&db_path).unwrap();
+        assert_eq!(loaded.game_id, "test-game");
         
         // Prüfe dass keine Temp-Datei übrig bleibt (nach kurzer Wartezeit für Filesystem-Sync)
+        // Ignoriere das games-Verzeichnis, das für Tests erstellt wurde
         std::thread::sleep(std::time::Duration::from_millis(100));
         let temp_files: Vec<_> = fs::read_dir(temp_dir.path()).unwrap()
             .filter_map(|e| e.ok())
             .filter(|e| {
                 let path_str = e.path().to_string_lossy().to_string();
-                path_str.contains(".tmp") && !path_str.contains("manifest")
+                // Ignoriere .tmp-Dateien, aber nicht Verzeichnisse wie "games"
+                path_str.contains(".tmp") && !path_str.contains("manifest") && e.path().is_file()
             })
             .collect();
         assert_eq!(temp_files.len(), 0, "Keine Temp-Dateien sollten übrig bleiben (gefunden: {:?})", 
             temp_files.iter().map(|e| e.path()).collect::<Vec<_>>());
         
-        // Prüfe dass Manifest korrekt geladen werden kann
-        let loaded = DownloadManifest::load(&manifest_path).unwrap();
-        assert_eq!(loaded.game_id, "test-game");
+        // Aufräumen: Lösche Test-Spiel aus dem Konfigurationsverzeichnis
+        let _ = cancel_game_download("test-game");
+        
     }
     
     #[test]
