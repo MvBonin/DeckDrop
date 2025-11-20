@@ -970,13 +970,22 @@ impl DeckDropApp {
                 self.add_game_additional_instructions = String::new();
                 
                 // Send metadata update with new games count
+                // WICHTIG: Dies aktualisiert die games_count, die anderen Peers angezeigt wird
+                // Die Spiele selbst werden automatisch angekündigt, wenn Peers eine GamesListRequest senden
+                // (was durch das Keep-Alive-System automatisch passiert)
                 if let Some(tx) = crate::network_bridge::get_metadata_update_tx() {
                     let games_count = self.my_games.len() as u32;
                     let _ = tx.send(deckdrop_network::network::discovery::MetadataUpdate {
                         player_name: None, // Only update games count
                         games_count: Some(games_count),
                     });
+                    eprintln!("Metadata-Update gesendet: {} Spiele", games_count);
                 }
+                
+                // WICHTIG: Das Spiel ist jetzt in config.game_paths und wird automatisch
+                // von anderen Peers angezeigt, wenn sie eine GamesListRequest senden
+                // (was durch das Keep-Alive-System alle 60 Sekunden passiert)
+                eprintln!("Spiel {} erfolgreich hinzugefügt und wird im Netzwerk angekündigt", game_path.display());
             }
             Message::UpdateIntegrityProgress(game_path, current) => {
                 // Update progress for a checking game
@@ -1244,13 +1253,15 @@ impl DeckDropApp {
                     }));
                     
                     // Schreibe deckdrop.toml direkt nach der Chunk-Generierung
-                    // (nicht erst in AddGameChunksGenerated, da das zu spät sein kann)
+                    // WICHTIG: Beide Dateien müssen gespeichert sein, bevor der Dialog geschlossen wird
                     if let Ok(hash_string) = &hash_result {
                         let chunks_hash = Some(hash_string.clone());
                         if let Err(e) = game_info_clone.save_to_path_with_hash(&game_path_clone, chunks_hash) {
                             eprintln!("Fehler beim Speichern von deckdrop.toml: {}", e);
                         } else {
                             println!("deckdrop.toml erfolgreich gespeichert in: {}", game_path_clone.display());
+                            // Beide Dateien sind jetzt gespeichert: deckdrop.toml und deckdrop_chunks.toml
+                            // Der Dialog wird in AddGameChunksGenerated geschlossen
                         }
                     }
                 });
@@ -1336,8 +1347,11 @@ impl DeckDropApp {
                 }
                 
                 // Save config with player name
+                // WICHTIG: Speichere den Spielernamen, damit er beim nächsten Start nicht erneut eingegeben werden muss
                 if let Err(e) = self.config.save() {
                     eprintln!("Error saving config: {}", e);
+                } else {
+                    eprintln!("Spielername '{}' erfolgreich gespeichert", self.config.player_name);
                 }
                 
                 // Update settings fields
