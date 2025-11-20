@@ -914,10 +914,11 @@ impl DeckDropApp {
                     hash: hash_result.ok(),
                 };
                 
-                // Save GameInfo
+                // Save GameInfo (wird bereits im Thread geschrieben, aber hier nochmal als Fallback)
+                // Dies ist ein Fallback, falls der Thread die Datei nicht geschrieben hat
                 if let Err(e) = game_info.save_to_path_with_hash(&game_path, game_info.hash.clone()) {
-                    eprintln!("Error saving game: {}", e);
-                    return Task::none();
+                    eprintln!("Error saving game (fallback): {}", e);
+                    // Nicht return Task::none(), da die Datei möglicherweise bereits geschrieben wurde
                 }
                 
                 // Add game path to config
@@ -1226,7 +1227,7 @@ impl DeckDropApp {
                 
                 // Start chunk generation in background thread
                 let game_path_clone = game_path.clone();
-                let _game_info_clone = game_info.clone();
+                let game_info_clone = game_info.clone();
                 let progress_tracker = self.add_game_progress_tracker.clone();
                 
                 // Initialize progress
@@ -1235,11 +1236,23 @@ impl DeckDropApp {
                 
                 // Spawn thread for chunk generation
                 std::thread::spawn(move || {
-                    let _ = deckdrop_core::generate_chunks_toml(&game_path_clone, Some(move |current: usize, total: usize, file_name: &str| {
+                    // Generiere deckdrop_chunks.toml
+                    let hash_result = deckdrop_core::generate_chunks_toml(&game_path_clone, Some(move |current: usize, total: usize, file_name: &str| {
                         if let Ok(mut tracker) = progress_tracker.lock() {
                             *tracker = Some((current, total, file_name.to_string()));
                         }
                     }));
+                    
+                    // Schreibe deckdrop.toml direkt nach der Chunk-Generierung
+                    // (nicht erst in AddGameChunksGenerated, da das zu spät sein kann)
+                    if let Ok(hash_string) = &hash_result {
+                        let chunks_hash = Some(hash_string.clone());
+                        if let Err(e) = game_info_clone.save_to_path_with_hash(&game_path_clone, chunks_hash) {
+                            eprintln!("Fehler beim Speichern von deckdrop.toml: {}", e);
+                        } else {
+                            println!("deckdrop.toml erfolgreich gespeichert in: {}", game_path_clone.display());
+                        }
+                    }
                 });
                 
                 // Return immediately - progress will be updated via Tick
@@ -2867,6 +2880,110 @@ impl DeckDropApp {
             }
         }
         
+        // WICHTIG: Kontinuierlich neue Chunks anfordern für alle aktiven Downloads
+        // Dies stellt sicher, dass der Download nicht stoppt, wenn fertige Chunks aus requested_chunks entfernt werden
+        for (game_id, download_state) in &self.active_downloads {
+            // Nur für Downloads, die aktiv sind
+            if !matches!(download_state.manifest.overall_status, 
+                deckdrop_core::DownloadStatus::Downloading | deckdrop_core::DownloadStatus::Pending) {
+                continue;
+            }
+            
+            // Prüfe ob Peers verfügbar sind
+            let peer_ids = if let Some(peers) = self.network_games.get(game_id) {
+                if peers.is_empty() {
+                    continue;
+                }
+                peers.iter().map(|(peer_id, _)| peer_id.clone()).collect::<Vec<_>>()
+            } else {
+                continue;
+            };
+            
+            // Prüfe ob es fehlende Chunks gibt, die noch nicht angefordert wurden
+            if let Ok(manifest_path) = deckdrop_core::get_manifest_path(game_id) {
+                if let Ok(manifest) = deckdrop_core::DownloadManifest::load(&manifest_path) {
+                    let missing_chunks = manifest.get_missing_chunks();
+                    if missing_chunks.is_empty() {
+                        continue; // Keine fehlenden Chunks
+                    }
+                    
+                    // Prüfe wie viele Chunks bereits angefordert wurden
+                    let requested_count = if let Ok(requested) = self.requested_chunks.lock() {
+                        missing_chunks.iter()
+                            .filter(|chunk| requested.contains(*chunk))
+                            .count()
+                    } else {
+                        continue;
+                    };
+                    
+                    // Wenn weniger als max_concurrent_chunks angefordert wurden, fordere neue an
+                    let max_concurrent = self.config.max_concurrent_chunks;
+                    if requested_count < max_concurrent {
+                        let remaining_slots = max_concurrent - requested_count;
+                        
+                        // Finde Chunks, die noch nicht angefordert wurden
+                        let new_chunks: Vec<String> = {
+                            if let Ok(requested) = self.requested_chunks.lock() {
+                                missing_chunks.into_iter()
+                                    .filter(|chunk| !requested.contains(chunk))
+                                    .take(remaining_slots)
+                                    .collect()
+                            } else {
+                                continue;
+                            }
+                        };
+                        
+                        if !new_chunks.is_empty() {
+                            // Markiere neue Chunks als angefordert
+                            let start_time = std::time::Instant::now();
+                            if let Ok(mut requested) = self.requested_chunks.lock() {
+                                for chunk in &new_chunks {
+                                    requested.insert(chunk.clone());
+                                }
+                            }
+                            // Tracke Startzeit für Progress-Berechnung
+                            if let Ok(mut start_times) = self.chunk_download_start_times.lock() {
+                                for chunk in &new_chunks {
+                                    start_times.insert(chunk.clone(), start_time);
+                                }
+                            }
+                            
+                            // Sende Requests für neue Chunks
+                            if let Some(tx) = crate::network_bridge::get_download_request_tx() {
+                                let peer_count = peer_ids.len();
+                                for (index, chunk_hash) in new_chunks.iter().enumerate() {
+                                    let peer_id = if peer_count > 0 {
+                                        &peer_ids[index % peer_count] // Round-Robin über Peers
+                                    } else {
+                                        continue;
+                                    };
+                                    
+                                    if let Err(e) = tx.send(
+                                        deckdrop_network::network::discovery::DownloadRequest::RequestChunk {
+                                            peer_id: peer_id.clone(),
+                                            chunk_hash: chunk_hash.clone(),
+                                            game_id: game_id.clone(),
+                                        }
+                                    ) {
+                                        eprintln!("Fehler beim Senden von Chunk-Request für {}: {}", chunk_hash, e);
+                                        // Entferne Chunk aus requested_chunks bei Fehler
+                                        if let Ok(mut requested) = self.requested_chunks.lock() {
+                                            requested.remove(chunk_hash);
+                                        }
+                                        if let Ok(mut start_times) = self.chunk_download_start_times.lock() {
+                                            start_times.remove(chunk_hash);
+                                        }
+                                    }
+                                }
+                                eprintln!("Automatisch {} neue Chunks für {} angefordert ({} bereits aktiv)", 
+                                    new_chunks.len(), game_id, requested_count);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
         // Remove downloads that no longer exist
         self.active_downloads.retain(|game_id, _| {
             if let Ok(manifest_path) = deckdrop_core::get_manifest_path(game_id) {
@@ -3134,9 +3251,10 @@ impl DeckDropApp {
                                 progress_bar(0.0..=100.0, ds.progress_percent)
                                     .width(Length::Fill),
                                 text(format!(
-                                    "Chunks: {}/{} downloaded, {} downloading | Peers: {} | Speed: {}",
+                                    "Chunks: {}/{} | Done: {} | Downloading: {} | Peers: {} | Speed: {}",
                                     ds.manifest.progress.downloaded_chunks,
                                     ds.manifest.progress.total_chunks,
+                                    ds.manifest.progress.downloaded_chunks,
                                     ds.downloading_chunks_count,
                                     ds.peer_count,
                                     speed_text
@@ -3350,9 +3468,10 @@ impl DeckDropApp {
                                 progress_bar(0.0..=100.0, ds.progress_percent)
                                     .width(Length::Fill),
                                 text(format!(
-                                    "Chunks: {}/{} downloaded, {} downloading | Peers: {} | Speed: {}",
+                                    "Chunks: {}/{} | Done: {} | Downloading: {} | Peers: {} | Speed: {}",
                                     ds.manifest.progress.downloaded_chunks,
                                     ds.manifest.progress.total_chunks,
+                                    ds.manifest.progress.downloaded_chunks,
                                     ds.downloading_chunks_count,
                                     ds.peer_count,
                                     speed_text
@@ -4327,6 +4446,7 @@ impl DeckDropApp {
                                                 };
                                                 
                                                 // Nur Chunks anzeigen, die wirklich noch fehlen UND angefordert wurden
+                                                // WICHTIG: Chunks, die zu 100% sind, werden nicht mehr angezeigt (sind fertig)
                                                 // Wenn ein Chunk nicht mehr in missing_chunks ist, ist er fertig und wird nicht mehr angezeigt
                                                 let mut chunks_with_progress: Vec<(String, f64)> = current_missing_chunks.iter()
                                                     .filter(|chunk| requested.contains(*chunk))
@@ -4355,6 +4475,8 @@ impl DeckDropApp {
                                                             (chunk.clone(), 0.0)
                                                         }
                                                     })
+                                                    // Filtere Chunks mit 100% Progress - diese sind fertig und werden nicht mehr angezeigt
+                                                    .filter(|(_, progress)| *progress < 100.0)
                                                     .collect();
                                                 
                                                 // Sortiere alphabetisch nach Chunk-Hash (stabil, keine Sprünge)
@@ -4411,7 +4533,7 @@ impl DeckDropApp {
                                         Space::with_height(Length::Fixed(scale(4.0))),
                                         text(format!("Size: {} / {}", downloaded_size_str, total_size_str)).size(scale_text(13.0)),
                                         Space::with_height(Length::Fixed(scale(4.0))),
-                                        text(format!("Chunks: {}/{}", ds.manifest.progress.downloaded_chunks, ds.manifest.progress.total_chunks)).size(scale_text(13.0)),
+                                        text(format!("Chunks: {}/{} | Done: {}", ds.manifest.progress.downloaded_chunks, ds.manifest.progress.total_chunks, ds.manifest.progress.downloaded_chunks)).size(scale_text(13.0)),
                                         // Einzelne Chunk-Progress-Balken
                                         if !downloading_chunks.is_empty() {
                                             column![

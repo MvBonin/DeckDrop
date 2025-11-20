@@ -686,7 +686,14 @@ pub fn start_game_download(
     let db_arc = get_manifest_db(game_id)?;
     db_arc.create_download(&manifest)?;
     
-    // Speichere auch deckdrop.toml und deckdrop_chunks.toml im Manifest-Verzeichnis
+    // Stelle sicher, dass das Spielverzeichnis existiert
+    std::fs::create_dir_all(&game_path)?;
+    
+    // Speichere deckdrop.toml und deckdrop_chunks.toml direkt im Spielverzeichnis
+    std::fs::write(game_path.join("deckdrop.toml"), deckdrop_toml)?;
+    std::fs::write(game_path.join("deckdrop_chunks.toml"), deckdrop_chunks_toml)?;
+    
+    // Speichere auch eine Kopie im Manifest-Verzeichnis für Backup/Metadaten
     let manifest_path = get_manifest_path(game_id)?;
     if let Some(manifest_dir) = manifest_path.parent() {
         std::fs::create_dir_all(manifest_dir)?;
@@ -1018,16 +1025,20 @@ pub fn finalize_game_download(
     // Stelle sicher, dass das Spielverzeichnis existiert
     std::fs::create_dir_all(&game_path)?;
     
-    // Kopiere Metadaten
+    // deckdrop.toml und deckdrop_chunks.toml sollten bereits im Spielverzeichnis sein
+    // (wurden in start_game_download gespeichert)
+    // Falls nicht vorhanden, kopiere aus Manifest-Verzeichnis als Fallback
     if let Some(manifest_dir) = manifest_path.parent() {
+        let deckdrop_toml_dest = game_path.join("deckdrop.toml");
+        let deckdrop_chunks_toml_dest = game_path.join("deckdrop_chunks.toml");
         let deckdrop_toml_src = manifest_dir.join("deckdrop.toml");
         let deckdrop_chunks_toml_src = manifest_dir.join("deckdrop_chunks.toml");
         
-        if deckdrop_toml_src.exists() {
-            std::fs::copy(&deckdrop_toml_src, game_path.join("deckdrop.toml"))?;
+        if !deckdrop_toml_dest.exists() && deckdrop_toml_src.exists() {
+            std::fs::copy(&deckdrop_toml_src, &deckdrop_toml_dest)?;
         }
-        if deckdrop_chunks_toml_src.exists() {
-            std::fs::copy(&deckdrop_chunks_toml_src, game_path.join("deckdrop_chunks.toml"))?;
+        if !deckdrop_chunks_toml_dest.exists() && deckdrop_chunks_toml_src.exists() {
+            std::fs::copy(&deckdrop_chunks_toml_src, &deckdrop_chunks_toml_dest)?;
         }
     }
     
