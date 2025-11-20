@@ -163,10 +163,10 @@ pub async fn run_discovery(
     let game_metadata_loader_clone = game_metadata_loader.clone();
     let chunk_loader_clone = chunk_loader.clone();
     
-    // Tracking für Chunk-Requests: request_id -> (chunk_hash, game_id, peer_id)
+    // Tracking für Chunk-Requests: request_id -> (chunk_hash, game_id, peer_id, request_time)
     // OutboundRequestId ist der Typ, der von send_request zurückgegeben wird
     use libp2p::request_response::OutboundRequestId;
-    let pending_chunk_requests: Arc<tokio::sync::Mutex<HashMap<OutboundRequestId, (String, String, String)>>> = 
+    let pending_chunk_requests: Arc<tokio::sync::Mutex<HashMap<OutboundRequestId, (String, String, String, std::time::Instant)>>> = 
         Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     let pending_chunk_requests_clone = pending_chunk_requests.clone();
     
@@ -454,7 +454,7 @@ pub async fn run_discovery(
                         
                         // Sammle alle Peer-IDs mit aktiven Requests
                         let mut active_peers = HashSet::new();
-                        for (_, (_, _, peer_id)) in pending_chunks.iter() {
+                        for (_, (_, _, peer_id, _)) in pending_chunks.iter() {
                             if let Ok(peer_id_parsed) = PeerId::from_str(peer_id) {
                                 active_peers.insert(peer_id_parsed);
                             }
@@ -496,7 +496,7 @@ pub async fn run_discovery(
                         
                         // Sammle alle Peer-IDs mit aktiven Requests
                         let mut active_peers = HashSet::new();
-                        for (_, (_, _, peer_id)) in pending_chunks.iter() {
+                        for (_, (_, _, peer_id, _)) in pending_chunks.iter() {
                             if let Ok(peer_id_parsed) = PeerId::from_str(peer_id) {
                                 active_peers.insert(peer_id_parsed);
                             }
@@ -710,10 +710,10 @@ pub async fn run_discovery(
                             let request = ChunkRequest { chunk_hash: chunk_hash.clone() };
                             let request_id = swarm.behaviour_mut().chunks.send_request(&peer_id_parsed, request);
                             
-                            // Tracke Request-ID für bessere Zuordnung
+                            // Tracke Request-ID für bessere Zuordnung (inkl. Zeit für Timeout-Analyse)
                             {
                                 let mut pending = pending_chunk_requests_clone.lock().await;
-                                pending.insert(request_id, (chunk_hash.clone(), game_id.clone(), peer_id.clone()));
+                                pending.insert(request_id, (chunk_hash.clone(), game_id.clone(), peer_id.clone(), std::time::Instant::now()));
                             }
                             
                             // Robustheit: Erhöhe aktive Request-Zahl
@@ -1095,13 +1095,22 @@ pub async fn run_discovery(
                                         let peer_id_str = peer.to_string();
                                         
                                         // Entferne Request aus Tracking und verwende getrackten Hash
-                                        let (chunk_hash, game_id, peer_id_from_tracking) = {
+                                        let (chunk_hash, game_id, peer_id_from_tracking, request_time) = {
                                             let mut pending = pending_chunk_requests_clone.lock().await;
                                             pending.remove(&request_id)
                                                 .unwrap_or_else(|| {
                                                     eprintln!("Warnung: Chunk Request {} nicht im Tracking gefunden, verwende Hash aus Response", request_id);
-                                                    (response.chunk_hash.clone(), "unknown".to_string(), peer_id_str.clone())
+                                                    (response.chunk_hash.clone(), "unknown".to_string(), peer_id_str.clone(), std::time::Instant::now())
                                                 })
+                                        };
+                                        
+                                        // Berechne Download-Dauer für Logging
+                                        let download_duration = request_time.elapsed();
+                                        let chunk_size_mb = response.chunk_data.len() as f64 / (1024.0 * 1024.0);
+                                        let speed_mbps = if download_duration.as_secs_f64() > 0.0 {
+                                            chunk_size_mb / download_duration.as_secs_f64()
+                                        } else {
+                                            0.0
                                         };
                                         
                                         // Robustheit: Reduziere aktive Request-Zahl bei Erfolg
@@ -1121,10 +1130,13 @@ pub async fn run_discovery(
                                             *global_active = global_active.saturating_sub(1);
                                         }
                                         
-                                        println!("Chunk Response erhalten von {} für hash {} (RequestId: {:?}, game_id: {})", 
+                                        println!("✅ Chunk Response erhalten von {} für hash {} (RequestId: {:?}, game_id: {})", 
                                             peer_id_str, chunk_hash, request_id, game_id);
-                                        eprintln!("Chunk Response erhalten von {} für hash {} (RequestId: {:?}, game_id: {})", 
+                                        eprintln!("✅ Chunk Response erhalten von {} für hash {} (RequestId: {:?}, game_id: {})", 
                                             peer_id_str, chunk_hash, request_id, game_id);
+                                        eprintln!("   → Chunk-Größe: {:.2} MB", chunk_size_mb);
+                                        eprintln!("   → Download-Dauer: {:.2}s", download_duration.as_secs_f64());
+                                        eprintln!("   → Geschwindigkeit: {:.2} MB/s", speed_mbps);
                                         
                                         // Sende Event mit chunk_hash (verwende getrackten Hash, nicht Response-Hash)
                                         let event_tx_for_chunk = event_tx_clone.clone();
@@ -1191,7 +1203,7 @@ pub async fn run_discovery(
                                                 // Tracke Request-ID
                                                 {
                                                     let mut pending = pending_chunk_requests_clone.lock().await;
-                                                    pending.insert(request_id, (chunk_hash.clone(), game_id.clone(), peer_id.clone()));
+                                                    pending.insert(request_id, (chunk_hash.clone(), game_id.clone(), peer_id.clone(), std::time::Instant::now()));
                                                 }
                                                 
                                                 // Erhöhe aktive Request-Zahl
@@ -1238,15 +1250,43 @@ pub async fn run_discovery(
                                     *global_active = global_active.saturating_sub(1);
                                 }
                                 
-                                // Hole Request-Informationen aus Tracking
-                                let (chunk_hash, game_id, _) = {
+                                // Hole Request-Informationen aus Tracking (inkl. Zeit)
+                                let (chunk_hash, game_id, _, request_time) = {
                                     let mut pending = pending_chunk_requests_clone.lock().await;
                                     pending.remove(&request_id)
-                                        .unwrap_or_else(|| ("unknown".to_string(), "unknown".to_string(), peer_id_str.clone()))
+                                        .unwrap_or_else(|| ("unknown".to_string(), "unknown".to_string(), peer_id_str.clone(), std::time::Instant::now()))
                                 };
                                 
-                                eprintln!("Chunks OutboundFailure für {} (RequestId: {:?}): chunk_hash={}, game_id={}, error={:?}", 
-                                    peer_id_str, request_id, chunk_hash, game_id, error);
+                                // Berechne wie lange der Request bereits lief
+                                let request_duration = request_time.elapsed();
+                                
+                                eprintln!("❌ Chunks OutboundFailure für {} (RequestId: {:?}):", peer_id_str, request_id);
+                                eprintln!("   → chunk_hash: {}", chunk_hash);
+                                eprintln!("   → game_id: {}", game_id);
+                                eprintln!("   → error: {:?}", error);
+                                eprintln!("   → request_duration: {:.2}s", request_duration.as_secs_f64());
+                                
+                                // Detaillierte Fehleranalyse
+                                match &error {
+                                    libp2p::request_response::OutboundFailure::Timeout => {
+                                        eprintln!("   → FEHLER-TYP: Timeout (Request hat 300s überschritten)");
+                                        eprintln!("   → MÖGLICHE URSACHEN: Langsame Verbindung, Peer überlastet, Netzwerkprobleme");
+                                    }
+                                    libp2p::request_response::OutboundFailure::ConnectionClosed => {
+                                        eprintln!("   → FEHLER-TYP: ConnectionClosed (Verbindung wurde getrennt)");
+                                        eprintln!("   → MÖGLICHE URSACHEN: Peer offline, Netzwerkproblem, Firewall");
+                                    }
+                                    libp2p::request_response::OutboundFailure::DialFailure { .. } => {
+                                        eprintln!("   → FEHLER-TYP: DialFailure (Verbindungsaufbau fehlgeschlagen)");
+                                        eprintln!("   → MÖGLICHE URSACHEN: Peer nicht erreichbar, Firewall, NAT-Problem");
+                                    }
+                                    libp2p::request_response::OutboundFailure::UnsupportedProtocols => {
+                                        eprintln!("   → FEHLER-TYP: UnsupportedProtocols (Protokoll nicht unterstützt)");
+                                    }
+                                    _ => {
+                                        eprintln!("   → FEHLER-TYP: {:?}", error);
+                                    }
+                                }
                                 
                                 // Robustheit: KEINE Reconnect-Versuche mehr bei Timeout - verhindert Reconnect-Sturm
                                 // Der Circuit Breaker in app.rs wird das Retry übernehmen
@@ -1316,7 +1356,7 @@ pub async fn run_discovery(
                                         // Tracke Request-ID
                                         {
                                             let mut pending = pending_chunk_requests_clone.lock().await;
-                                            pending.insert(request_id, (chunk_hash.clone(), game_id.clone(), peer_id.clone()));
+                                            pending.insert(request_id, (chunk_hash.clone(), game_id.clone(), peer_id.clone(), std::time::Instant::now()));
                                         }
                                         
                                         // Erhöhe aktive Request-Zahl

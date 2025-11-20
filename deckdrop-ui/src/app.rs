@@ -71,6 +71,7 @@ pub struct DeckDropApp {
     // Downloads
     pub active_downloads: HashMap<String, DownloadState>, // game_id -> DownloadState
     pub last_download_update: std::time::Instant, // Zeitpunkt der letzten Download-Update (für Throttling)
+    pub downloading_starting: std::collections::HashSet<String>, // game_id -> Download wird gerade gestartet (Button deaktivieren)
     
     // Chunk processing tracking (to prevent duplicate processing and enable parallel processing)
     pub processing_chunks: Arc<std::sync::Mutex<HashSet<String>>>, // chunk_hash -> in_progress
@@ -388,6 +389,7 @@ impl Default for DeckDropApp {
             network_games,
             peers: Vec::new(),
             active_downloads: HashMap::new(),
+            downloading_starting: std::collections::HashSet::new(),
             processing_chunks: Arc::new(std::sync::Mutex::new(HashSet::new())),
             requested_chunks: Arc::new(std::sync::Mutex::new(HashSet::new())),
             chunk_download_start_times: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -658,6 +660,7 @@ impl DeckDropApp {
             network_games,
             peers: Vec::new(),
             active_downloads,
+            downloading_starting: std::collections::HashSet::new(),
             processing_chunks: Arc::new(std::sync::Mutex::new(HashSet::new())),
             requested_chunks: Arc::new(std::sync::Mutex::new(HashSet::new())),
             chunk_download_start_times: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -921,14 +924,35 @@ impl DeckDropApp {
                     // Nicht return Task::none(), da die Datei möglicherweise bereits geschrieben wurde
                 }
                 
+                // WICHTIG: Prüfe ob deckdrop.toml und deckdrop_chunks.toml existieren
+                // Beide Dateien müssen vorhanden sein, damit das Spiel geladen werden kann
+                let deckdrop_toml_exists = game_path.join("deckdrop.toml").exists();
+                let deckdrop_chunks_toml_exists = game_path.join("deckdrop_chunks.toml").exists();
+                
+                if !deckdrop_toml_exists || !deckdrop_chunks_toml_exists {
+                    eprintln!("Error: Game files not ready yet. deckdrop.toml: {}, deckdrop_chunks.toml: {}", 
+                        deckdrop_toml_exists, deckdrop_chunks_toml_exists);
+                    // Warte nicht - das Spiel wird später automatisch geladen, wenn die Dateien vorhanden sind
+                }
+                
                 // Add game path to config
+                // WICHTIG: add_game_path speichert die Config automatisch
                 let mut config = deckdrop_core::Config::load();
                 if let Err(e) = config.add_game_path(&game_path) {
                     eprintln!("Error adding game path to config: {}", e);
+                } else {
+                    eprintln!("Game path {} added to config and saved", game_path.display());
                 }
                 
-                // Reload games list
+                // Update config in self
                 self.config = config.clone();
+                
+                // WICHTIG: Lade die Config NEU, um sicherzustellen, dass die Pfade expandiert sind
+                // (Config::load() expandiert Pfade automatisch)
+                self.config = deckdrop_core::Config::load();
+                
+                // Reload games list to ensure consistency
+                // Dies stellt sicher, dass alle Spiele korrekt geladen sind, einschließlich des neuen Spiels
                 self.my_games.clear();
                 self.game_integrity_status.clear();
                 
@@ -938,13 +962,18 @@ impl DeckDropApp {
                 }
                 
                 // 2. Lade Spiele aus den manuell hinzugefügten Pfaden (game_paths)
-                // Nur das Verzeichnis selbst prüfen, NICHT rekursiv Unterverzeichnisse
+                // WICHTIG: Die Pfade sind bereits expandiert durch Config::load()
                 for game_path_dir in &self.config.game_paths {
                     // Check if the path itself is a game (has deckdrop.toml)
                     if deckdrop_core::check_game_config_exists(game_path_dir) {
                         if let Ok(game_info) = deckdrop_core::GameInfo::load_from_path(game_path_dir) {
                             self.my_games.push((game_path_dir.clone(), game_info));
+                            eprintln!("Loaded game from path: {}", game_path_dir.display());
+                        } else {
+                            eprintln!("Warning: Could not load game info from {}", game_path_dir.display());
                         }
+                    } else {
+                        eprintln!("Warning: Game config does not exist at {}", game_path_dir.display());
                     }
                     // KEINE rekursive Suche in Unterverzeichnissen für game_paths
                     // Nur download_path wird rekursiv durchsucht
@@ -952,6 +981,8 @@ impl DeckDropApp {
                 
                 // Deduplicate games by game_id
                 self.deduplicate_games_by_id();
+                
+                eprintln!("Games list reloaded: {} games total (including newly added game)", self.my_games.len());
                 
                 // Mark the newly added game as "Intact" immediately (we just generated chunks, so we know it's valid)
                 self.game_integrity_status.insert(game_path.clone(), GameIntegrityStatus::Intact);
@@ -1005,6 +1036,9 @@ impl DeckDropApp {
                 self.handle_network_event(event);
             }
             Message::DownloadGame(game_id) => {
+                // WICHTIG: Markiere Download als gestartet, um Button zu deaktivieren
+                self.downloading_starting.insert(game_id.clone());
+                
                 // Find peer for this download
                 if let Some(peers) = self.network_games.get(&game_id) {
                     if let Some((peer_id, _)) = peers.first() {
@@ -1014,8 +1048,18 @@ impl DeckDropApp {
                                 peer_id: peer_id.clone(),
                                 game_id: game_id.clone(),
                             });
+                            eprintln!("Download gestartet für {} - Button deaktiviert", game_id);
+                        } else {
+                            // Fehler: Entferne aus downloading_starting, wenn Request nicht gesendet werden konnte
+                            self.downloading_starting.remove(&game_id);
                         }
+                    } else {
+                        // Fehler: Kein Peer gefunden - entferne aus downloading_starting
+                        self.downloading_starting.remove(&game_id);
                     }
+                } else {
+                    // Fehler: Keine Peers für dieses Spiel - entferne aus downloading_starting
+                    self.downloading_starting.remove(&game_id);
                 }
             }
             Message::PauseDownload(game_id) => {
@@ -1885,6 +1929,9 @@ impl DeckDropApp {
                 }
             }
             DiscoveryEvent::GameMetadataReceived { peer_id, game_id, deckdrop_toml, deckdrop_chunks_toml } => {
+                // WICHTIG: Entferne aus downloading_starting, da Download jetzt tatsächlich startet
+                self.downloading_starting.remove(&game_id);
+                
                 // Start download with received metadata
                 if let Err(e) = deckdrop_core::start_game_download(
                     &game_id,
@@ -2364,6 +2411,17 @@ impl DeckDropApp {
             DiscoveryEvent::ChunkRequestFailed { peer_id, chunk_hash, error } => {
                 eprintln!("ChunkRequestFailed: {} from {}: {}", chunk_hash, peer_id, error);
                 
+                // WICHTIG: Entferne Chunk SOFORT aus requested_chunks, damit neue Chunks angefordert werden können
+                // Der Chunk wird später wieder hinzugefügt, wenn der Retry gesendet wird
+                if let Ok(mut requested) = self.requested_chunks.lock() {
+                    requested.remove(&chunk_hash);
+                    eprintln!("Chunk {} aus requested_chunks entfernt (fehlgeschlagen) - neue Chunks können angefordert werden", chunk_hash);
+                }
+                // Entferne auch aus start_times
+                if let Ok(mut start_times) = self.chunk_download_start_times.lock() {
+                    start_times.remove(&chunk_hash);
+                }
+                
                 // Robustheit: Circuit Breaker - Blockiere Peer bei zu vielen Fehlern
                 if let Ok(mut perf_map) = self.peer_performance.lock() {
                     let perf = perf_map.entry(peer_id.clone()).or_insert_with(PeerPerformance::default);
@@ -2438,6 +2496,8 @@ impl DeckDropApp {
                         let network_games_clone = self.network_games.clone();
                         let peer_performance_clone = self.peer_performance.clone();
                         let chunk_retries_clone = self.chunk_retries.clone();
+                        let requested_chunks_for_task = self.requested_chunks.clone();
+                        let chunk_download_start_times_for_task = self.chunk_download_start_times.clone();
                         
                         std::thread::spawn(move || {
                             // Warte auf Backoff
@@ -2496,6 +2556,15 @@ impl DeckDropApp {
                                         ) {
                                             eprintln!("Fehler beim Senden von Retry-Chunk-Request für {}: {}", chunk_hash_for_task, e);
                                         } else {
+                                            // WICHTIG: Füge Chunk wieder zu requested_chunks hinzu, da Retry gesendet wurde
+                                            if let Ok(mut requested) = requested_chunks_for_task.lock() {
+                                                requested.insert(chunk_hash_for_task.clone());
+                                            }
+                                            // Tracke Startzeit für Retry
+                                            if let Ok(mut start_times) = chunk_download_start_times_for_task.lock() {
+                                                start_times.insert(chunk_hash_for_task.clone(), std::time::Instant::now());
+                                            }
+                                            
                                             println!("Retry Chunk-Request gesendet: {} an Peer {} (Retry #{}, Backoff: {}s)", 
                                                 chunk_hash_for_task, retry_peer_id, retry_count, backoff_seconds);
                                             
@@ -2522,12 +2591,8 @@ impl DeckDropApp {
                         Ok(retries) => retries.get(&chunk_hash).map(|r| r.retry_count).unwrap_or(0),
                         Err(_) => 0,
                     };
-                    eprintln!("Max Retries erreicht für Chunk {} ({} Retries)", chunk_hash, retry_count);
-                }
-                
-                // Entferne Chunk aus "angefordert" Set, damit er erneut angefordert werden kann
-                if let Ok(mut requested) = self.requested_chunks.lock() {
-                    requested.remove(&chunk_hash);
+                    eprintln!("Max Retries erreicht für Chunk {} ({} Retries) - Chunk wird nicht mehr angefordert", chunk_hash, retry_count);
+                    // Chunk bleibt aus requested_chunks entfernt (wurde bereits oben entfernt)
                 }
             }
         }
@@ -3516,11 +3581,19 @@ impl DeckDropApp {
                                     ]
                                     .spacing(scale(4.0))
                                 } else {
+                                    // Prüfe ob Download gerade gestartet wird
+                                    let is_starting = self.downloading_starting.contains(&game_id_clone);
                                     column![
-                                        button("Get this game")
-                                            .on_press(Message::DownloadGame(game_id_clone.clone()))
-                                            .style(button::primary)
-                                            .width(Length::Fixed(scale(180.0))),
+                                        if is_starting {
+                                            button("Starting...")
+                                                .style(button::secondary)
+                                                .width(Length::Fixed(scale(180.0)))
+                                        } else {
+                                            button("Get this game")
+                                                .on_press(Message::DownloadGame(game_id_clone.clone()))
+                                                .style(button::primary)
+                                                .width(Length::Fixed(scale(180.0)))
+                                        },
                                     ]
                                     .spacing(scale(4.0))
                                 },
@@ -4239,9 +4312,16 @@ impl DeckDropApp {
                         }
                     } else if is_network_game && !is_downloading {
                         // Network game without download: show Download button
-                        header_row = header_row.push(button("Download")
-                            .on_press(Message::DownloadGame(game_info.game_id.clone()))
-                            .style(button::primary));
+                        // Prüfe ob Download gerade gestartet wird
+                        let is_starting = self.downloading_starting.contains(&game_info.game_id);
+                        if is_starting {
+                            header_row = header_row.push(button("Starting...")
+                                .style(button::secondary));
+                        } else {
+                            header_row = header_row.push(button("Download")
+                                .on_press(Message::DownloadGame(game_info.game_id.clone()))
+                                .style(button::primary));
+                        }
                     }
                     
                     header_row
