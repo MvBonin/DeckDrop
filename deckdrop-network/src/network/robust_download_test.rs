@@ -328,8 +328,10 @@ file_size = {}
                                 eprintln!("❌ Chunk {} fehlgeschlagen: {}", chunk_hash, error);
                                 // Retry sollte automatisch passieren
                             }
-                        } else if let DiscoveryEvent::ChunkRequestSent { .. } = event {
-                            // Ignoriere ChunkRequestSent Events
+                        } else if let DiscoveryEvent::ChunkRequestSent { peer_id, chunk_hash, game_id } = event {
+                            if chunk_hash.starts_with(&format!("{}:", file1_hash)) {
+                                println!("✓ ChunkRequestSent Event empfangen: {} von {} für {}", chunk_hash, peer_id, game_id);
+                            }
                         }
                     }
                     Ok(None) => {

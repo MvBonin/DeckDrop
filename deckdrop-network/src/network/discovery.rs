@@ -1075,14 +1075,20 @@ pub async fn run_discovery(
                                                 let chunk_hash_clone = request.chunk_hash.clone();
                                                 let event_tx_for_upload = event_tx_clone.clone();
                                                 
-                                                // Sende Upload-Event (asynchron, blockiert nicht)
-                                                tokio::spawn(async move {
-                                                    let _ = event_tx_for_upload.send(DiscoveryEvent::ChunkUploaded {
-                                                        peer_id: peer_id_str,
-                                                        chunk_hash: chunk_hash_clone,
-                                                        chunk_size,
-                                                    }).await;
-                                                });
+                                                eprintln!("✅ Chunk {} gefunden ({} MB), sende Response an {}", 
+                                                    request.chunk_hash, chunk_size / (1024 * 1024), peer);
+                                                
+                                                // Sende Upload-Event (synchron, da schnell und nicht blockierend)
+                                                let event_tx_for_upload_clone = event_tx_for_upload.clone();
+                                                let peer_id_str_clone = peer_id_str.clone();
+                                                let chunk_hash_clone_upload = chunk_hash_clone.clone();
+                                                if let Err(e) = event_tx_for_upload_clone.send(DiscoveryEvent::ChunkUploaded {
+                                                    peer_id: peer_id_str_clone,
+                                                    chunk_hash: chunk_hash_clone_upload,
+                                                    chunk_size,
+                                                }).await {
+                                                    eprintln!("Fehler beim Senden von ChunkUploaded Event: {}", e);
+                                                }
                                                 
                                                 ChunkResponse { 
                                                     chunk_hash: request.chunk_hash.clone(),
@@ -1090,32 +1096,48 @@ pub async fn run_discovery(
                                                 }
                                             } else {
                                                 // Chunk nicht gefunden
-                                                eprintln!("Chunk {} nicht gefunden", request.chunk_hash);
+                                                eprintln!("❌ Chunk {} nicht gefunden", request.chunk_hash);
                                                 ChunkResponse { 
                                                     chunk_hash: request.chunk_hash.clone(),
                                                     chunk_data: Vec::new() 
                                                 }
                                             }
                                         } else {
+                                            eprintln!("⚠️ ChunkLoader nicht verfügbar für Chunk {}", request.chunk_hash);
                                             ChunkResponse { 
                                                 chunk_hash: request.chunk_hash.clone(),
                                                 chunk_data: Vec::new() 
                                             }
                                         };
-                                        let _ = swarm.behaviour_mut().chunks.send_response(channel, response);
+                                        
+                                        match swarm.behaviour_mut().chunks.send_response(channel, response) {
+                                            Ok(_) => {
+                                                eprintln!("✅ Chunk Response erfolgreich gesendet für hash: {} an {}", 
+                                                    request.chunk_hash, peer);
+                                            }
+                                            Err(e) => {
+                                                eprintln!("❌ Fehler beim Senden der Chunk Response für hash: {} an {}: {:?}", 
+                                                    request.chunk_hash, peer, e);
+                                            }
+                                        }
                                     }
                                     libp2p::request_response::Message::Response { request_id, response, .. } => {
                                         // Wir haben einen Chunk erhalten
                                         let peer_id_str = peer.to_string();
+                                        eprintln!("🔵 Chunk Response Message empfangen von {} (RequestId: {:?}, Response-Hash: {})", 
+                                            peer_id_str, request_id, response.chunk_hash);
                                         
                                         // Entferne Request aus Tracking und verwende getrackten Hash
                                         let (chunk_hash, game_id, peer_id_from_tracking, request_time) = {
                                             let mut pending = pending_chunk_requests_clone.lock().await;
-                                            pending.remove(&request_id)
-                                                .unwrap_or_else(|| {
-                                                    eprintln!("Warnung: Chunk Request {} nicht im Tracking gefunden, verwende Hash aus Response", request_id);
-                                                    (response.chunk_hash.clone(), "unknown".to_string(), peer_id_str.clone(), std::time::Instant::now())
-                                                })
+                                            if let Some((hash, gid, peer, time)) = pending.remove(&request_id) {
+                                                eprintln!("✅ Chunk Request {} im Tracking gefunden: hash={}, game_id={}", 
+                                                    request_id, hash, gid);
+                                                (hash, gid, peer, time)
+                                            } else {
+                                                eprintln!("⚠️ Warnung: Chunk Request {} nicht im Tracking gefunden, verwende Hash aus Response", request_id);
+                                                (response.chunk_hash.clone(), "unknown".to_string(), peer_id_str.clone(), std::time::Instant::now())
+                                            }
                                         };
                                         
                                         // Berechne Download-Dauer für Logging
@@ -1153,15 +1175,23 @@ pub async fn run_discovery(
                                         eprintln!("   → Geschwindigkeit: {:.2} MB/s", speed_mbps);
                                         
                                         // Sende Event mit chunk_hash (verwende getrackten Hash, nicht Response-Hash)
+                                        // WICHTIG: Klone chunk_data VOR dem tokio::spawn, da response moved wird
+                                        let chunk_data_clone = response.chunk_data.clone();
                                         let event_tx_for_chunk = event_tx_clone.clone();
                                         let chunk_hash_clone = chunk_hash.clone();
-                                        tokio::spawn(async move {
-                                            let _ = event_tx_for_chunk.send(DiscoveryEvent::ChunkReceived {
-                                                peer_id: peer_id_str,
-                                                chunk_hash: chunk_hash_clone,
-                                                chunk_data: response.chunk_data.clone(),
-                                            }).await;
-                                        });
+                                        let peer_id_str_clone = peer_id_str.clone();
+                                        
+                                        // Sende Event synchron (nicht in separatem Task), um Race Conditions zu vermeiden
+                                        // Das Event-Senden sollte schnell sein und blockiert nicht lange
+                                        if let Err(e) = event_tx_for_chunk.send(DiscoveryEvent::ChunkReceived {
+                                            peer_id: peer_id_str_clone,
+                                            chunk_hash: chunk_hash_clone,
+                                            chunk_data: chunk_data_clone,
+                                        }).await {
+                                            eprintln!("❌ Fehler beim Senden von ChunkReceived Event: {}", e);
+                                        } else {
+                                            eprintln!("✅ ChunkReceived Event erfolgreich gesendet für hash: {}", chunk_hash);
+                                        }
                                         
                                         // Verarbeite wartende Chunk-Requests aus der Warteschlange
                                         loop {
@@ -1398,6 +1428,16 @@ pub async fn run_discovery(
                                             peer_id, chunk_hash, request_id);
                                         eprintln!("Chunk Request aus Warteschlange gesendet an {} für hash: {} (RequestId: {:?})", 
                                             peer_id, chunk_hash, request_id);
+                                        
+                                        // WICHTIG: Sende Event, dass Chunk-Request erfolgreich gesendet wurde
+                                        // Dies ist kritisch, damit der Chunk in requested_chunks eingetragen wird
+                                        if let Err(e) = event_tx.send(DiscoveryEvent::ChunkRequestSent {
+                                            peer_id: peer_id.clone(),
+                                            chunk_hash: chunk_hash.clone(),
+                                            game_id: game_id.clone(),
+                                        }).await {
+                                            eprintln!("Fehler beim Senden von ChunkRequestSent Event: {}", e);
+                                        }
                                     } else {
                                         // Keine wartenden Requests mehr
                                         break;

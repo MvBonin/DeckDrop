@@ -355,6 +355,14 @@ impl Codec for ChunkCodec {
         io.read_exact(&mut hash_len_bytes).await?;
         let hash_len = u32::from_be_bytes(hash_len_bytes) as usize;
         
+        // Validierung: Hash-Länge sollte vernünftig sein (max 256 Bytes für einen Hash-String)
+        if hash_len > 256 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Hash-Länge zu groß: {} Bytes (max 256)", hash_len),
+            ));
+        }
+        
         // Lese chunk_hash
         let mut chunk_hash_bytes = vec![0u8; hash_len];
         io.read_exact(&mut chunk_hash_bytes).await?;
@@ -365,6 +373,15 @@ impl Codec for ChunkCodec {
         let mut len_bytes = [0u8; 4];
         io.read_exact(&mut len_bytes).await?;
         let data_len = u32::from_be_bytes(len_bytes) as usize;
+        
+        // Validierung: Chunk-Daten sollten maximal 15MB sein (10MB + Overhead für Sicherheit)
+        const MAX_CHUNK_SIZE: usize = 15 * 1024 * 1024; // 15MB
+        if data_len > MAX_CHUNK_SIZE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Chunk-Daten zu groß: {} Bytes (max {} Bytes)", data_len, MAX_CHUNK_SIZE),
+            ));
+        }
         
         // Lese Chunk-Daten
         let mut chunk_data = vec![0u8; data_len];
@@ -921,6 +938,14 @@ impl Codec for ChunkCodec {
         io.read_exact(&mut hash_len_bytes).await?;
         let hash_len = u32::from_be_bytes(hash_len_bytes) as usize;
         
+        // Validierung: Hash-Länge sollte vernünftig sein (max 256 Bytes für einen Hash-String)
+        if hash_len > 256 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Hash-Länge zu groß: {} Bytes (max 256)", hash_len),
+            ));
+        }
+        
         // Lese chunk_hash
         let mut chunk_hash_bytes = vec![0u8; hash_len];
         io.read_exact(&mut chunk_hash_bytes).await?;
@@ -931,6 +956,15 @@ impl Codec for ChunkCodec {
         let mut len_bytes = [0u8; 4];
         io.read_exact(&mut len_bytes).await?;
         let data_len = u32::from_be_bytes(len_bytes) as usize;
+        
+        // Validierung: Chunk-Daten sollten maximal 15MB sein (10MB + Overhead für Sicherheit)
+        const MAX_CHUNK_SIZE: usize = 15 * 1024 * 1024; // 15MB
+        if data_len > MAX_CHUNK_SIZE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Chunk-Daten zu groß: {} Bytes (max {} Bytes)", data_len, MAX_CHUNK_SIZE),
+            ));
+        }
         
         // Lese Chunk-Daten
         let mut chunk_data = vec![0u8; data_len];

@@ -79,6 +79,12 @@ pub struct DeckDropApp {
     // Chunk request tracking (to prevent requesting the same chunk multiple times)
     pub requested_chunks: Arc<std::sync::Mutex<HashSet<String>>>, // chunk_hash -> already requested
     
+    // Tracking: Welcher Peer hat welchen Chunk angefordert (für Load-Balancing und Deduplizierung)
+    pub chunk_peer_requests: Arc<std::sync::Mutex<HashMap<String, String>>>, // chunk_hash -> peer_id
+    
+    // Tracking: Wie viele aktive Requests pro Peer (für Load-Balancing)
+    pub active_requests_per_peer: Arc<std::sync::Mutex<HashMap<String, usize>>>, // peer_id -> Anzahl aktiver Requests
+    
     // Chunk download progress tracking (start time per chunk for progress calculation)
     pub chunk_download_start_times: Arc<std::sync::Mutex<HashMap<String, std::time::Instant>>>, // chunk_hash -> start_time
     
@@ -392,6 +398,8 @@ impl Default for DeckDropApp {
             downloading_starting: std::collections::HashSet::new(),
             processing_chunks: Arc::new(std::sync::Mutex::new(HashSet::new())),
             requested_chunks: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            chunk_peer_requests: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            active_requests_per_peer: Arc::new(std::sync::Mutex::new(HashMap::new())),
             chunk_download_start_times: Arc::new(std::sync::Mutex::new(HashMap::new())),
             writing_chunks: Arc::new(std::sync::Mutex::new(HashSet::new())),
             chunk_retries: Arc::new(std::sync::Mutex::new(HashMap::new())), // Robustheit: Retry-Tracking
@@ -663,6 +671,8 @@ impl DeckDropApp {
             downloading_starting: std::collections::HashSet::new(),
             processing_chunks: Arc::new(std::sync::Mutex::new(HashSet::new())),
             requested_chunks: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            chunk_peer_requests: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            active_requests_per_peer: Arc::new(std::sync::Mutex::new(HashMap::new())),
             chunk_download_start_times: Arc::new(std::sync::Mutex::new(HashMap::new())),
             writing_chunks: Arc::new(std::sync::Mutex::new(HashSet::new())),
             chunk_retries: Arc::new(std::sync::Mutex::new(HashMap::new())), // Robustheit: Retry-Tracking
@@ -2082,6 +2092,12 @@ impl DeckDropApp {
                     return;
                 }
                 
+                // Aktualisiere Tracking-Daten im UI-Thread BEVOR der Background-Thread startet
+                // (wird später im Thread aktualisiert, wenn Chunk fertig ist)
+                let chunk_peer_requests_for_thread = self.chunk_peer_requests.clone();
+                let active_requests_per_peer_for_thread = self.active_requests_per_peer.clone();
+                let peer_performance_for_thread = self.peer_performance.clone();
+                
                 // Verarbeite Chunk in einem separaten Thread, um die GUI nicht zu blockieren
                 let chunk_data_clone = chunk_data.clone();
                 let requested_chunks_for_thread = self.requested_chunks.clone(); // Clone für Thread
@@ -2168,7 +2184,20 @@ impl DeckDropApp {
                                                             }
                                                             // JETZT erst: Entferne Chunk aus "angefordert" Set, NACH erfolgreichem Manifest-Update
                                                             if let Ok(mut requested) = requested_chunks_for_thread.lock() {
-                                                                requested.remove(&chunk_hash_clone);
+                                                                if requested.remove(&chunk_hash_clone) {
+                                                                    // Reduziere aktive Request-Zahl für den Peer, der diesen Chunk angefordert hat
+                                                                    if let Ok(mut chunk_peers) = chunk_peer_requests_for_thread.lock() {
+                                                                        if let Some(peer_id) = chunk_peers.remove(&chunk_hash_clone) {
+                                                                            if let Ok(mut active_per_peer) = active_requests_per_peer_for_thread.lock() {
+                                                                                if let Some(count) = active_per_peer.get_mut(&peer_id) {
+                                                                                    if *count > 0 {
+                                                                                        *count -= 1;
+                                                                                    }
+                                                                                }
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                }
                                                             }
                                                             // Entferne Chunk aus "wird geschrieben" und Startzeit, da er jetzt fertig ist
                                                             if let Ok(mut writing) = writing_chunks_for_thread.lock() {
@@ -2250,48 +2279,109 @@ impl DeckDropApp {
                                                                                     
                                                                                     if !new_chunks.is_empty() {
                                                                                         let start_time = std::time::Instant::now();
-                                                                                        // Trage Chunks direkt in requested_chunks ein, BEVOR sie gesendet werden
-                                                                                        // Wenn der Request fehlschlägt, wird er in ChunkRequestFailed entfernt
-                                                                                        if let Ok(mut requested) = requested_chunks_for_thread.lock() {
-                                                                                            for chunk in &new_chunks {
-                                                                                                requested.insert(chunk.clone());
+                                                                                        
+                                                                                        // Filtere Chunks, die bereits angefordert wurden (verhindert doppelte Requests)
+                                                                                        let chunks_to_request: Vec<String> = {
+                                                                                            if let Ok(requested) = requested_chunks_for_thread.lock() {
+                                                                                                new_chunks.iter()
+                                                                                                    .filter(|chunk| !requested.contains(*chunk))
+                                                                                                    .cloned()
+                                                                                                    .collect()
+                                                                                            } else {
+                                                                                                new_chunks.clone()
                                                                                             }
-                                                                                        }
-                                                                                        if let Ok(mut start_times) = chunk_download_start_times_for_thread.lock() {
-                                                                                            for chunk in &new_chunks {
-                                                                                                start_times.insert(chunk.clone(), start_time);
-                                                                                            }
-                                                                                        }
+                                                                                        };
+                                                                                        
+                                                                                        if chunks_to_request.is_empty() {
+                                                                                            eprintln!("⚠️ Alle Chunks wurden bereits angefordert - überspringe");
+                                                                                        } else {
+                                                                                        
+                                                                                        // WICHTIG: Trage Chunks NICHT vorzeitig in requested_chunks ein!
+                                                                                        // Sie werden erst eingetragen, NACHDEM sie erfolgreich gesendet wurden (via ChunkRequestSent Event)
+                                                                                        // Dies verhindert, dass Chunks in requested_chunks bleiben, die nie gesendet wurden
                                                                                         
                                                                                         // Sende Requests für neue Chunks
-                                                                                        // Round-Robin-Verteilung über alle verfügbaren Peers für bessere Parallelisierung
-                                                                                        let peer_count = peer_ids.len();
-                                                                                        for (index, chunk_hash) in new_chunks.iter().enumerate() {
-                                                                                            let peer_id = if peer_count > 0 {
-                                                                                                &peer_ids[index % peer_count] // Round-Robin über Peers
-                                                                                            } else {
-                                                                                                continue;
+                                                                                        // Intelligente Peer-Auswahl mit Load-Balancing (im Thread mit geklonten Daten)
+                                                                                        for chunk_hash in chunks_to_request.iter() {
+                                                                                            // Wähle den besten Peer für diesen Chunk (Load-Balancing + Performance)
+                                                                                            // Finde den besten Peer (wenigste aktive Requests, gute Performance, unter Limit)
+                                                                                            let peer_id = {
+                                                                                                let active_per_peer_guard = active_requests_per_peer_for_thread.lock().ok();
+                                                                                                let perf_map_guard = peer_performance_for_thread.lock().ok();
+                                                                                                
+                                                                                                if let (Some(active_per_peer), Some(perf_map)) = (active_per_peer_guard, perf_map_guard) {
+                                                                                                    let mut best_peer: Option<String> = None;
+                                                                                                    let mut best_score = f64::NEG_INFINITY;
+                                                                                                    
+                                                                                                    for peer_id in &peer_ids {
+                                                                                                        // Prüfe ob Peer blockiert ist
+                                                                                                        let is_blocked = if let Some(perf) = perf_map.get(peer_id) {
+                                                                                                            if let Some(blocked_until) = perf.blocked_until {
+                                                                                                                std::time::Instant::now() < blocked_until
+                                                                                                            } else {
+                                                                                                                false
+                                                                                                            }
+                                                                                                        } else {
+                                                                                                            false
+                                                                                                        };
+                                                                                                        
+                                                                                                        if is_blocked {
+                                                                                                            continue; // Peer ist blockiert
+                                                                                                        }
+                                                                                                        
+                                                                                                        // Prüfe ob Peer unter Limit ist
+                                                                                                        // WICHTIG: Verwende das Netzwerk-Limit (10), nicht das globale Limit (15)
+                                                                                                        const MAX_REQUESTS_PER_PEER: usize = 10;
+                                                                                                        let active_count = active_per_peer.get(peer_id).copied().unwrap_or(0);
+                                                                                                        if active_count >= MAX_REQUESTS_PER_PEER {
+                                                                                                            continue; // Peer hat bereits zu viele aktive Requests
+                                                                                                        }
+                                                                                                        
+                                                                                                        // Berechne Score
+                                                                                                        let perf = perf_map.get(peer_id).cloned().unwrap_or_default();
+                                                                                                        let available_slots = MAX_REQUESTS_PER_PEER - active_count;
+                                                                                                        let performance_score = perf.download_speed_bytes_per_sec / 1_000_000.0;
+                                                                                                        let success_score = perf.success_rate * 100.0;
+                                                                                                        let slot_score = available_slots as f64 * 10.0;
+                                                                                                        let score = performance_score * 2.0 + success_score + slot_score - (active_count as f64 * 5.0);
+                                                                                                        
+                                                                                                        if score > best_score {
+                                                                                                            best_score = score;
+                                                                                                            best_peer = Some(peer_id.clone());
+                                                                                                        }
+                                                                                                    }
+                                                                                                    best_peer
+                                                                                                } else {
+                                                                                                    // Fallback: Round-Robin
+                                                                                                    let peer_count = peer_ids.len();
+                                                                                                    if peer_count > 0 {
+                                                                                                        Some(peer_ids[0].clone())
+                                                                                                    } else {
+                                                                                                        None
+                                                                                                    }
+                                                                                                }
                                                                                             };
                                                                                             
-                                                                                            if let Err(e) = tx.send(
-                                                                                                deckdrop_network::network::discovery::DownloadRequest::RequestChunk {
-                                                                                                    peer_id: peer_id.clone(),
-                                                                                                    chunk_hash: chunk_hash.clone(),
-                                                                                                    game_id: game_id.clone(),
+                                                                                            if let Some(peer_id) = peer_id {
+                                                                                                if let Err(e) = tx.send(
+                                                                                                    deckdrop_network::network::discovery::DownloadRequest::RequestChunk {
+                                                                                                        peer_id: peer_id.clone(),
+                                                                                                        chunk_hash: chunk_hash.clone(),
+                                                                                                        game_id: game_id.clone(),
+                                                                                                    }
+                                                                                                ) {
+                                                                                                    eprintln!("Fehler beim Senden von Chunk-Request für {}: {}", chunk_hash, e);
+                                                                                                    // Bei Sendefehler: Chunk wurde nie in requested_chunks eingetragen, also nichts zu entfernen
                                                                                                 }
-                                                                                            ) {
-                                                                                                eprintln!("Fehler beim Senden von Chunk-Request für {}: {}", chunk_hash, e);
-                                                                                                // Bei Sendefehler entferne Chunk aus requested_chunks
-                                                                                                if let Ok(mut requested) = requested_chunks_for_thread.lock() {
-                                                                                                    requested.remove(chunk_hash);
-                                                                                                }
-                                                                                                if let Ok(mut start_times) = chunk_download_start_times_for_thread.lock() {
-                                                                                                    start_times.remove(chunk_hash);
-                                                                                                }
+                                                                                                // Bei erfolgreichem tx.send() wird der Chunk via ChunkRequestSent Event in requested_chunks eingetragen
+                                                                                            } else {
+                                                                                                eprintln!("⚠️ Kein verfügbarer Peer für Chunk {} (alle Peers haben zu viele aktive Requests)", chunk_hash);
+                                                                                                // Chunk wurde nie in requested_chunks eingetragen, also nichts zu entfernen
                                                                                             }
                                                                                         }
                                                                                         eprintln!("[Download] {}: {}/{} active chunks. Requesting {} (chunk finished).", 
-                                                                                            game_id, requested_count, max_concurrent, new_chunks.len());
+                                                                                            game_id, requested_count, max_concurrent, chunks_to_request.len());
+                                                                                        }
                                                                                     }
                                                                                 }
                                                                             }
@@ -2361,17 +2451,8 @@ impl DeckDropApp {
                                                                 };
                                                                 
                                                                 if !new_chunks.is_empty() {
-                                                                    let start_time = std::time::Instant::now();
-                                                                    if let Ok(mut requested) = requested_chunks_for_thread.lock() {
-                                                                        for chunk in &new_chunks {
-                                                                            requested.insert(chunk.clone());
-                                                                        }
-                                                                    }
-                                                                    if let Ok(mut start_times) = chunk_download_start_times_for_thread.lock() {
-                                                                        for chunk in &new_chunks {
-                                                                            start_times.insert(chunk.clone(), start_time);
-                                                                        }
-                                                                    }
+                                                                    // WICHTIG: Trage Chunks NICHT vorzeitig in requested_chunks ein!
+                                                                    // Sie werden erst eingetragen, NACHDEM sie erfolgreich gesendet wurden (via ChunkRequestSent Event)
                                                                     
                                                                     let peer_count = peer_ids.len();
                                                                     for (index, chunk_hash) in new_chunks.iter().enumerate() {
@@ -2389,14 +2470,9 @@ impl DeckDropApp {
                                                                             }
                                                                         ) {
                                                                             eprintln!("Fehler beim Senden von Chunk-Request für {}: {}", chunk_hash, e);
-                                                                            // Entferne Chunk aus requested_chunks bei Fehler
-                                                                            if let Ok(mut requested) = requested_chunks_for_thread.lock() {
-                                                                                requested.remove(chunk_hash);
-                                                                            }
-                                                                            if let Ok(mut start_times) = chunk_download_start_times_for_thread.lock() {
-                                                                                start_times.remove(chunk_hash);
-                                                                            }
+                                                                            // Bei Sendefehler: Chunk wurde nie in requested_chunks eingetragen, also nichts zu entfernen
                                                                         }
+                                                                        // Bei erfolgreichem tx.send() wird der Chunk via ChunkRequestSent Event in requested_chunks eingetragen
                                                                     }
                                                                 }
                                                             }
@@ -2432,7 +2508,20 @@ impl DeckDropApp {
                 if let Ok(mut requested) = self.requested_chunks.lock() {
                     if !requested.contains(&chunk_hash) {
                         requested.insert(chunk_hash.clone());
+                        
+                        // Tracke welcher Peer diesen Chunk angefordert hat
+                        if let Ok(mut chunk_peers) = self.chunk_peer_requests.lock() {
+                            chunk_peers.insert(chunk_hash.clone(), peer_id.clone());
+                        }
+                        
+                        // Erhöhe aktive Request-Zahl für diesen Peer
+                        if let Ok(mut active_per_peer) = self.active_requests_per_peer.lock() {
+                            *active_per_peer.entry(peer_id.clone()).or_insert(0) += 1;
+                        }
+                        
                         eprintln!("Chunk {} in requested_chunks eingetragen (Request erfolgreich gesendet an {})", chunk_hash, peer_id);
+                    } else {
+                        eprintln!("⚠️ Chunk {} wurde bereits angefordert (ignoriere doppelten Request von {})", chunk_hash, peer_id);
                     }
                 }
                 if let Ok(mut start_times) = self.chunk_download_start_times.lock() {
@@ -2445,8 +2534,23 @@ impl DeckDropApp {
                 // WICHTIG: Entferne Chunk SOFORT aus requested_chunks, damit neue Chunks angefordert werden können
                 // Der Chunk wird später wieder hinzugefügt, wenn der Retry gesendet wird
                 if let Ok(mut requested) = self.requested_chunks.lock() {
-                    requested.remove(&chunk_hash);
-                    eprintln!("Chunk {} aus requested_chunks entfernt (fehlgeschlagen) - neue Chunks können angefordert werden", chunk_hash);
+                    if requested.remove(&chunk_hash) {
+                        // Reduziere aktive Request-Zahl für diesen Peer
+                        if let Ok(mut active_per_peer) = self.active_requests_per_peer.lock() {
+                            if let Some(count) = active_per_peer.get_mut(&peer_id) {
+                                if *count > 0 {
+                                    *count -= 1;
+                                }
+                            }
+                        }
+                        
+                        // Entferne Chunk-Peer-Mapping
+                        if let Ok(mut chunk_peers) = self.chunk_peer_requests.lock() {
+                            chunk_peers.remove(&chunk_hash);
+                        }
+                        
+                        eprintln!("Chunk {} aus requested_chunks entfernt (fehlgeschlagen) - neue Chunks können angefordert werden", chunk_hash);
+                    }
                 }
                 // Entferne auch aus start_times
                 if let Ok(mut start_times) = self.chunk_download_start_times.lock() {
@@ -2587,14 +2691,8 @@ impl DeckDropApp {
                                         ) {
                                             eprintln!("Fehler beim Senden von Retry-Chunk-Request für {}: {}", chunk_hash_for_task, e);
                                         } else {
-                                            // WICHTIG: Füge Chunk wieder zu requested_chunks hinzu, da Retry gesendet wurde
-                                            if let Ok(mut requested) = requested_chunks_for_task.lock() {
-                                                requested.insert(chunk_hash_for_task.clone());
-                                            }
-                                            // Tracke Startzeit für Retry
-                                            if let Ok(mut start_times) = chunk_download_start_times_for_task.lock() {
-                                                start_times.insert(chunk_hash_for_task.clone(), std::time::Instant::now());
-                                            }
+                                            // WICHTIG: Trage Chunk NICHT vorzeitig in requested_chunks ein!
+                                            // Er wird via ChunkRequestSent Event eingetragen, NACHDEM er erfolgreich gesendet wurde
                                             
                                             println!("Retry Chunk-Request gesendet: {} an Peer {} (Retry #{}, Backoff: {}s)", 
                                                 chunk_hash_for_task, retry_peer_id, retry_count, backoff_seconds);
@@ -2606,6 +2704,7 @@ impl DeckDropApp {
                                                     info.last_peer_id = retry_peer_id.clone();
                                                 }
                                             }
+                                            // Chunk wird via ChunkRequestSent Event in requested_chunks eingetragen
                                         }
                                     }
                                 } else {
@@ -2627,6 +2726,77 @@ impl DeckDropApp {
                 }
             }
         }
+    }
+    
+    /// Wählt den besten Peer für einen Chunk aus (Load-Balancing + Performance)
+    /// 
+    /// WICHTIG: max_chunks_per_peer sollte das Netzwerk-Limit (10) sein, nicht das globale Limit (15)
+    /// Das Netzwerk-Limit ist pro Peer, das globale Limit ist die Gesamtzahl aller aktiven Downloads
+    fn select_best_peer_for_chunk(
+        &self,
+        chunk_hash: &str,
+        available_peers: &[String],
+        max_chunks_per_peer: usize,
+    ) -> Option<String> {
+        // WICHTIG: Verwende das Netzwerk-Limit (10), nicht das globale Limit (15)
+        // Das Netzwerk-Limit ist pro Peer, das globale Limit ist die Gesamtzahl
+        const MAX_REQUESTS_PER_PEER: usize = 10;
+        let max_chunks_per_peer = max_chunks_per_peer.min(MAX_REQUESTS_PER_PEER);
+        // Prüfe ob Chunk bereits angefordert wurde
+        if let Ok(requested) = self.requested_chunks.lock() {
+            if requested.contains(chunk_hash) {
+                // Chunk wurde bereits angefordert - verwende den Peer, der ihn angefordert hat
+                if let Ok(chunk_peers) = self.chunk_peer_requests.lock() {
+                    if let Some(peer_id) = chunk_peers.get(chunk_hash) {
+                        return Some(peer_id.clone());
+                    }
+                }
+                // Chunk wurde angefordert, aber kein Peer-Mapping - sollte nicht passieren
+                return None;
+            }
+        }
+        
+        // Hole aktive Requests pro Peer und Peer-Performance
+        let active_per_peer = self.active_requests_per_peer.lock().ok()?;
+        let perf_map = self.peer_performance.lock().ok()?;
+        
+        // Finde den besten Peer (wenigste aktive Requests, gute Performance, unter Limit)
+        let mut best_peer: Option<String> = None;
+        let mut best_score = f64::NEG_INFINITY;
+        
+        for peer_id in available_peers {
+            // Prüfe ob Peer blockiert ist
+            if let Some(perf) = perf_map.get(peer_id) {
+                if let Some(blocked_until) = perf.blocked_until {
+                    if std::time::Instant::now() < blocked_until {
+                        continue; // Peer ist blockiert
+                    }
+                }
+            }
+            
+            // Prüfe ob Peer unter Limit ist
+            let active_count = active_per_peer.get(peer_id).copied().unwrap_or(0);
+            if active_count >= max_chunks_per_peer {
+                continue; // Peer hat bereits zu viele aktive Requests
+            }
+            
+            // Berechne Score: niedrige aktive Requests = besser, hohe Performance = besser
+            let perf = perf_map.get(peer_id).cloned().unwrap_or_default();
+            let available_slots = max_chunks_per_peer - active_count;
+            let performance_score = perf.download_speed_bytes_per_sec / 1_000_000.0; // MB/s
+            let success_score = perf.success_rate * 100.0; // 0-100
+            let slot_score = available_slots as f64 * 10.0; // Mehr verfügbare Slots = besser
+            
+            // Gesamt-Score: Performance + Success + Slots - aktive Requests
+            let score = performance_score * 2.0 + success_score + slot_score - (active_count as f64 * 5.0);
+            
+            if score > best_score {
+                best_score = score;
+                best_peer = Some(peer_id.clone());
+            }
+        }
+        
+        best_peer
     }
     
     /// Phase 4: Request missing chunks with adaptive limits based on peer performance
@@ -3117,48 +3287,50 @@ impl DeckDropApp {
                     if !new_chunks.is_empty() {
                         let start_time = std::time::Instant::now();
                         // WICHTIG: Trage Chunks direkt nach dem Senden in requested_chunks ein
-                        // Wenn der Request fehlschlägt, wird er in ChunkRequestFailed entfernt
-                        // Dies ist robuster als auf ChunkRequestSent Events zu warten
-                        if let Ok(mut requested) = self.requested_chunks.lock() {
-                            for chunk in &new_chunks {
-                                requested.insert(chunk.clone());
+                        // Filtere Chunks, die bereits angefordert wurden (verhindert doppelte Requests)
+                        let chunks_to_request: Vec<String> = {
+                            if let Ok(requested) = self.requested_chunks.lock() {
+                                new_chunks.iter()
+                                    .filter(|chunk| !requested.contains(*chunk))
+                                    .cloned()
+                                    .collect()
+                            } else {
+                                new_chunks.clone()
                             }
-                        }
-                        if let Ok(mut start_times) = self.chunk_download_start_times.lock() {
-                            for chunk in &new_chunks {
-                                start_times.insert(chunk.clone(), start_time);
-                            }
-                        }
+                        };
                         
-                        // Sende Requests für neue Chunks
-                        if let Some(tx) = crate::network_bridge::get_download_request_tx() {
-                            let peer_count = peer_ids.len();
-                            for (index, chunk_hash) in new_chunks.iter().enumerate() {
-                                let peer_id = if peer_count > 0 {
-                                    &peer_ids[index % peer_count] // Round-Robin über Peers
-                                } else {
-                                    continue;
-                                };
-                                
-                                if let Err(e) = tx.send(
-                                    deckdrop_network::network::discovery::DownloadRequest::RequestChunk {
-                                        peer_id: peer_id.clone(),
-                                        chunk_hash: chunk_hash.clone(),
-                                        game_id: game_id.clone(),
-                                    }
-                                ) {
-                                    eprintln!("Fehler beim Senden von Chunk-Request für {}: {}", chunk_hash, e);
-                                    // Bei Sendefehler entferne Chunk aus requested_chunks
-                                    if let Ok(mut requested) = self.requested_chunks.lock() {
-                                        requested.remove(chunk_hash);
-                                    }
-                                    if let Ok(mut start_times) = self.chunk_download_start_times.lock() {
-                                        start_times.remove(chunk_hash);
+                        if !chunks_to_request.is_empty() {
+                            // WICHTIG: Trage Chunks NICHT vorzeitig in requested_chunks ein!
+                            // Sie werden erst eingetragen, NACHDEM sie erfolgreich gesendet wurden (via ChunkRequestSent Event)
+                            // Dies verhindert, dass Chunks in requested_chunks bleiben, die nie gesendet wurden
+                            
+                            // Sende Requests für neue Chunks
+                            // Intelligente Peer-Auswahl mit Load-Balancing
+                            if let Some(tx) = crate::network_bridge::get_download_request_tx() {
+                                for chunk_hash in chunks_to_request.iter() {
+                                    // WICHTIG: Verwende das Netzwerk-Limit (10) für Peer-Auswahl, nicht das globale Limit (15)
+                                    // Das Netzwerk-Limit ist pro Peer, das globale Limit ist die Gesamtzahl
+                                    const MAX_REQUESTS_PER_PEER: usize = 10;
+                                    if let Some(peer_id) = self.select_best_peer_for_chunk(chunk_hash, &peer_ids, MAX_REQUESTS_PER_PEER) {
+                                        if let Err(e) = tx.send(
+                                            deckdrop_network::network::discovery::DownloadRequest::RequestChunk {
+                                                peer_id: peer_id.clone(),
+                                                chunk_hash: chunk_hash.clone(),
+                                                game_id: game_id.clone(),
+                                            }
+                                        ) {
+                                            eprintln!("Fehler beim Senden von Chunk-Request für {}: {}", chunk_hash, e);
+                                            // Bei Sendefehler: Chunk wurde nie in requested_chunks eingetragen, also nichts zu entfernen
+                                        }
+                                        // Bei erfolgreichem tx.send() wird der Chunk via ChunkRequestSent Event in requested_chunks eingetragen
+                                    } else {
+                                        eprintln!("⚠️ Kein verfügbarer Peer für Chunk {} (alle Peers haben zu viele aktive Requests)", chunk_hash);
+                                        // Chunk wurde nie in requested_chunks eingetragen, also nichts zu entfernen
                                     }
                                 }
+                                eprintln!("[Download] {}: {}/{} active chunks. Requesting {}.", 
+                                    game_id, requested_count, max_concurrent, chunks_to_request.len());
                             }
-                            eprintln!("[Download] {}: {}/{} active chunks. Requesting {}.", 
-                                game_id, requested_count, max_concurrent, new_chunks.len());
                         }
                     }
                 }
