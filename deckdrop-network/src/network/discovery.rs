@@ -258,10 +258,17 @@ pub async fn run_discovery(
     // Helper function to create agent_version from metadata
     let version = env!("CARGO_PKG_VERSION");
     let create_agent_version = |player_name: &Option<String>, games_count: &Option<u32>| {
-        // Robustheit: Nur "Unknown" verwenden wenn wirklich kein Name vorhanden ist
-        if player_name.is_some() || games_count.is_some() {
+        // Robustheit: Leere Namen wie "" nicht als echten Spielernamen behandeln
+        let normalized_name = player_name
+            .as_ref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+        
+        // Robustheit: Nur "Unknown" verwenden, wenn wirklich kein Name vorhanden ist
+        if normalized_name.is_some() || games_count.is_some() {
             let metadata = serde_json::json!({
-                "player_name": player_name.as_ref().map(|s| s.as_str()).unwrap_or("Unknown"),
+                "player_name": normalized_name.as_ref().map(|s| s.as_str()).unwrap_or("Unknown"),
                 "games_count": games_count.unwrap_or(0),
                 "version": version
             });

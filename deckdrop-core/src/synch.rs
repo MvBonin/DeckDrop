@@ -3,6 +3,8 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::io::{Seek, SeekFrom, Write};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 /// Manifest-Struktur für Download-Status
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -923,8 +925,57 @@ pub fn request_missing_chunks(
     Ok(())
 }
 
-/// Lädt alle aktiven Downloads aus SQLite-Datenbanken
+/// Zeitbasierter Cache für aktive Downloads (wird von mehreren Threads verwendet)
+struct ActiveDownloadsCache {
+    last_update: Instant,
+    data: Vec<(String, DownloadManifest)>,
+}
+
+static ACTIVE_DOWNLOADS_CACHE: OnceLock<Mutex<ActiveDownloadsCache>> = OnceLock::new();
+
+fn get_active_downloads_cache() -> &'static Mutex<ActiveDownloadsCache> {
+    ACTIVE_DOWNLOADS_CACHE.get_or_init(|| {
+        Mutex::new(ActiveDownloadsCache {
+            last_update: Instant::now()
+                .checked_sub(Duration::from_secs(60))
+                .unwrap_or_else(Instant::now),
+            data: Vec::new(),
+        })
+    })
+}
+
+/// Gibt die aktuell gecachten aktiven Downloads zurück, ohne das Dateisystem / SQLite zu berühren.
+/// 
+/// Wird vor allem von der UI verwendet, um den Main-Thread nicht mit I/O zu blockieren.
+pub fn get_active_downloads_cached_only() -> Vec<(String, DownloadManifest)> {
+    let cache = get_active_downloads_cache();
+    if let Ok(cache_guard) = cache.lock() {
+        return cache_guard.data.clone();
+    }
+    Vec::new()
+}
+
+/// Lädt alle aktiven Downloads aus SQLite-Datenbanken und aktualisiert den Cache.
+/// 
+/// WICHTIG: Diese Funktion kann teures I/O verursachen und sollte NICHT im UI-Thread
+/// aufgerufen werden. Verwende im UI stattdessen `get_active_downloads_cached_only()`.
 pub fn load_active_downloads() -> Vec<(String, DownloadManifest)> {
+    // Einfache Zeit-basierte Cache-Schicht:
+    // Viele Aufrufer fragen sehr häufig nach aktiven Downloads.
+    // Um die SQLite-DBs und das Dateisystem zu entlasten, cachen wir das Ergebnis
+    // für einen kurzen Zeitraum und geben in dieser Zeit eine Kopie zurück.
+
+    let cache = get_active_downloads_cache();
+
+    {
+        // Schnellpfad: Wenn die letzte Aktualisierung sehr frisch ist, gib eine Kopie zurück
+        if let Ok(cache_guard) = cache.lock() {
+            if cache_guard.last_update.elapsed() < Duration::from_millis(800) {
+                return cache_guard.data.clone();
+            }
+        }
+    }
+
     let base_dir = match directories::ProjectDirs::from("com", "deckdrop", "deckdrop") {
         Some(dir) => dir,
         None => return Vec::new(),
@@ -959,6 +1010,12 @@ pub fn load_active_downloads() -> Vec<(String, DownloadManifest)> {
                 }
             }
         }
+    }
+    
+    // Cache aktualisieren
+    if let Ok(mut cache_guard) = cache.lock() {
+        cache_guard.last_update = Instant::now();
+        cache_guard.data = downloads.clone();
     }
     
     downloads
@@ -1405,8 +1462,18 @@ file_size = {}
         
         println!("✓ Test erfolgreich: Zwei Peers haben Chunks ausgetauscht und Datei rekonstruiert!");
         
-        // Aufräumen: Lösche Test-Spiel (Manifest und Chunks-Verzeichnis)
+        // Aufräumen: Lösche Test-Spiel (Manifest, Chunks-Verzeichnis und Spielverzeichnis)
+        // 1. Manifest/chunks über cancel_game_download
         let _ = cancel_game_download(game_id);
+        
+        // 2. Spielverzeichnis unter download_path entfernen (wurde in prepare_download_with_progress angelegt)
+        let manifest_for_cleanup = DownloadManifest::load(&manifest_path).unwrap();
+        let game_dir = PathBuf::from(&manifest_for_cleanup.game_path);
+        if game_dir.exists() {
+            if let Err(e) = fs::remove_dir_all(&game_dir) {
+                eprintln!("Warnung: Konnte Test-Spielverzeichnis nicht löschen ({}): {}", game_dir.display(), e);
+            }
+        }
         
         // TempDir wird automatisch gelöscht wenn es out of scope geht
     }
@@ -1724,7 +1791,6 @@ file_size = {}
     
     #[test]
     fn test_prepare_download_with_progress_callback_frequency() {
-        use tempfile::TempDir;
         use std::sync::{Arc, Mutex};
         use std::time::{SystemTime, UNIX_EPOCH};
         
@@ -1804,6 +1870,21 @@ description = "Test"
         if result.is_ok() {
             let manifest_path = get_manifest_path(&game_id).unwrap();
             assert!(manifest_path.exists(), "Manifest sollte erstellt worden sein");
+            
+            // Lade Manifest, um das Spielverzeichnis zu ermitteln
+            if let Ok(manifest) = DownloadManifest::load(&manifest_path) {
+                let game_dir = PathBuf::from(&manifest.game_path);
+                
+                // Aufräumen: Lösche Spielverzeichnis im Download-Pfad
+                if game_dir.exists() {
+                    if let Err(e) = fs::remove_dir_all(&game_dir) {
+                        eprintln!("Warnung: Konnte Test-Spielverzeichnis nicht löschen ({}): {}", game_dir.display(), e);
+                    }
+                }
+            }
+            
+            // Aufräumen: Lösche Manifest + Chunks-Verzeichnis über cancel_game_download
+            let _ = cancel_game_download(&game_id);
         }
     }
 }
