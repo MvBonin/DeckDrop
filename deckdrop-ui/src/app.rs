@@ -71,8 +71,8 @@ pub struct DeckDropApp {
     // Downloads
     pub active_downloads: HashMap<String, DownloadState>, // game_id -> DownloadState
     pub last_download_update: std::time::Instant, // Zeitpunkt der letzten Download-Update (für Throttling)
-    pub downloading_starting: std::collections::HashSet<String>, // game_id -> Download wird gerade gestartet (Button deaktivieren)
-    pub preparing_downloads: HashMap<String, (usize, usize)>, // game_id -> (current_files, total_files) für Pre-Allocation-Progress
+    pub downloading_starting: Arc<std::sync::Mutex<std::collections::HashSet<String>>>, // game_id -> Download wird gerade gestartet (Button deaktivieren) - thread-safe
+    pub preparing_downloads: Arc<std::sync::Mutex<HashMap<String, (usize, usize)>>>, // game_id -> (current_files, total_files) für Pre-Allocation-Progress - thread-safe
     
     // Chunk processing tracking (to prevent duplicate processing and enable parallel processing)
     pub processing_chunks: Arc<std::sync::Mutex<HashSet<String>>>, // chunk_hash -> in_progress
@@ -396,8 +396,8 @@ impl Default for DeckDropApp {
             network_games,
             peers: Vec::new(),
             active_downloads: HashMap::new(),
-            downloading_starting: std::collections::HashSet::new(),
-            preparing_downloads: HashMap::new(),
+            downloading_starting: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            preparing_downloads: Arc::new(std::sync::Mutex::new(HashMap::new())),
             processing_chunks: Arc::new(std::sync::Mutex::new(HashSet::new())),
             requested_chunks: Arc::new(std::sync::Mutex::new(HashSet::new())),
             chunk_peer_requests: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -672,8 +672,8 @@ impl DeckDropApp {
             network_games,
             peers: Vec::new(),
             active_downloads,
-            downloading_starting: std::collections::HashSet::new(),
-            preparing_downloads: HashMap::new(),
+            downloading_starting: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            preparing_downloads: Arc::new(std::sync::Mutex::new(HashMap::new())),
             processing_chunks: Arc::new(std::sync::Mutex::new(HashSet::new())),
             requested_chunks: Arc::new(std::sync::Mutex::new(HashSet::new())),
             chunk_peer_requests: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -1052,7 +1052,9 @@ impl DeckDropApp {
             }
             Message::DownloadGame(game_id) => {
                 // WICHTIG: Markiere Download als gestartet, um Button zu deaktivieren
-                self.downloading_starting.insert(game_id.clone());
+                if let Ok(mut starting) = self.downloading_starting.lock() {
+                    starting.insert(game_id.clone());
+                }
                 
                 // Find peer for this download
                 if let Some(peers) = self.network_games.get(&game_id) {
@@ -1066,15 +1068,21 @@ impl DeckDropApp {
                             eprintln!("Download gestartet für {} - Button deaktiviert", game_id);
                         } else {
                             // Fehler: Entferne aus downloading_starting, wenn Request nicht gesendet werden konnte
-                            self.downloading_starting.remove(&game_id);
+                            if let Ok(mut starting) = self.downloading_starting.lock() {
+                                starting.remove(&game_id);
+                            }
                         }
                     } else {
                         // Fehler: Kein Peer gefunden - entferne aus downloading_starting
-                        self.downloading_starting.remove(&game_id);
+                        if let Ok(mut starting) = self.downloading_starting.lock() {
+                            starting.remove(&game_id);
+                        }
                     }
                 } else {
                     // Fehler: Keine Peers für dieses Spiel - entferne aus downloading_starting
-                    self.downloading_starting.remove(&game_id);
+                    if let Ok(mut starting) = self.downloading_starting.lock() {
+                        starting.remove(&game_id);
+                    }
                 }
             }
             Message::PauseDownload(game_id) => {
@@ -1131,19 +1139,29 @@ impl DeckDropApp {
                 // Remove from active downloads
                 self.active_downloads.remove(&game_id);
                 // Remove from preparing downloads
-                self.preparing_downloads.remove(&game_id);
+                if let Ok(mut preparing) = self.preparing_downloads.lock() {
+                    preparing.remove(&game_id);
+                }
+                // Remove from downloading_starting
+                if let Ok(mut starting) = self.downloading_starting.lock() {
+                    starting.remove(&game_id);
+                }
             }
             Message::UpdateDownloadPreparationProgress(game_id, current, total) => {
                 // Aktualisiere Progress für Pre-Allocation
                 // WICHTIG: Diese Messages werden normalerweise im Tick-Handler verarbeitet,
                 // aber falls sie hier ankommen (z.B. durch direkten Aufruf), verarbeiten wir sie auch hier
-                self.preparing_downloads.insert(game_id, (current, total));
+                if let Ok(mut preparing) = self.preparing_downloads.lock() {
+                    preparing.insert(game_id, (current, total));
+                }
             }
             Message::DownloadPrepared(game_id, result) => {
                 // WICHTIG: Diese Messages werden normalerweise im Tick-Handler verarbeitet,
                 // aber falls sie hier ankommen (z.B. durch direkten Aufruf), verarbeiten wir sie auch hier
                 // Entferne aus preparing_downloads
-                self.preparing_downloads.remove(&game_id);
+                if let Ok(mut preparing) = self.preparing_downloads.lock() {
+                    preparing.remove(&game_id);
+                }
                 
                 match result {
                     Ok(()) => {
@@ -1183,7 +1201,9 @@ impl DeckDropApp {
                     Err(e) => {
                         eprintln!("Error preparing download for {}: {}", game_id, e);
                         // Entferne aus downloading_starting, damit Button wieder aktiviert wird
-                        self.downloading_starting.remove(&game_id);
+                        if let Ok(mut starting) = self.downloading_starting.lock() {
+                            starting.remove(&game_id);
+                        }
                     }
                 }
             }
@@ -1527,12 +1547,16 @@ impl DeckDropApp {
                         for msg in messages {
                             match msg {
                                 Message::UpdateDownloadPreparationProgress(game_id, current, total) => {
-                                    // Aktualisiere Progress direkt
-                                    self.preparing_downloads.insert(game_id, (current, total));
+                                    // Aktualisiere Progress direkt (thread-safe)
+                                    if let Ok(mut preparing) = self.preparing_downloads.lock() {
+                                        preparing.insert(game_id, (current, total));
+                                    }
                                 }
                                 Message::DownloadPrepared(game_id, result) => {
-                                    // Entferne aus preparing_downloads
-                                    self.preparing_downloads.remove(&game_id);
+                                    // Entferne aus preparing_downloads (thread-safe)
+                                    if let Ok(mut preparing) = self.preparing_downloads.lock() {
+                                        preparing.remove(&game_id);
+                                    }
                                     
                                     match result {
                                         Ok(()) => {
@@ -1572,7 +1596,9 @@ impl DeckDropApp {
                                         Err(e) => {
                                             eprintln!("Error preparing download for {}: {}", game_id, e);
                                             // Entferne aus downloading_starting, damit Button wieder aktiviert wird
-                                            self.downloading_starting.remove(&game_id);
+                                            if let Ok(mut starting) = self.downloading_starting.lock() {
+                                                starting.remove(&game_id);
+                                            }
                                         }
                                     }
                                 }
@@ -2074,7 +2100,9 @@ impl DeckDropApp {
             }
             DiscoveryEvent::GameMetadataReceived { peer_id, game_id, deckdrop_toml, deckdrop_chunks_toml } => {
                 // WICHTIG: Entferne aus downloading_starting, da Pre-Allocation jetzt startet
-                self.downloading_starting.remove(&game_id);
+                if let Ok(mut starting) = self.downloading_starting.lock() {
+                    starting.remove(&game_id);
+                }
                 
                 // Parse deckdrop_chunks.toml um die Anzahl der Dateien zu bestimmen
                 #[derive(serde::Deserialize)]
@@ -2085,8 +2113,10 @@ impl DeckDropApp {
                     .map(|ct| ct.file.len())
                     .unwrap_or(0);
                 
-                // Setze initialen Progress
-                self.preparing_downloads.insert(game_id.clone(), (0, total_files));
+                // Setze initialen Progress (thread-safe)
+                if let Ok(mut preparing) = self.preparing_downloads.lock() {
+                    preparing.insert(game_id.clone(), (0, total_files));
+                }
                 
                 // Starte Pre-Allocation in einem separaten Thread
                 let game_id_clone = game_id.clone();
@@ -2135,7 +2165,9 @@ impl DeckDropApp {
                     });
                 } else {
                     eprintln!("Error: Download-Preparation-Message-Sender nicht verfügbar");
-                    self.preparing_downloads.remove(&game_id);
+                    if let Ok(mut preparing) = self.preparing_downloads.lock() {
+                        preparing.remove(&game_id);
+                    }
                 }
             }
             DiscoveryEvent::ChunkUploaded { peer_id: _, chunk_hash, chunk_size } => {
@@ -3930,15 +3962,25 @@ impl DeckDropApp {
                                     ]
                                     .spacing(scale(4.0))
                                 } else {
-                                    // Prüfe ob Download gerade vorbereitet wird
-                                    let is_preparing = self.preparing_downloads.contains_key(&game_id_clone);
-                                    let is_starting = self.downloading_starting.contains(&game_id_clone);
+                                    // Prüfe ob Download gerade vorbereitet wird (thread-safe)
+                                    let is_preparing = if let Ok(preparing) = self.preparing_downloads.lock() {
+                                        preparing.contains_key(&game_id_clone)
+                                    } else {
+                                        false
+                                    };
+                                    let is_starting = if let Ok(starting) = self.downloading_starting.lock() {
+                                        starting.contains(&game_id_clone)
+                                    } else {
+                                        false
+                                    };
                                     
                                     if is_preparing {
-                                        // Zeige Ladebalken für Pre-Allocation
-                                        let (current, total) = self.preparing_downloads.get(&game_id_clone)
-                                            .copied()
-                                            .unwrap_or((0, 1));
+                                        // Zeige Ladebalken für Pre-Allocation (thread-safe)
+                                        let (current, total) = if let Ok(preparing) = self.preparing_downloads.lock() {
+                                            preparing.get(&game_id_clone).copied().unwrap_or((0, 1))
+                                        } else {
+                                            (0, 1)
+                                        };
                                         let progress = if total > 0 {
                                             current as f32 / total as f32
                                         } else {
@@ -4684,15 +4726,25 @@ impl DeckDropApp {
                                 .style(button::primary));
                         }
                     } else if is_network_game && !is_downloading {
-                        // Network game without download: show Download button or preparation progress
-                        let is_preparing = self.preparing_downloads.contains_key(&game_info.game_id);
-                        let is_starting = self.downloading_starting.contains(&game_info.game_id);
+                        // Network game without download: show Download button or preparation progress (thread-safe)
+                        let is_preparing = if let Ok(preparing) = self.preparing_downloads.lock() {
+                            preparing.contains_key(&game_info.game_id)
+                        } else {
+                            false
+                        };
+                        let is_starting = if let Ok(starting) = self.downloading_starting.lock() {
+                            starting.contains(&game_info.game_id)
+                        } else {
+                            false
+                        };
                         
                         if is_preparing {
-                            // Zeige Ladebalken für Pre-Allocation
-                            let (current, total) = self.preparing_downloads.get(&game_info.game_id)
-                                .copied()
-                                .unwrap_or((0, 1));
+                            // Zeige Ladebalken für Pre-Allocation (thread-safe)
+                            let (current, total) = if let Ok(preparing) = self.preparing_downloads.lock() {
+                                preparing.get(&game_info.game_id).copied().unwrap_or((0, 1))
+                            } else {
+                                (0, 1)
+                            };
                             let progress = if total > 0 {
                                 current as f32 / total as f32
                             } else {
