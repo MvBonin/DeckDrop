@@ -1527,10 +1527,19 @@ impl DeckDropApp {
                 }
                 
                 // Check for Network events (non-blocking) via global access
+                // WICHTIG: Begrenze Anzahl verarbeiteter Events pro Tick, um GUI-Freeze zu vermeiden
+                const MAX_EVENTS_PER_TICK: usize = 10;
                 if let Some(rx) = crate::network_bridge::get_network_event_rx() {
                     if let Ok(mut rx) = rx.lock() {
-                        while let Ok(event) = rx.try_recv() {
-                            self.handle_network_event(event);
+                        let mut events_processed = 0;
+                        while events_processed < MAX_EVENTS_PER_TICK {
+                            match rx.try_recv() {
+                                Ok(event) => {
+                                    self.handle_network_event(event);
+                                    events_processed += 1;
+                                }
+                                Err(_) => break, // Keine weiteren Events verfügbar
+                            }
                         }
                     }
                 }
@@ -1541,10 +1550,12 @@ impl DeckDropApp {
                     if let Ok(rx) = rx.lock() {
                         let mut messages = Vec::new();
                         while let Ok(msg) = rx.try_recv() {
+                            eprintln!("Tick: Empfange Download-Preparation-Message: {:?}", msg);
                             messages.push(msg);
                         }
                         // Verarbeite alle Messages direkt, ohne update() erneut aufzurufen
                         for msg in messages {
+                            eprintln!("Tick: Verarbeite Download-Preparation-Message: {:?}", msg);
                             match msg {
                                 Message::UpdateDownloadPreparationProgress(game_id, current, total) => {
                                     // Aktualisiere Progress direkt (thread-safe)
@@ -2125,8 +2136,10 @@ impl DeckDropApp {
                 
                 // Hole den Message-Sender für Download-Preparation
                 if let Some(tx) = crate::get_download_prep_tx() {
+                    eprintln!("GameMetadataReceived: Starte Pre-Allocation für {}", game_id);
                     std::thread::spawn(move || {
                         let mut last_sent_progress = 0;
+                        eprintln!("Pre-Allocation Thread gestartet für {}", game_id_clone);
                         // Führe Pre-Allocation durch
                         let result = deckdrop_core::prepare_download_with_progress(
                             &game_id_clone,
@@ -2147,27 +2160,55 @@ impl DeckDropApp {
                                 if progress_percent >= last_sent_progress + 5 || 
                                    current % 10 == 0 || 
                                    current == total {
-                                    let _ = tx.send(Message::UpdateDownloadPreparationProgress(
+                                    eprintln!("Pre-Allocation Progress: {}/{} ({}%)", current, total, progress_percent);
+                                    if let Err(e) = tx.send(Message::UpdateDownloadPreparationProgress(
                                         game_id_clone.clone(),
                                         current,
                                         total,
-                                    ));
+                                    )) {
+                                        eprintln!("Fehler beim Senden von Progress-Update: {}", e);
+                                    }
                                     last_sent_progress = progress_percent;
                                 }
                             },
                         );
                         
+                        match &result {
+                            Ok(_) => eprintln!("Pre-Allocation abgeschlossen für {}: OK", game_id_clone),
+                            Err(e) => eprintln!("Pre-Allocation abgeschlossen für {}: Fehler: {}", game_id_clone, e),
+                        }
+                        
                         // Sende Ergebnis
-                        let _ = tx.send(Message::DownloadPrepared(
+                        if let Err(e) = tx.send(Message::DownloadPrepared(
                             game_id_clone.clone(),
                             result.map_err(|e| e.to_string()),
-                        ));
+                        )) {
+                            eprintln!("Fehler beim Senden von DownloadPrepared: {}", e);
+                        }
                     });
                 } else {
-                    eprintln!("Error: Download-Preparation-Message-Sender nicht verfügbar");
+                    eprintln!("ERROR: Download-Preparation-Message-Sender nicht verfügbar für {}", game_id);
+                    // Entferne aus preparing_downloads und downloading_starting
                     if let Ok(mut preparing) = self.preparing_downloads.lock() {
                         preparing.remove(&game_id);
                     }
+                    if let Ok(mut starting) = self.downloading_starting.lock() {
+                        starting.remove(&game_id);
+                    }
+                }
+            }
+            DiscoveryEvent::GameMetadataRequestFailed { peer_id, game_id, error } => {
+                eprintln!("GameMetadataRequestFailed: game_id={} from peer={}, error={}", game_id, peer_id, error);
+                
+                // WICHTIG: Entferne aus downloading_starting, damit Button wieder aktiv wird
+                if let Ok(mut starting) = self.downloading_starting.lock() {
+                    starting.remove(&game_id);
+                    eprintln!("GameMetadataRequestFailed: {} aus downloading_starting entfernt", game_id);
+                }
+                
+                // Entferne auch aus preparing_downloads falls vorhanden
+                if let Ok(mut preparing) = self.preparing_downloads.lock() {
+                    preparing.remove(&game_id);
                 }
             }
             DiscoveryEvent::ChunkUploaded { peer_id: _, chunk_hash, chunk_size } => {
@@ -2270,8 +2311,9 @@ impl DeckDropApp {
                 let active_requests_per_peer_for_thread = self.active_requests_per_peer.clone();
                 let peer_performance_for_thread = self.peer_performance.clone();
                 
-                // Verarbeite Chunk in einem separaten Thread, um die GUI nicht zu blockieren
-                let chunk_data_clone = chunk_data.clone();
+                // WICHTIG: Verschiebe chunk_data direkt in den Thread (move), um Klonen im UI-Thread zu vermeiden
+                // Dies verhindert GUI-Freeze bei großen Chunks (10MB+)
+                // Klone chunk_data erst im Background-Thread, nicht im UI-Thread
                 let requested_chunks_for_thread = self.requested_chunks.clone(); // Clone für Thread
                 let chunk_download_start_times_for_thread = self.chunk_download_start_times.clone(); // Clone für Thread
                 let writing_chunks_for_thread = self.writing_chunks.clone(); // Clone für Thread
@@ -2286,8 +2328,14 @@ impl DeckDropApp {
                     })
                 });
                 
+                // WICHTIG: Bewege chunk_data direkt in den Thread (ohne vorheriges Klonen im UI-Thread)
+                // Das Klonen passiert erst im Background-Thread, wenn nötig
+                let chunk_data_for_thread = chunk_data; // Move statt Clone
+                
                 // Spawn background thread für Chunk-Verarbeitung
                 std::thread::spawn(move || {
+                    // Verwende chunk_data direkt (wurde bereits in den Thread bewegt)
+                    // Klone nur wenn nötig für Funktionen, die Ownership benötigen
                     // Drop-Guard: Entfernt Chunk aus "in Verarbeitung" Set am Ende (egal ob Erfolg oder Fehler)
                     struct ChunkProcessingGuard {
                         processing_chunks: Arc<std::sync::Mutex<HashSet<String>>>,
@@ -2315,7 +2363,8 @@ impl DeckDropApp {
                                 // Überspringe wenn pausiert
                                 if !matches!(manifest.overall_status, deckdrop_core::DownloadStatus::Paused) {
                                     // Robustheit: Validiere Chunk-Größe vor Speicherung
-                                    if let Err(e) = deckdrop_core::validate_chunk_size(&chunk_hash_clone, &chunk_data_clone, &manifest) {
+                                    // Verwende chunk_data_for_thread direkt (kein Clone nötig, da &[u8])
+                                    if let Err(e) = deckdrop_core::validate_chunk_size(&chunk_hash_clone, &chunk_data_for_thread, &manifest) {
                                         eprintln!("Chunk-Validierung fehlgeschlagen für {}: {}", chunk_hash_clone, e);
                                         // Entferne Chunk aus "angefordert" Set, damit Retry möglich ist
                                         if let Ok(mut requested) = requested_chunks_for_thread.lock() {
@@ -2335,8 +2384,9 @@ impl DeckDropApp {
                                     
                                     // Schreibe Chunk direkt in die finale Datei (Piece-by-Piece Writing)
                                     // Lade Manifest für write_chunk_to_file
+                                    // Verwende chunk_data_for_thread direkt (kein Clone nötig, da &[u8])
                                     if let Ok(manifest_for_write) = deckdrop_core::DownloadManifest::load(&manifest_path) {
-                                        match deckdrop_core::write_chunk_to_file(&chunk_hash_clone, &chunk_data_clone, &manifest_for_write) {
+                                        match deckdrop_core::write_chunk_to_file(&chunk_hash_clone, &chunk_data_for_thread, &manifest_for_write) {
                                             Ok(()) => {
                                                 // Robustheit: Atomares Manifest-Update mit SQLite (verhindert Race Conditions)
                                                 // WICHTIG: Entferne Chunk erst NACH erfolgreichem Manifest-Update aus requested_chunks!

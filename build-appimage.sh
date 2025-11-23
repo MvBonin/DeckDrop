@@ -12,6 +12,13 @@ if [ ! -f "Cargo.toml" ]; then
     exit 1
 fi
 
+# Lösche alte AppImage falls vorhanden
+APPIMAGE_NAME="DeckDrop-x86_64.AppImage"
+if [ -f "$APPIMAGE_NAME" ]; then
+    echo "Lösche alte AppImage: $APPIMAGE_NAME"
+    rm -f "$APPIMAGE_NAME"
+fi
+
 # Schritt 1: Prüfe Dependencies
 echo ""
 echo "=== Prüfe Dependencies ==="
@@ -193,14 +200,6 @@ fi
 # Schritt 5: Baue AppImage
 echo ""
 echo "=== Baue AppImage ==="
-
-APPIMAGE_NAME="DeckDrop-x86_64.AppImage"
-
-# Lösche altes AppImage falls vorhanden
-if [ -f "$APPIMAGE_NAME" ]; then
-    echo "Lösche altes AppImage..."
-    rm -f "$APPIMAGE_NAME"
-fi
 
 ./"$APPIMAGETOOL" AppDir "$APPIMAGE_NAME"
 

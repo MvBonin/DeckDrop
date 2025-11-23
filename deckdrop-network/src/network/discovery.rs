@@ -40,6 +40,11 @@ pub enum DiscoveryEvent {
         deckdrop_toml: String,
         deckdrop_chunks_toml: String,
     },
+    GameMetadataRequestFailed {
+        peer_id: String,
+        game_id: String,
+        error: String,
+    },
     ChunkReceived {
         peer_id: String,
         chunk_hash: String,
@@ -602,6 +607,8 @@ pub async fn run_discovery(
                                     addrs.get(&peer_id).cloned()
                                 };
                                 
+                                let mut reconnect_failed = false;
+                                
                                 if let Some(addr) = addr_opt {
                                     let addr_with_peer = if addr.iter().any(|p| matches!(p, libp2p::multiaddr::Protocol::P2p(_))) {
                                         addr.clone()
@@ -611,16 +618,44 @@ pub async fn run_discovery(
                                     
                                     if let Err(e) = swarm.dial(addr_with_peer) {
                                         eprintln!("Reconnect fehlgeschlagen für {}: {}", peer_id, e);
+                                        reconnect_failed = true;
                                     } else {
                                         println!("Reconnect initiiert für {}, warte auf Verbindung...", peer_id);
-                                        // Warte kurz auf Verbindung
-                                        tokio::time::sleep(Duration::from_millis(500)).await;
+                                        eprintln!("Reconnect initiiert für {}, warte auf Verbindung...", peer_id);
+                                        // Warte länger auf Verbindung (bis zu 3 Sekunden mit Retries)
+                                        let mut connected = false;
+                                        for _ in 0..6 {
+                                            tokio::time::sleep(Duration::from_millis(500)).await;
+                                            if swarm.connected_peers().any(|p| p == &peer_id_parsed) {
+                                                connected = true;
+                                                println!("Peer {} erfolgreich verbunden nach Reconnect", peer_id);
+                                                eprintln!("Peer {} erfolgreich verbunden nach Reconnect", peer_id);
+                                                break;
+                                            }
+                                        }
+                                        if !connected {
+                                            eprintln!("Peer {} nicht verbunden nach 3 Sekunden Wartezeit", peer_id);
+                                        }
                                     }
+                                } else {
+                                    eprintln!("Keine Adresse für Peer {} gefunden", peer_id);
+                                    reconnect_failed = true;
                                 }
                                 
                                 // Prüfe erneut, ob Peer jetzt verbunden ist
                                 if !swarm.connected_peers().any(|p| p == &peer_id_parsed) {
                                     eprintln!("Peer {} immer noch nicht verbunden nach Reconnect-Versuch", peer_id);
+                                    
+                                    // Sende Event an UI, damit Button wieder aktiv wird
+                                    let _ = event_tx_clone.send(DiscoveryEvent::GameMetadataRequestFailed {
+                                        peer_id: peer_id.clone(),
+                                        game_id: game_id.clone(),
+                                        error: if reconnect_failed {
+                                            "Peer nicht erreichbar - Reconnect fehlgeschlagen oder keine Adresse gefunden".to_string()
+                                        } else {
+                                            "Peer nicht verbunden nach Reconnect-Versuch".to_string()
+                                        },
+                                    }).await;
                                     continue;
                                 }
                             }
@@ -752,12 +787,47 @@ pub async fn run_discovery(
             }
             // Handle Swarm Events
             event = swarm.select_next_some() => {
-                println!("Swarm Event empfangen: {:?}", event);
-                eprintln!("Swarm Event empfangen: {:?}", event);
+                // WICHTIG: Verwende selektives Logging statt {:?}, um endlose Ausgabe von chunk_data zu vermeiden
+                // Nur wichtige Swarm-Events loggen, nicht das komplette Event mit allen Daten
+                match &event {
+                    SwarmEvent::Behaviour(behaviour_event) => {
+                        match behaviour_event {
+                            DiscoveryBehaviourEvent::Chunks(_) => {
+                                // Chunks-Events werden bereits separat geloggt
+                            }
+                            _ => {
+                                eprintln!("Swarm Event: Behaviour({:?})", std::mem::discriminant(behaviour_event));
+                            }
+                        }
+                    }
+                    SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+                        eprintln!("Swarm Event: ConnectionEstablished mit {}", peer_id);
+                    }
+                    SwarmEvent::ConnectionClosed { peer_id, .. } => {
+                        eprintln!("Swarm Event: ConnectionClosed mit {}", peer_id);
+                    }
+                    SwarmEvent::OutgoingConnectionError { error, .. } => {
+                        eprintln!("Swarm Event: OutgoingConnectionError: {:?}", error);
+                    }
+                    SwarmEvent::IncomingConnectionError { error, .. } => {
+                        eprintln!("Swarm Event: IncomingConnectionError: {:?}", error);
+                    }
+                    _ => {
+                        // Andere Events nur mit Discriminant loggen
+                        eprintln!("Swarm Event: {:?}", std::mem::discriminant(&event));
+                    }
+                }
                 match event {
             SwarmEvent::Behaviour(discovery_event) => {
-                println!("DiscoveryBehaviourEvent empfangen: {:?}", discovery_event);
-                eprintln!("DiscoveryBehaviourEvent empfangen: {:?}", discovery_event);
+                // WICHTIG: Verwende selektives Logging statt {:?}, um endlose Ausgabe von chunk_data zu vermeiden
+                match &discovery_event {
+                    DiscoveryBehaviourEvent::Chunks(_) => {
+                        // Chunks-Events werden bereits separat geloggt
+                    }
+                    _ => {
+                        eprintln!("DiscoveryBehaviourEvent: {:?}", std::mem::discriminant(&discovery_event));
+                    }
+                }
                 match discovery_event {
                     DiscoveryBehaviourEvent::Identify(event) => {
                         use libp2p::identify::Event;
@@ -1015,11 +1085,16 @@ pub async fn run_discovery(
                                 eprintln!("GameMetadata OutboundFailure für {} (RequestId: {:?}): game_id={}, error={:?}", 
                                     peer_id_str, request_id, game_id, error);
                                 
+                                // Konvertiere Error zu String für Event
+                                let error_string = format!("{:?}", error);
+                                
                                 // Retry-Mechanismus: Bei Timeout oder ConnectionClosed versuche Reconnect und Retry
                                 let should_retry = matches!(error, 
                                     libp2p::request_response::OutboundFailure::Timeout |
                                     libp2p::request_response::OutboundFailure::ConnectionClosed
                                 );
+                                
+                                let mut retry_successful = false;
                                 
                                 if should_retry {
                                     eprintln!("GameMetadata Request fehlgeschlagen, versuche Reconnect und Retry für {}", peer_id_str);
@@ -1045,8 +1120,19 @@ pub async fn run_discovery(
                                             eprintln!("Reconnect fehlgeschlagen für {}: {}", peer_id_str, e);
                                         } else {
                                             println!("Reconnect initiiert für {}, Retry wird später versucht", peer_id_str);
+                                            retry_successful = true;
                                         }
                                     }
+                                }
+                                
+                                // Sende Event an UI, wenn kein Retry möglich oder Retry fehlgeschlagen
+                                if !should_retry || !retry_successful {
+                                    let _ = event_tx_clone.send(DiscoveryEvent::GameMetadataRequestFailed {
+                                        peer_id: peer_id_str.clone(),
+                                        game_id: game_id.clone(),
+                                        error: error_string,
+                                    }).await;
+                                    eprintln!("GameMetadataRequestFailed Event gesendet für {} (game_id: {})", peer_id_str, game_id);
                                 }
                             }
                             libp2p::request_response::Event::InboundFailure { peer, error, .. } => {
@@ -1056,8 +1142,29 @@ pub async fn run_discovery(
                         }
                     }
                     DiscoveryBehaviourEvent::Chunks(chunk_event) => {
-                        println!("Chunks Event empfangen: {:?}", chunk_event);
-                        eprintln!("Chunks Event empfangen: {:?}", chunk_event);
+                        // WICHTIG: Verwende selektives Logging statt {:?}, um endlose Ausgabe von chunk_data zu vermeiden
+                        match &chunk_event {
+                            libp2p::request_response::Event::Message { message, .. } => {
+                                match message {
+                                    libp2p::request_response::Message::Request { request, .. } => {
+                                        eprintln!("Chunks Event: Request für hash: {}", request.chunk_hash);
+                                    }
+                                    libp2p::request_response::Message::Response { request_id, response, .. } => {
+                                        eprintln!("Chunks Event: Response für RequestId: {:?}, hash: {}, size: {} MB", 
+                                            request_id, response.chunk_hash, response.chunk_data.len() / (1024 * 1024));
+                                    }
+                                }
+                            }
+                            libp2p::request_response::Event::OutboundFailure { peer, request_id, error, .. } => {
+                                eprintln!("Chunks Event: OutboundFailure für Peer: {}, RequestId: {:?}, Error: {:?}", peer, request_id, error);
+                            }
+                            libp2p::request_response::Event::InboundFailure { peer, error, .. } => {
+                                eprintln!("Chunks Event: InboundFailure für Peer: {}, Error: {:?}", peer, error);
+                            }
+                            libp2p::request_response::Event::ResponseSent { .. } => {
+                                // Ignoriere ResponseSent Events (nur für Logging)
+                            }
+                        }
                         let active_requests_per_peer_for_chunks = active_requests_per_peer_clone.clone();
                         match chunk_event {
                             libp2p::request_response::Event::Message { message, peer, .. } => {
@@ -1553,6 +1660,9 @@ pub async fn run_discovery(
             SwarmEvent::ConnectionEstablished { peer_id, .. } => {
                 println!("Connection established with: {}", peer_id);
                 eprintln!("Connection established with: {}", peer_id);
+                
+                // WICHTIG: Peer-Adresse wird bereits bei mDNS Discovery gespeichert
+                // Falls nicht vorhanden, wird sie beim nächsten mDNS Update gespeichert
                 
                 // Identify Protokoll wird automatisch die Metadaten senden/empfangen
                 // Kein manueller Handshake mehr nötig
@@ -2071,6 +2181,7 @@ mod tests {
                         }
                         Some(DiscoveryEvent::GamesListReceived { .. }) => {}
                         Some(DiscoveryEvent::GameMetadataReceived { .. }) => {}
+                        Some(DiscoveryEvent::GameMetadataRequestFailed { .. }) => {}
                         Some(DiscoveryEvent::ChunkReceived { .. }) => {}
                         Some(DiscoveryEvent::ChunkRequestFailed { .. }) => {}
                         Some(DiscoveryEvent::ChunkRequestSent { .. }) => {}
@@ -2095,6 +2206,7 @@ mod tests {
                         }
                         Some(DiscoveryEvent::GamesListReceived { .. }) => {}
                         Some(DiscoveryEvent::GameMetadataReceived { .. }) => {}
+                        Some(DiscoveryEvent::GameMetadataRequestFailed { .. }) => {}
                         Some(DiscoveryEvent::ChunkReceived { .. }) => {}
                         Some(DiscoveryEvent::ChunkRequestFailed { .. }) => {}
                         Some(DiscoveryEvent::ChunkRequestSent { .. }) => {}
@@ -2596,6 +2708,9 @@ mod tests {
                         }
                         Some(DiscoveryEvent::GameMetadataReceived { .. }) => {
                             // Ignoriere GameMetadataReceived Events in diesem Test
+                        }
+                        Some(DiscoveryEvent::GameMetadataRequestFailed { .. }) => {
+                            // Ignoriere GameMetadataRequestFailed Events in diesem Test
                         }
                         Some(DiscoveryEvent::ChunkReceived { .. }) => {
                             // Ignoriere ChunkReceived Events in diesem Test

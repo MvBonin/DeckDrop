@@ -762,7 +762,8 @@ where
         std::fs::write(manifest_dir.join("deckdrop_chunks.toml"), deckdrop_chunks_toml)?;
     }
     
-    // Prüfe, ob Manifest und Dateien erfolgreich erstellt wurden
+    // Prüfe, ob Manifest-DB und Dateien erfolgreich erstellt wurden
+    // WICHTIG: Prüfe nach create_download, da die DB-Datei erst dann garantiert existiert
     let manifest_exists = manifest_path.exists();
     let toml_exists = game_path.join("deckdrop.toml").exists();
     let chunks_toml_exists = game_path.join("deckdrop_chunks.toml").exists();

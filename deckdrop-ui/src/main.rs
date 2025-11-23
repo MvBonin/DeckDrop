@@ -131,6 +131,7 @@ fn main() -> iced::Result {
     let (download_prep_tx, download_prep_rx) = std_mpsc::channel::<Message>();
     set_download_prep_tx(download_prep_tx);
     set_download_prep_rx(Arc::new(std::sync::Mutex::new(download_prep_rx)));
+    eprintln!("Download-Preparation-Channel initialisiert");
     
     // System-Tray-Icon ist deaktiviert (tray-icon Abhängigkeit entfernt, um libxdo zu vermeiden)
     // Die Anwendung funktioniert weiterhin ohne Tray-Icon
