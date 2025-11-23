@@ -1,2 +1,7 @@
 .DS_Store
 */.DS_Store
+AppDir
+target
+DeckDrop-x86_64.AppImage
+*.md
+appimagetool-x86_64.AppImage

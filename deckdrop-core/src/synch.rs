@@ -1720,4 +1720,89 @@ file_size = {}
                 "Chunk {} hat falsche Daten", i);
         }
     }
+    
+    #[test]
+    fn test_prepare_download_with_progress_callback_frequency() {
+        use tempfile::TempDir;
+        use std::sync::{Arc, Mutex};
+        use std::time::{SystemTime, UNIX_EPOCH};
+        
+        // Erstelle eindeutige game_id basierend auf Timestamp
+        let unique_id = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let game_id = format!("test_game_callback_{}", unique_id);
+        
+        // Erstelle Test deckdrop.toml
+        let deckdrop_toml = format!(r#"
+game_id = "{}"
+name = "Test Game Callback"
+version = "1.0.0"
+start_file = "game.exe"
+description = "Test"
+"#, game_id);
+        
+        // Erstelle deckdrop_chunks.toml mit 50 Dateien (um zu testen, ob Callback korrekt aufgerufen wird)
+        let mut chunks_toml = String::new();
+        for i in 0..50 {
+            chunks_toml.push_str(&format!(
+                "[[file]]\npath = \"file_{}.bin\"\nfile_hash = \"hash_{}\"\nchunk_count = 1\nfile_size = 1024\n",
+                i, i
+            ));
+        }
+        
+        // Test: Zähle wie oft der Callback aufgerufen wird
+        let callback_count = Arc::new(Mutex::new(0));
+        let callback_count_clone = callback_count.clone();
+        let callback_values = Arc::new(Mutex::new(Vec::new()));
+        let callback_values_clone = callback_values.clone();
+        
+        // Führe prepare_download_with_progress aus
+        let result = prepare_download_with_progress(
+            &game_id,
+            &deckdrop_toml,
+            &chunks_toml,
+            move |current, total| {
+                let mut count = callback_count_clone.lock().unwrap();
+                *count += 1;
+                
+                let mut values = callback_values_clone.lock().unwrap();
+                values.push((current, total));
+                
+                // Prüfe dass current und total sinnvoll sind
+                assert!(current > 0, "current sollte > 0 sein");
+                assert!(total > 0, "total sollte > 0 sein");
+                assert!(current <= total, "current sollte <= total sein");
+            },
+        );
+        
+        // Prüfe Ergebnis - zeige Fehler falls vorhanden
+        if let Err(e) = &result {
+            eprintln!("prepare_download_with_progress Fehler: {}", e);
+        }
+        
+        let count = callback_count.lock().unwrap();
+        let values = callback_values.lock().unwrap();
+        
+        // Prüfe dass Callback genau 50 mal aufgerufen wurde (eine pro Datei)
+        assert_eq!(*count, 50, "Callback sollte genau 50 mal aufgerufen werden (eine pro Datei), wurde aber {} mal aufgerufen", *count);
+        
+        // Prüfe dass die Werte korrekt sind
+        assert_eq!(values.len(), 50, "Callback-Werte sollten 50 Einträge haben");
+        assert_eq!(values[0], (1, 50), "Erster Callback sollte (1, 50) sein");
+        assert_eq!(values[49], (50, 50), "Letzter Callback sollte (50, 50) sein");
+        
+        // Prüfe dass die Werte sequenziell sind
+        for i in 0..50 {
+            assert_eq!(values[i].0, i + 1, "Callback {} sollte current={} haben", i, i + 1);
+            assert_eq!(values[i].1, 50, "Callback {} sollte total=50 haben", i);
+        }
+        
+        // Wenn prepare_download_with_progress erfolgreich war, sollte auch Manifest existieren
+        if result.is_ok() {
+            let manifest_path = get_manifest_path(&game_id).unwrap();
+            assert!(manifest_path.exists(), "Manifest sollte erstellt worden sein");
+        }
+    }
 }

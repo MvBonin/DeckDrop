@@ -1135,9 +1135,13 @@ impl DeckDropApp {
             }
             Message::UpdateDownloadPreparationProgress(game_id, current, total) => {
                 // Aktualisiere Progress für Pre-Allocation
+                // WICHTIG: Diese Messages werden normalerweise im Tick-Handler verarbeitet,
+                // aber falls sie hier ankommen (z.B. durch direkten Aufruf), verarbeiten wir sie auch hier
                 self.preparing_downloads.insert(game_id, (current, total));
             }
             Message::DownloadPrepared(game_id, result) => {
+                // WICHTIG: Diese Messages werden normalerweise im Tick-Handler verarbeitet,
+                // aber falls sie hier ankommen (z.B. durch direkten Aufruf), verarbeiten wir sie auch hier
                 // Entferne aus preparing_downloads
                 self.preparing_downloads.remove(&game_id);
                 
@@ -1512,11 +1516,72 @@ impl DeckDropApp {
                 }
                 
                 // Check for Download-Preparation messages (non-blocking) via global access
+                // Sammle alle Messages und verarbeite sie direkt, um Endlosschleifen zu vermeiden
                 if let Some(rx) = crate::get_download_prep_rx() {
                     if let Ok(rx) = rx.lock() {
+                        let mut messages = Vec::new();
                         while let Ok(msg) = rx.try_recv() {
-                            // Verarbeite Message direkt (wird in update() behandelt)
-                            return self.update(msg);
+                            messages.push(msg);
+                        }
+                        // Verarbeite alle Messages direkt, ohne update() erneut aufzurufen
+                        for msg in messages {
+                            match msg {
+                                Message::UpdateDownloadPreparationProgress(game_id, current, total) => {
+                                    // Aktualisiere Progress direkt
+                                    self.preparing_downloads.insert(game_id, (current, total));
+                                }
+                                Message::DownloadPrepared(game_id, result) => {
+                                    // Entferne aus preparing_downloads
+                                    self.preparing_downloads.remove(&game_id);
+                                    
+                                    match result {
+                                        Ok(()) => {
+                                            // Pre-Allocation erfolgreich - starte Download
+                                            // Load manifest for UI update
+                                            if let Ok(manifest_path) = deckdrop_core::get_manifest_path(&game_id) {
+                                                if let Ok(manifest) = deckdrop_core::DownloadManifest::load(&manifest_path) {
+                                                    let progress_percent = manifest.progress.percentage as f32;
+                                                    let downloaded_chunks = manifest.progress.downloaded_chunks;
+                                                    
+                                                    self.active_downloads.insert(game_id.clone(), DownloadState {
+                                                        manifest: manifest.clone(),
+                                                        progress_percent,
+                                                        downloading_chunks_count: 0,
+                                                        peer_count: 0,
+                                                        download_speed_bytes_per_sec: 0.0,
+                                                        last_update_time: std::time::Instant::now(),
+                                                        last_downloaded_chunks: downloaded_chunks,
+                                                        speed_samples: Vec::new(),
+                                                    });
+                                                    
+                                                    // Request missing chunks to start download
+                                                    if let Some(peers) = self.network_games.get(&game_id) {
+                                                        let peer_ids: Vec<String> = peers.iter()
+                                                            .map(|(pid, _)| pid.clone())
+                                                            .collect();
+                                                        
+                                                        // WICHTIG: Verwende max_concurrent_chunks statt festem Wert 10
+                                                        let max_chunks_per_peer = self.config.max_concurrent_chunks.max(10);
+                                                        if let Err(e) = self.request_missing_chunks_adaptive(&game_id, &peer_ids, max_chunks_per_peer) {
+                                                            eprintln!("Error requesting missing chunks for {}: {}", game_id, e);
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            eprintln!("Error preparing download for {}: {}", game_id, e);
+                                            // Entferne aus downloading_starting, damit Button wieder aktiviert wird
+                                            self.downloading_starting.remove(&game_id);
+                                        }
+                                    }
+                                }
+                                _ => {
+                                    // Andere Messages sollten normal verarbeitet werden
+                                    // Aber wir vermeiden hier eine Endlosschleife
+                                    eprintln!("Warnung: Unerwartete Message im Download-Preparation-Channel: {:?}", msg);
+                                }
+                            }
                         }
                     }
                 }
@@ -2031,18 +2096,34 @@ impl DeckDropApp {
                 // Hole den Message-Sender für Download-Preparation
                 if let Some(tx) = crate::get_download_prep_tx() {
                     std::thread::spawn(move || {
+                        let mut last_sent_progress = 0;
                         // Führe Pre-Allocation durch
                         let result = deckdrop_core::prepare_download_with_progress(
                             &game_id_clone,
                             &deckdrop_toml_clone,
                             &deckdrop_chunks_toml_clone,
                             |current, total| {
-                                // Sende Progress-Update
-                                let _ = tx.send(Message::UpdateDownloadPreparationProgress(
-                                    game_id_clone.clone(),
-                                    current,
-                                    total,
-                                ));
+                                // Sende Progress-Update nur bei signifikanten Änderungen (alle 5% oder jede 10. Datei)
+                                let progress_percent = if total > 0 {
+                                    (current * 100) / total
+                                } else {
+                                    0
+                                };
+                                
+                                // Sende Update nur wenn:
+                                // 1. Progress um mindestens 5% gestiegen ist, ODER
+                                // 2. Jede 10. Datei, ODER
+                                // 3. Letzte Datei (current == total)
+                                if progress_percent >= last_sent_progress + 5 || 
+                                   current % 10 == 0 || 
+                                   current == total {
+                                    let _ = tx.send(Message::UpdateDownloadPreparationProgress(
+                                        game_id_clone.clone(),
+                                        current,
+                                        total,
+                                    ));
+                                    last_sent_progress = progress_percent;
+                                }
                             },
                         );
                         
