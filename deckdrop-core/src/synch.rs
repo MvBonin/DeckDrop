@@ -716,11 +716,16 @@ pub fn get_chunks_dir(game_id: &str) -> Result<PathBuf, Box<dyn std::error::Erro
 }
 
 /// Startet den Download-Prozess für ein Spiel
-pub fn start_game_download(
+/// Führt die Pre-Allocation mit Progress-Callback durch
+pub fn prepare_download_with_progress<F>(
     game_id: &str,
     deckdrop_toml: &str,
     deckdrop_chunks_toml: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
+    mut progress_callback: F,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    F: FnMut(usize, usize),
+{
     // Parse deckdrop.toml um game_name zu erhalten
     let game_info: crate::game::GameInfo = toml::from_str(deckdrop_toml)?;
     let game_name = game_info.name.clone();
@@ -757,6 +762,16 @@ pub fn start_game_download(
         std::fs::write(manifest_dir.join("deckdrop_chunks.toml"), deckdrop_chunks_toml)?;
     }
     
+    // Prüfe, ob Manifest und Dateien erfolgreich erstellt wurden
+    let manifest_exists = manifest_path.exists();
+    let toml_exists = game_path.join("deckdrop.toml").exists();
+    let chunks_toml_exists = game_path.join("deckdrop_chunks.toml").exists();
+    
+    if !manifest_exists || !toml_exists || !chunks_toml_exists {
+        return Err(format!("Fehler beim Erstellen von Manifest oder Metadaten-Dateien: manifest={}, toml={}, chunks_toml={}", 
+            manifest_exists, toml_exists, chunks_toml_exists).into());
+    }
+    
     // Phase 1: Pre-Allocation - Blockiere Dateien vorher (BitTorrent-ähnlich)
     // Parse deckdrop_chunks.toml um Dateien zu pre-allokieren
     #[derive(Deserialize)]
@@ -764,8 +779,9 @@ pub fn start_game_download(
         file: Vec<ChunkFileEntry>,
     }
     let chunks_toml: ChunksToml = toml::from_str(deckdrop_chunks_toml)?;
+    let total_files = chunks_toml.file.len();
     
-    for entry in chunks_toml.file {
+    for (index, entry) in chunks_toml.file.iter().enumerate() {
         let file_path = game_path.join(&entry.path);
         
         // Pre-Allokiere Datei (erstellt sparse file)
@@ -779,12 +795,24 @@ pub fn start_game_download(
                 // Nicht kritisch - Datei wird beim ersten Chunk erstellt
             }
         }
+        
+        // Sende Progress-Update
+        progress_callback(index + 1, total_files);
     }
     
-    println!("Download gestartet für Spiel: {} (ID: {})", game_info.name, game_id);
-    eprintln!("Download gestartet für Spiel: {} (ID: {})", game_info.name, game_id);
+    println!("Download vorbereitet für Spiel: {} (ID: {})", game_info.name, game_id);
+    eprintln!("Download vorbereitet für Spiel: {} (ID: {})", game_info.name, game_id);
     
     Ok(())
+}
+
+pub fn start_game_download(
+    game_id: &str,
+    deckdrop_toml: &str,
+    deckdrop_chunks_toml: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Verwende prepare_download_with_progress ohne Callback
+    prepare_download_with_progress(game_id, deckdrop_toml, deckdrop_chunks_toml, |_, _| {})
 }
 
 /// Fordert fehlende Chunks für ein Spiel an

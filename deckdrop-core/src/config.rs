@@ -49,45 +49,26 @@ impl Config {
     
     /// Lädt die Konfiguration aus der Datei oder gibt Standardwerte zurück
     /// Generiert KEINE Peer-ID automatisch - das muss explizit über generate_and_save_peer_id() gemacht werden
+    /// 
+    /// WICHTIG: Wenn kein Peer-ID-Unterordner gesetzt ist (z.B. durch --random-id), wird NUR das Hauptverzeichnis verwendet.
+    /// Es werden KEINE Unterordner durchsucht, um sicherzustellen, dass die normale Config immer verwendet wird.
     pub fn load() -> Self {
         // Versuche zuerst, die Peer-ID aus dem Hauptverzeichnis zu laden
         let main_keypair_path = directories::ProjectDirs::from("com", "deckdrop", "deckdrop")
             .map(|dirs| dirs.config_dir().join("peer_id.key"));
         
         // Wenn kein Peer-ID-Unterordner gesetzt ist, versuche die Keypair-Datei im Hauptverzeichnis zu finden
+        // WICHTIG: Durchsuche KEINE Unterordner - verwende nur das Hauptverzeichnis
         if Self::get_peer_id_subdir().is_none() {
-            let mut peer_id_loaded = false;
-            
             if let Some(ref main_path) = main_keypair_path {
                 if main_path.exists() {
                     if let Some(_peer_id) = Self::load_peer_id_from_keypair_file(main_path) {
                         // Keypair im Hauptverzeichnis gefunden - verwende Hauptverzeichnis
-                        peer_id_loaded = true;
+                        // Kein Unterordner wird gesetzt - bleibt im Hauptverzeichnis
                     }
                 }
             }
-            
-            // Wenn keine Keypair-Datei im Hauptverzeichnis gefunden wurde, durchsuche Unterordner
-            if !peer_id_loaded {
-                if let Some(base_dir) = directories::ProjectDirs::from("com", "deckdrop", "deckdrop") {
-                    let config_dir = base_dir.config_dir();
-                    if let Ok(entries) = fs::read_dir(config_dir) {
-                        for entry in entries.flatten() {
-                            let path = entry.path();
-                            if path.is_dir() {
-                                let keypair_path = path.join("peer_id.key");
-                                if keypair_path.exists() {
-                                    if let Some(peer_id) = Self::load_peer_id_from_keypair_file(&keypair_path) {
-                                        // Keypair in Unterordner gefunden - setze Unterordner
-                                        Self::set_peer_id_subdir(&peer_id);
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+            // KEINE Suche in Unterordnern - nur Hauptverzeichnis wird verwendet
         }
         // Wenn Peer-ID-Unterordner bereits gesetzt ist (z.B. durch --random-id), wird die Suche übersprungen
         

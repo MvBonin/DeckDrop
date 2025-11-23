@@ -23,6 +23,32 @@ pub fn get_window_op_rx() -> Option<Arc<std::sync::Mutex<std_mpsc::Receiver<Mess
     WINDOW_OP_RX.get().cloned()
 }
 
+/// Globaler Download-Preparation-Message-Sender (für Threads)
+static DOWNLOAD_PREP_TX: std::sync::OnceLock<std_mpsc::Sender<Message>> = std::sync::OnceLock::new();
+
+/// Setzt den globalen Download-Preparation-Message-Sender
+fn set_download_prep_tx(tx: std_mpsc::Sender<Message>) {
+    let _ = DOWNLOAD_PREP_TX.set(tx);
+}
+
+/// Gibt den globalen Download-Preparation-Message-Sender zurück
+pub fn get_download_prep_tx() -> Option<std_mpsc::Sender<Message>> {
+    DOWNLOAD_PREP_TX.get().cloned()
+}
+
+/// Globaler Download-Preparation-Message-Receiver (für Polling)
+static DOWNLOAD_PREP_RX: std::sync::OnceLock<Arc<std::sync::Mutex<std_mpsc::Receiver<Message>>>> = std::sync::OnceLock::new();
+
+/// Setzt den globalen Download-Preparation-Message-Receiver
+fn set_download_prep_rx(rx: Arc<std::sync::Mutex<std_mpsc::Receiver<Message>>>) {
+    let _ = DOWNLOAD_PREP_RX.set(rx);
+}
+
+/// Gibt den globalen Download-Preparation-Message-Receiver zurück
+pub fn get_download_prep_rx() -> Option<Arc<std::sync::Mutex<std_mpsc::Receiver<Message>>>> {
+    DOWNLOAD_PREP_RX.get().cloned()
+}
+
 fn main() -> iced::Result {
     // Prüfe Command-Line-Argumente
     let args: Vec<String> = env::args().collect();
@@ -100,6 +126,11 @@ fn main() -> iced::Result {
     
     // Setze globalen Window-Operation-Receiver (für Zugriff in app.rs)
     set_window_op_rx(window_op_rx.clone());
+    
+    // Erstelle Channel für Download-Preparation-Messages (vom Thread zum UI-Thread)
+    let (download_prep_tx, download_prep_rx) = std_mpsc::channel::<Message>();
+    set_download_prep_tx(download_prep_tx);
+    set_download_prep_rx(Arc::new(std::sync::Mutex::new(download_prep_rx)));
     
     // System-Tray-Icon ist deaktiviert (tray-icon Abhängigkeit entfernt, um libxdo zu vermeiden)
     // Die Anwendung funktioniert weiterhin ohne Tray-Icon

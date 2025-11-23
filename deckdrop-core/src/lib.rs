@@ -19,7 +19,7 @@ pub use game::{GameInfo, load_games_from_directory, check_game_config_exists, ch
 pub use gamechecker::{calculate_file_hash, verify_game_integrity, verify_game_integrity_with_progress, light_check_game};
 pub use synch::{
     DownloadManifest, DownloadStatus, DownloadProgress,
-    start_game_download, request_missing_chunks, 
+    start_game_download, prepare_download_with_progress, request_missing_chunks, 
     finalize_game_download, cancel_game_download,
     get_manifest_path, get_chunks_dir, find_game_id_for_chunk,
     check_and_validate_complete_files, check_and_validate_single_file, find_file_for_chunk, load_active_downloads,
