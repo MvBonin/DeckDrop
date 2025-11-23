@@ -1661,6 +1661,15 @@ pub async fn run_discovery(
                 println!("Connection established with: {}", peer_id);
                 eprintln!("Connection established with: {}", peer_id);
                 
+                // WICHTIG: Sende sofort einen Keep-Alive Request nach Verbindungsaufbau!
+                // Dies verhindert, dass die Verbindung idle-closed wird bevor der erste
+                // reguläre Keep-Alive nach 30-60 Sekunden kommt.
+                // Sende GamesList-Request als Keep-Alive (ist nicht-blockierend und klein)
+                eprintln!("Sende initialen Keep-Alive Request an {}", peer_id);
+                let request = GamesListRequest;
+                let _request_id = swarm.behaviour_mut().games_list.send_request(&peer_id, request);
+                eprintln!("✅ Initialer Keep-Alive Request gesendet an {}", peer_id);
+                
                 // WICHTIG: Peer-Adresse wird bereits bei mDNS Discovery gespeichert
                 // Falls nicht vorhanden, wird sie beim nächsten mDNS Update gespeichert
                 
