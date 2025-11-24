@@ -278,7 +278,16 @@ impl NetworkBridge {
                 for (game_id, manifest) in &active_downloads {
                     if matches!(manifest.overall_status, DownloadStatus::Downloading | DownloadStatus::Pending) {
                         // Verwende SQLite-Datenbank direkt für memory-effizienten Zugriff
-                        if let Ok(manifest_path) = deckdrop_core::synch::get_manifest_path(game_id) {
+                        // WICHTIG: Verwende get_manifest_db für Connection-Pooling
+                        if let Ok(db_arc) = deckdrop_core::manifest_db::get_manifest_db(game_id) {
+                            for batch_result in db_arc.stream_missing_chunks(game_id, 100) {
+                                if let Ok(batch) = batch_result {
+                                    for chunk_hash in batch {
+                                        all_currently_missing.insert(chunk_hash);
+                                    }
+                                }
+                            }
+                        } else if let Ok(manifest_path) = deckdrop_core::synch::get_manifest_path(game_id) {
                             if let Ok(db) = deckdrop_core::manifest_db::ManifestDB::open(&manifest_path) {
                                 // Lade Chunks in kleinen Batches (max 100 pro Batch)
                                 for batch_result in db.stream_missing_chunks(game_id, 100) {
@@ -337,7 +346,16 @@ impl NetworkBridge {
                                 }
 
                                 // Eigene Scheduling-Logik mit direkter Datenbank-Abfrage (memory-effizient)
-                                let missing_chunks = if let Ok(manifest_path) = deckdrop_core::synch::get_manifest_path(game_id) {
+                                // WICHTIG: Verwende get_manifest_db für Connection-Pooling
+                                let missing_chunks = if let Ok(db_arc) = deckdrop_core::manifest_db::get_manifest_db(game_id) {
+                                    let mut all_missing = Vec::new();
+                                    for batch_result in db_arc.stream_missing_chunks(game_id, 50) {
+                                        if let Ok(batch) = batch_result {
+                                            all_missing.extend(batch);
+                                        }
+                                    }
+                                    all_missing
+                                } else if let Ok(manifest_path) = deckdrop_core::synch::get_manifest_path(game_id) {
                                     if let Ok(db) = deckdrop_core::manifest_db::ManifestDB::open(&manifest_path) {
                                         // Sammle alle fehlenden Chunks aus der Datenbank
                                         let mut all_missing = Vec::new();

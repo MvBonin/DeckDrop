@@ -163,8 +163,8 @@ pub struct DeckDropApp {
     pub edit_game_additional_instructions: String,
     pub edit_game_path: Option<PathBuf>, // Path of game being edited
     
-    // Worker Channel für sequentielles Schreiben (verhindert Thread-Explosion)
-    pub chunk_writer_tx: std::sync::mpsc::Sender<ChunkWriteTask>,
+    // Worker Channel für paralleles Schreiben (Async Channel für MPMC)
+    pub chunk_writer_tx: async_channel::Sender<ChunkWriteTask>,
 }
 
 /// Tab selection
@@ -410,28 +410,36 @@ impl Default for DeckDropApp {
         let writing_chunks = Arc::new(std::sync::Mutex::new(HashSet::new()));
         let chunk_retries = Arc::new(std::sync::Mutex::new(HashMap::new()));
 
-        // Erstelle Worker Channel
-        let (chunk_writer_tx, chunk_writer_rx) = std::sync::mpsc::channel();
+        // Erstelle Worker Channel (Bounded für Backpressure)
+        // Verwende async_channel für MPMC (Multi-Producer Multi-Consumer)
+        let (chunk_writer_tx, chunk_writer_rx) = async_channel::bounded(100);
         
-        // Starte Worker Thread
-        let wc_writing = writing_chunks.clone();
-        let wc_requested = requested_chunks.clone();
-        let wc_peer_req = chunk_peer_requests.clone();
-        let wc_active_peer = active_requests_per_peer.clone();
-        let wc_start_times = chunk_download_start_times.clone();
-        let wc_retries = chunk_retries.clone();
+        // Starte Worker Threads (Parallel Writing)
+        // 4 Threads sollten für SSDs gut sein, für HDDs könnte es zu Seek-Thrashing führen
+        // Aber da wir File-Locking haben, ist es sicher.
+        let num_threads = 4;
         
-        std::thread::spawn(move || {
-            run_chunk_writer(
-                chunk_writer_rx,
-                wc_writing,
-                wc_requested,
-                wc_peer_req,
-                wc_active_peer,
-                wc_start_times,
-                wc_retries,
-            );
-        });
+        for _ in 0..num_threads {
+            let rx = chunk_writer_rx.clone();
+            let wc_writing = writing_chunks.clone();
+            let wc_requested = requested_chunks.clone();
+            let wc_peer_req = chunk_peer_requests.clone();
+            let wc_active_peer = active_requests_per_peer.clone();
+            let wc_start_times = chunk_download_start_times.clone();
+            let wc_retries = chunk_retries.clone();
+            
+            std::thread::spawn(move || {
+                run_chunk_writer(
+                    rx,
+                    wc_writing,
+                    wc_requested,
+                    wc_peer_req,
+                    wc_active_peer,
+                    wc_start_times,
+                    wc_retries,
+                );
+            });
+        }
 
         Self {
             current_tab: Tab::MyGames,
@@ -715,28 +723,36 @@ impl DeckDropApp {
         let writing_chunks = Arc::new(std::sync::Mutex::new(HashSet::new()));
         let chunk_retries = Arc::new(std::sync::Mutex::new(HashMap::new()));
 
-        // Erstelle Worker Channel
-        let (chunk_writer_tx, chunk_writer_rx) = std::sync::mpsc::channel();
+        // Erstelle Worker Channel (Bounded für Backpressure)
+        // Verwende async_channel für MPMC (Multi-Producer Multi-Consumer)
+        let (chunk_writer_tx, chunk_writer_rx) = async_channel::bounded(100);
         
-        // Starte Worker Thread
-        let wc_writing = writing_chunks.clone();
-        let wc_requested = requested_chunks.clone();
-        let wc_peer_req = chunk_peer_requests.clone();
-        let wc_active_peer = active_requests_per_peer.clone();
-        let wc_start_times = chunk_download_start_times.clone();
-        let wc_retries = chunk_retries.clone();
+        // Starte Worker Threads (Parallel Writing)
+        // 4 Threads sollten für SSDs gut sein, für HDDs könnte es zu Seek-Thrashing führen
+        // Aber da wir File-Locking haben, ist es sicher.
+        let num_threads = 4;
         
-        std::thread::spawn(move || {
-            run_chunk_writer(
-                chunk_writer_rx,
-                wc_writing,
-                wc_requested,
-                wc_peer_req,
-                wc_active_peer,
-                wc_start_times,
-                wc_retries,
-            );
-        });
+        for _ in 0..num_threads {
+            let rx = chunk_writer_rx.clone();
+            let wc_writing = writing_chunks.clone();
+            let wc_requested = requested_chunks.clone();
+            let wc_peer_req = chunk_peer_requests.clone();
+            let wc_active_peer = active_requests_per_peer.clone();
+            let wc_start_times = chunk_download_start_times.clone();
+            let wc_retries = chunk_retries.clone();
+            
+            std::thread::spawn(move || {
+                run_chunk_writer(
+                    rx,
+                    wc_writing,
+                    wc_requested,
+                    wc_peer_req,
+                    wc_active_peer,
+                    wc_start_times,
+                    wc_retries,
+                );
+            });
+        }
 
         Self {
             current_tab: Tab::MyGames,
@@ -2466,7 +2482,7 @@ impl DeckDropApp {
                     peer_id: peer_id.clone(),
                 };
                 
-                if let Err(e) = self.chunk_writer_tx.send(task) {
+                if let Err(e) = self.chunk_writer_tx.send_blocking(task) {
                     eprintln!("KRITISCH: Konnte Chunk-Task nicht an Worker senden: {}", e);
                     // Cleanup processing_chunks falls Senden fehlschlägt
                     if let Ok(mut processing) = self.processing_chunks.lock() {
@@ -5113,9 +5129,9 @@ fn container_box_style(theme: &Theme) -> iced::widget::container::Style {
     }
 }
 
-/// Worker-Funktion für sequentielles Schreiben von Chunks (verhindert Thread-Explosion)
+/// Worker-Funktion für paralleles Schreiben von Chunks
 fn run_chunk_writer(
-    rx: std::sync::mpsc::Receiver<ChunkWriteTask>,
+    rx: async_channel::Receiver<ChunkWriteTask>,
     writing_chunks: Arc<std::sync::Mutex<HashSet<String>>>,
     requested_chunks: Arc<std::sync::Mutex<HashSet<String>>>,
     chunk_peer_requests: Arc<std::sync::Mutex<HashMap<String, String>>>,
@@ -5123,9 +5139,9 @@ fn run_chunk_writer(
     chunk_download_start_times: Arc<std::sync::Mutex<HashMap<String, std::time::Instant>>>,
     chunk_retries: Arc<std::sync::Mutex<HashMap<String, ChunkRetryInfo>>>,
 ) {
-    eprintln!("ChunkWriter Thread gestartet (sequentiell)");
+    eprintln!("ChunkWriter Thread gestartet (Parallel)");
     
-    while let Ok(task) = rx.recv() {
+    while let Ok(task) = rx.recv_blocking() {
         let chunk_hash = task.chunk_hash;
         let chunk_data = task.chunk_data; // Move ownership
         let _peer_id = task.peer_id; // Wird aktuell nicht direkt hier verwendet, aber gut für Debugging

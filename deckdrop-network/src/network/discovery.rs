@@ -386,8 +386,23 @@ pub async fn run_discovery(
     let mut name_request_interval = tokio::time::interval(Duration::from_secs(30)); // Alle 30 Sekunden prüfen
     name_request_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     
+    // Channel für asynchrone Chunk-Responses
+    // Ermöglicht das Laden von Chunks im Hintergrund, ohne den Swarm-Loop zu blockieren
+    let (chunk_response_tx, mut chunk_response_rx) = tokio::sync::mpsc::channel::<(libp2p::request_response::ResponseChannel<ChunkResponse>, ChunkResponse)>(100);
+
     loop {
         tokio::select! {
+            // Verarbeite asynchrone Chunk-Responses
+            Some((channel, response)) = chunk_response_rx.recv() => {
+                match swarm.behaviour_mut().chunks.send_response(channel, response.clone()) {
+                    Ok(_) => {
+                         /* eprintln!("✅ Async Chunk Response gesendet für {}", response.chunk_hash); */
+                    }
+                    Err(_) => {
+                         eprintln!("❌ Fehler beim Senden der Async Chunk Response für {}", response.chunk_hash);
+                    }
+                }
+            }
             // Robustheit: Prüfe Peers ohne Namen und erfrage Name nachträglich
             _ = name_request_interval.tick() => {
                 let connected_peers: Vec<PeerId> = swarm.connected_peers().cloned().collect();
@@ -1363,60 +1378,60 @@ pub async fn run_discovery(
                                         // Ein Peer fragt nach einem Chunk
                                         eprintln!("Chunk Request von {} für hash: {}", peer, request.chunk_hash);
                                         
-                                        // Lade Chunk über den Callback, falls vorhanden
-                                        let response = if let Some(ref loader) = chunk_loader_clone {
-                                            if let Some(chunk_data) = loader(&request.chunk_hash) {
-                                                // Tracke Upload: Sende Event wenn Chunk erfolgreich geladen wurde
-                                                let chunk_size = chunk_data.len();
-                                                let peer_id_str = peer.to_string();
-                                                let chunk_hash_clone = request.chunk_hash.clone();
-                                                let event_tx_for_upload = event_tx_clone.clone();
-                                                
-                                                eprintln!("✅ Chunk {} gefunden ({} MB), sende Response an {}", 
-                                                    request.chunk_hash, chunk_size / (1024 * 1024), peer);
-                                                
-                                                // Sende Upload-Event (synchron, da schnell und nicht blockierend)
-                                                let event_tx_for_upload_clone = event_tx_for_upload.clone();
-                                                let peer_id_str_clone = peer_id_str.clone();
-                                                let chunk_hash_clone_upload = chunk_hash_clone.clone();
-                                                if let Err(e) = event_tx_for_upload_clone.send(DiscoveryEvent::ChunkUploaded {
-                                                    peer_id: peer_id_str_clone,
-                                                    chunk_hash: chunk_hash_clone_upload,
+                                        let chunk_loader = chunk_loader_clone.clone();
+                                        let chunk_response_tx = chunk_response_tx.clone();
+                                        let event_tx = event_tx_clone.clone();
+                                        let chunk_hash = request.chunk_hash.clone();
+                                        let peer_str = peer.to_string();
+                                        
+                                        // Asynchrones Laden des Chunks, um den Swarm-Loop nicht zu blockieren
+                                        tokio::spawn(async move {
+                                            // Klone für den inneren Closure
+                                            let peer_str_inner = peer_str.clone();
+                                            let chunk_hash_inner = chunk_hash.clone();
+                                            
+                                            // Führe Blocking I/O im spawn_blocking aus
+                                            let result = tokio::task::spawn_blocking(move || {
+                                                if let Some(loader) = chunk_loader {
+                                                    if let Some(chunk_data) = loader(&chunk_hash_inner) {
+                                                        let chunk_size = chunk_data.len();
+                                                        eprintln!("✅ Chunk {} gefunden ({} MB), bereite Response vor für {}", 
+                                                            chunk_hash_inner, chunk_size / (1024 * 1024), peer_str_inner);
+                                                        
+                                                        return Some((chunk_data, chunk_size));
+                                                    } else {
+                                                        eprintln!("❌ Chunk {} nicht gefunden", chunk_hash_inner);
+                                                    }
+                                                }
+                                                None
+                                            }).await.unwrap_or(None);
+                                            
+                                            let response_msg = if let Some((chunk_data, chunk_size)) = result {
+                                                // Sende Upload-Event
+                                                if let Err(e) = event_tx.send(DiscoveryEvent::ChunkUploaded {
+                                                    peer_id: peer_str.clone(),
+                                                    chunk_hash: chunk_hash.clone(),
                                                     chunk_size,
                                                 }).await {
                                                     eprintln!("Fehler beim Senden von ChunkUploaded Event: {}", e);
                                                 }
                                                 
                                                 ChunkResponse { 
-                                                    chunk_hash: request.chunk_hash.clone(),
+                                                    chunk_hash: chunk_hash,
                                                     chunk_data 
                                                 }
                                             } else {
-                                                // Chunk nicht gefunden
-                                                eprintln!("❌ Chunk {} nicht gefunden", request.chunk_hash);
                                                 ChunkResponse { 
-                                                    chunk_hash: request.chunk_hash.clone(),
+                                                    chunk_hash: chunk_hash,
                                                     chunk_data: Vec::new() 
                                                 }
+                                            };
+                                            
+                                            // Sende Response zurück an den Swarm-Loop via Channel
+                                            if let Err(_) = chunk_response_tx.send((channel, response_msg)).await {
+                                                 eprintln!("Fehler beim Zurücksenden der Chunk Response an Swarm Loop");
                                             }
-                                        } else {
-                                            eprintln!("⚠️ ChunkLoader nicht verfügbar für Chunk {} - sende leere Response", request.chunk_hash);
-                                            ChunkResponse {
-                                                chunk_hash: request.chunk_hash.clone(),
-                                                chunk_data: Vec::new()
-                                            }
-                                        };
-                                        
-                                        match swarm.behaviour_mut().chunks.send_response(channel, response) {
-                                            Ok(_) => {
-                                                eprintln!("✅ Chunk Response erfolgreich gesendet für hash: {} an {}", 
-                                                    request.chunk_hash, peer);
-                                            }
-                                            Err(e) => {
-                                                eprintln!("❌ Fehler beim Senden der Chunk Response für hash: {} an {}: {:?}", 
-                                                    request.chunk_hash, peer, e);
-                                            }
-                                        }
+                                        });
                                     }
                                     libp2p::request_response::Message::Response { request_id, response, .. } => {
                                         // Wir haben einen Chunk erhalten
