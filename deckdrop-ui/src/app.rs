@@ -51,6 +51,14 @@ pub enum GameIntegrityStatus {
     Error(String),
 }
 
+/// Task für den Chunk-Writer-Thread
+#[derive(Debug)]
+pub struct ChunkWriteTask {
+    pub chunk_hash: String,
+    pub chunk_data: Vec<u8>,
+    pub peer_id: String,
+}
+
 /// Main application state
 #[derive(Debug, Clone)]
 pub struct DeckDropApp {
@@ -154,6 +162,9 @@ pub struct DeckDropApp {
     pub edit_game_description: String,
     pub edit_game_additional_instructions: String,
     pub edit_game_path: Option<PathBuf>, // Path of game being edited
+    
+    // Worker Channel für sequentielles Schreiben (verhindert Thread-Explosion)
+    pub chunk_writer_tx: std::sync::mpsc::Sender<ChunkWriteTask>,
 }
 
 /// Tab selection
@@ -388,6 +399,40 @@ impl Default for DeckDropApp {
             }
         }
         
+        // Initialisiere Shared State für Worker-Thread
+        let downloading_starting = Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+        let preparing_downloads = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let processing_chunks = Arc::new(std::sync::Mutex::new(HashSet::new()));
+        let requested_chunks = Arc::new(std::sync::Mutex::new(HashSet::new()));
+        let chunk_peer_requests = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let active_requests_per_peer = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let chunk_download_start_times = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let writing_chunks = Arc::new(std::sync::Mutex::new(HashSet::new()));
+        let chunk_retries = Arc::new(std::sync::Mutex::new(HashMap::new()));
+
+        // Erstelle Worker Channel
+        let (chunk_writer_tx, chunk_writer_rx) = std::sync::mpsc::channel();
+        
+        // Starte Worker Thread
+        let wc_writing = writing_chunks.clone();
+        let wc_requested = requested_chunks.clone();
+        let wc_peer_req = chunk_peer_requests.clone();
+        let wc_active_peer = active_requests_per_peer.clone();
+        let wc_start_times = chunk_download_start_times.clone();
+        let wc_retries = chunk_retries.clone();
+        
+        std::thread::spawn(move || {
+            run_chunk_writer(
+                chunk_writer_rx,
+                wc_writing,
+                wc_requested,
+                wc_peer_req,
+                wc_active_peer,
+                wc_start_times,
+                wc_retries,
+            );
+        });
+
         Self {
             current_tab: Tab::MyGames,
             previous_tab: None,
@@ -396,15 +441,16 @@ impl Default for DeckDropApp {
             network_games,
             peers: Vec::new(),
             active_downloads: HashMap::new(),
-            downloading_starting: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
-            preparing_downloads: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            processing_chunks: Arc::new(std::sync::Mutex::new(HashSet::new())),
-            requested_chunks: Arc::new(std::sync::Mutex::new(HashSet::new())),
-            chunk_peer_requests: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            active_requests_per_peer: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            chunk_download_start_times: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            writing_chunks: Arc::new(std::sync::Mutex::new(HashSet::new())),
-            chunk_retries: Arc::new(std::sync::Mutex::new(HashMap::new())), // Robustheit: Retry-Tracking
+            downloading_starting,
+            preparing_downloads,
+            processing_chunks,
+            requested_chunks,
+            chunk_peer_requests,
+            active_requests_per_peer,
+            chunk_download_start_times,
+            writing_chunks,
+            chunk_retries, // Robustheit: Retry-Tracking
+            chunk_writer_tx, // Worker Channel
             active_uploads: Arc::new(std::sync::Mutex::new(HashMap::new())),
             upload_stats: Arc::new(std::sync::Mutex::new(UploadStats {
                 active_upload_count: 0,
@@ -658,6 +704,40 @@ impl DeckDropApp {
             }
         }
         
+        // Initialisiere Shared State für Worker-Thread
+        let downloading_starting = Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+        let preparing_downloads = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let processing_chunks = Arc::new(std::sync::Mutex::new(HashSet::new()));
+        let requested_chunks = Arc::new(std::sync::Mutex::new(HashSet::new()));
+        let chunk_peer_requests = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let active_requests_per_peer = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let chunk_download_start_times = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let writing_chunks = Arc::new(std::sync::Mutex::new(HashSet::new()));
+        let chunk_retries = Arc::new(std::sync::Mutex::new(HashMap::new()));
+
+        // Erstelle Worker Channel
+        let (chunk_writer_tx, chunk_writer_rx) = std::sync::mpsc::channel();
+        
+        // Starte Worker Thread
+        let wc_writing = writing_chunks.clone();
+        let wc_requested = requested_chunks.clone();
+        let wc_peer_req = chunk_peer_requests.clone();
+        let wc_active_peer = active_requests_per_peer.clone();
+        let wc_start_times = chunk_download_start_times.clone();
+        let wc_retries = chunk_retries.clone();
+        
+        std::thread::spawn(move || {
+            run_chunk_writer(
+                chunk_writer_rx,
+                wc_writing,
+                wc_requested,
+                wc_peer_req,
+                wc_active_peer,
+                wc_start_times,
+                wc_retries,
+            );
+        });
+
         Self {
             current_tab: Tab::MyGames,
             previous_tab: None,
@@ -666,15 +746,16 @@ impl DeckDropApp {
             network_games,
             peers: Vec::new(),
             active_downloads,
-            downloading_starting: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
-            preparing_downloads: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            processing_chunks: Arc::new(std::sync::Mutex::new(HashSet::new())),
-            requested_chunks: Arc::new(std::sync::Mutex::new(HashSet::new())),
-            chunk_peer_requests: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            active_requests_per_peer: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            chunk_download_start_times: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            writing_chunks: Arc::new(std::sync::Mutex::new(HashSet::new())),
-            chunk_retries: Arc::new(std::sync::Mutex::new(HashMap::new())), // Robustheit: Retry-Tracking
+            downloading_starting,
+            preparing_downloads,
+            processing_chunks,
+            requested_chunks,
+            chunk_peer_requests,
+            active_requests_per_peer,
+            chunk_download_start_times,
+            writing_chunks,
+            chunk_retries, // Robustheit: Retry-Tracking
+            chunk_writer_tx, // Worker Channel
             active_uploads: Arc::new(std::sync::Mutex::new(HashMap::new())),
             upload_stats: Arc::new(std::sync::Mutex::new(UploadStats {
                 active_upload_count: 0,
@@ -2376,235 +2457,22 @@ impl DeckDropApp {
                 let active_requests_per_peer_for_thread = self.active_requests_per_peer.clone();
                 let peer_performance_for_thread = self.peer_performance.clone();
                 
-                // WICHTIG: Verschiebe chunk_data direkt in den Thread (move), um Klonen im UI-Thread zu vermeiden
-                // Dies verhindert GUI-Freeze bei großen Chunks (10MB+)
-                // Klone chunk_data erst im Background-Thread, nicht im UI-Thread
-                let requested_chunks_for_thread = self.requested_chunks.clone(); // Clone für Thread
-                let chunk_download_start_times_for_thread = self.chunk_download_start_times.clone(); // Clone für Thread
-                let writing_chunks_for_thread = self.writing_chunks.clone(); // Clone für Thread
-                let chunk_retries_for_thread = self.chunk_retries.clone(); // Clone für Thread
+                // WICHTIG: Verschiebe chunk_data direkt in den Worker (move), um Klonen im UI-Thread zu vermeiden
+                // Worker verarbeitet sequentiell -> keine Thread-Explosion und kein DB-Locking.
                 
-                // WICHTIG: Bewege chunk_data direkt in den Thread (ohne vorheriges Klonen im UI-Thread)
-                // Das Klonen passiert erst im Background-Thread, wenn nötig
-                let chunk_data_for_thread = chunk_data; // Move statt Clone
+                let task = ChunkWriteTask {
+                    chunk_hash: chunk_hash.clone(),
+                    chunk_data, // Move ownership
+                    peer_id: peer_id.clone(),
+                };
                 
-                // Spawn background thread für Chunk-Verarbeitung
-                std::thread::spawn(move || {
-                    // Verwende chunk_data direkt (wurde bereits in den Thread bewegt)
-                    // Klone nur wenn nötig für Funktionen, die Ownership benötigen
-                    
-                    // Drop-Guard: Entfernt Chunk aus "in Verarbeitung" Set am Ende (egal ob Erfolg oder Fehler)
-                    struct ChunkProcessingGuard {
-                        processing_chunks: Arc<std::sync::Mutex<HashSet<String>>>,
-                        chunk_hash: String,
+                if let Err(e) = self.chunk_writer_tx.send(task) {
+                    eprintln!("KRITISCH: Konnte Chunk-Task nicht an Worker senden: {}", e);
+                    // Cleanup processing_chunks falls Senden fehlschlägt
+                    if let Ok(mut processing) = self.processing_chunks.lock() {
+                        processing.remove(&chunk_hash);
                     }
-                    
-                    impl Drop for ChunkProcessingGuard {
-                        fn drop(&mut self) {
-                            if let Ok(mut processing) = self.processing_chunks.lock() {
-                                processing.remove(&self.chunk_hash);
-                            }
-                        }
-                    }
-                    
-                    // Drop-Guard: Entfernt Chunk aus "wird geschrieben" Set am Ende (egal ob Erfolg oder Fehler)
-                    struct WritingChunksGuard {
-                        writing_chunks: Arc<std::sync::Mutex<HashSet<String>>>,
-                        chunk_hash: String,
-                    }
-                    
-                    impl Drop for WritingChunksGuard {
-                        fn drop(&mut self) {
-                            if let Ok(mut writing) = self.writing_chunks.lock() {
-                                writing.remove(&self.chunk_hash);
-                            }
-                        }
-                    }
-                    
-                    let _processing_guard = ChunkProcessingGuard {
-                        processing_chunks: processing_chunks.clone(),
-                        chunk_hash: chunk_hash_clone.clone(),
-                    };
-                    
-                    // Finde game_id aus chunk_hash (durch Manifest-Suche)
-                    if let Ok(game_id) = deckdrop_core::find_game_id_for_chunk(&chunk_hash_clone) {
-                        // Prüfe ob Download pausiert ist
-                        if let Ok(manifest_path) = deckdrop_core::get_manifest_path(&game_id) {
-                            if let Ok(manifest) = deckdrop_core::DownloadManifest::load(&manifest_path) {
-                                // Überspringe wenn pausiert
-                                if !matches!(manifest.overall_status, deckdrop_core::DownloadStatus::Paused) {
-                                    // Robustheit: Validiere Chunk-Größe vor Speicherung
-                                    // Verwende chunk_data_for_thread direkt (kein Clone nötig, da &[u8])
-                                    if let Err(e) = deckdrop_core::validate_chunk_size(&chunk_hash_clone, &chunk_data_for_thread, &manifest) {
-                                        eprintln!("Chunk-Validierung fehlgeschlagen für {}: {}", chunk_hash_clone, e);
-                                        // Entferne Chunk aus "angefordert" Set, damit Retry möglich ist
-                                        if let Ok(mut requested) = requested_chunks_for_thread.lock() {
-                                            requested.remove(&chunk_hash_clone);
-                                        }
-                                        // Entferne Startzeit für diesen Chunk
-                                        if let Ok(mut start_times) = chunk_download_start_times_for_thread.lock() {
-                                            start_times.remove(&chunk_hash_clone);
-                                        }
-                                        return; // Überspringe ungültigen Chunk
-                                    }
-                                    
-                                    // Füge Chunk zu "wird geschrieben" hinzu und erstelle Guard für automatisches Cleanup
-                                    if let Ok(mut writing) = writing_chunks_for_thread.lock() {
-                                        writing.insert(chunk_hash_clone.clone());
-                                    }
-                                    
-                                    // Erstelle Guard der writing_chunks IMMER aufräumt (auch bei Panic/Error)
-                                    let _writing_guard = WritingChunksGuard {
-                                        writing_chunks: writing_chunks_for_thread.clone(),
-                                        chunk_hash: chunk_hash_clone.clone(),
-                                    };
-                                    
-                                    // Schreibe Chunk direkt in die finale Datei (Piece-by-Piece Writing)
-                                    // Lade Manifest für write_chunk_to_file
-                                    eprintln!("DEBUG: Starte Schreiben für Chunk {}", chunk_hash_clone);
-                                    // Verwende chunk_data_for_thread direkt (kein Clone nötig, da &[u8])
-                                    if let Ok(manifest_for_write) = deckdrop_core::DownloadManifest::load(&manifest_path) {
-                                        match deckdrop_core::write_chunk_to_file(&chunk_hash_clone, &chunk_data_for_thread, &manifest_for_write) {
-                                            Ok(()) => {
-                                                eprintln!("DEBUG: Schreiben erfolgreich für Chunk {}. Starte DB-Update...", chunk_hash_clone);
-                                                // Robustheit: Atomares Manifest-Update mit SQLite (verhindert Race Conditions)
-                                                // WICHTIG: Entferne Chunk erst NACH erfolgreichem Manifest-Update aus requested_chunks!
-                                                let chunk_hash_for_update = chunk_hash_clone.clone();
-                                                let manifest_path_display = manifest_path.display().to_string();
-                                                
-                                                // Verwende SQLite für atomares Update
-                                                match deckdrop_core::synch::mark_chunk_downloaded_sqlite(&game_id, &chunk_hash_for_update) {
-                                                    Ok(()) => {
-                                                        eprintln!("DEBUG: DB-Update erfolgreich für Chunk {}", chunk_hash_clone);
-                                                        // Benachrichtige Network-Layer, dass Chunk erfolgreich heruntergeladen wurde
-                                                        // Dies reduziert den globalen active_chunk_downloads Counter und ermöglicht neue Downloads
-                                                        if let Some(tx) = crate::network_bridge::get_download_request_tx() {
-                                                            if let Err(e) = tx.send(
-                                                                deckdrop_network::network::discovery::DownloadRequest::ChunkDownloadCompleted {
-                                                                    chunk_hash: chunk_hash_for_update.clone(),
-                                                                }
-                                                            ) {
-                                                                eprintln!("❌ Fehler beim Senden von ChunkDownloadCompleted: {}", e);
-                                                            }
-                                                        } else {
-                                                            eprintln!("❌ WARNUNG: Kein DownloadRequest Sender verfügbar");
-                                                        }
-
-                                                        // Lade Manifest für Progress-Logging
-                                                        if let Ok(manifest) = deckdrop_core::DownloadManifest::load(&manifest_path) {
-                                                            // Nur bei wichtigen Meilensteinen loggen (jeder 10. Chunk oder bei Fehlern)
-                                                            if manifest.progress.downloaded_chunks % 10 == 0 || manifest.progress.downloaded_chunks == manifest.progress.total_chunks {
-                                                                eprintln!("Manifest aktualisiert: {}/{} Chunks heruntergeladen", 
-                                                                    manifest.progress.downloaded_chunks, 
-                                                                    manifest.progress.total_chunks);
-                                                            }
-                                                            // JETZT erst: Entferne Chunk aus "angefordert" Set, NACH erfolgreichem Manifest-Update
-                                                            if let Ok(mut requested) = requested_chunks_for_thread.lock() {
-                                                                if requested.remove(&chunk_hash_clone) {
-                                                                    println!("🗑️ Chunk {} aus requested_chunks entfernt", chunk_hash_clone);
-                                                                    // Reduziere aktive Request-Zahl für den Peer, der diesen Chunk angefordert hat
-                                                                    if let Ok(mut chunk_peers) = chunk_peer_requests_for_thread.lock() {
-                                                                        if let Some(peer_id) = chunk_peers.remove(&chunk_hash_clone) {
-                                                                            if let Ok(mut active_per_peer) = active_requests_per_peer_for_thread.lock() {
-                                                                                if let Some(count) = active_per_peer.get_mut(&peer_id) {
-                                                                                    if *count > 0 {
-                                                                                        *count -= 1;
-                                                                                    }
-                                                                                }
-                                                                            }
-                                                                        }
-                                                                    }
-                                                                }
-                                                            }
-                                                            // Cleanup der Start-Zeit (writing_chunks wird durch Guard aufgeräumt)
-                                                            if let Ok(mut start_times) = chunk_download_start_times_for_thread.lock() {
-                                                                start_times.remove(&chunk_hash_clone);
-                                                            }
-                                                            
-                                                            // Aktualisiere den Cache der aktiven Downloads im Hintergrund:
-                                                            // Dies sorgt dafür, dass die UI in `update_download_progress`
-                                                            // nur noch den bereits gecachten Zustand lesen muss und kein
-                                                            // blockierendes I/O mehr im Main-Thread ausführt.
-                                                            // WICHTIG: force_update verwenden, damit der Cache sofort den neuen Chunk enthält!
-                                                            let _ = deckdrop_core::force_update_active_downloads();
-                                                            
-                                                            // Lade Manifest erneut für weitere Operationen
-                                                            if let Ok(manifest) = deckdrop_core::DownloadManifest::load(&manifest_path) {
-                                                                // Prüfe ob die BETROFFENE Datei komplett ist und validiere sie im Hintergrund-Thread
-                                                                // Nur die Datei prüfen, zu der dieser Chunk gehört (effizient!)
-                                                                if let Some(file_path) = deckdrop_core::find_file_for_chunk(&manifest, &chunk_hash_clone) {
-                                                                    let game_id_for_validate = game_id.clone();
-                                                                    let manifest_for_validate = manifest.clone();
-                                                                    let file_path_for_validate = file_path.clone();
-                                                                    std::thread::spawn(move || {
-                                                                        // Prüfe nur diese EINE Datei (nicht alle Dateien!)
-                                                                        match deckdrop_core::check_and_validate_single_file(
-                                                                            &game_id_for_validate,
-                                                                            &manifest_for_validate,
-                                                                            &file_path_for_validate,
-                                                                        ) {
-                                                                            Ok(true) => {
-                                                                                println!("Datei validiert: {}", file_path_for_validate);
-                                                                            }
-                                                                            Ok(false) => {
-                                                                                // Datei noch nicht komplett - normal, weiter warten
-                                                                            }
-                                                                            Err(e) => {
-                                                                                eprintln!("Fehler bei Validierung von {}: {}", file_path_for_validate, e);
-                                                                            }
-                                                                        }
-                                                                    });
-                                                                }
-                                                        
-                                                    }
-                                                }
-                                            }
-                                            Err(e) => {
-                                                eprintln!("❌ KRITISCHER FEHLER: Konnte Chunk {} nicht im Manifest markieren: {}", chunk_hash_for_update, e);
-                                                eprintln!("❌ Chunk wird NICHT aus requested_chunks entfernt - wird später retryed");
-
-                                                // Bei Manifest-Fehler: Chunk NICHT entfernen, damit es später nochmal versucht wird
-                                                // Das verhindert Datenverlust und inkonsistente Zustände
-                                                // (wurde noch nicht entfernt, da wir erst nach erfolgreichem Manifest-Update entfernen)
-                                            }
-                                        }
-                                    }
-                                    Err(e) => {
-                                        eprintln!("❌ KRITISCH: Fehler beim Schreiben des Chunks {} in Datei: {}", chunk_hash_clone, e);
-                                        // Bei Fehler: Entferne start_times (writing_chunks wird durch Guard aufgeräumt)
-                                        if let Ok(mut start_times) = chunk_download_start_times_for_thread.lock() {
-                                            start_times.remove(&chunk_hash_clone);
-                                        }
-                                        // WICHTIG: Chunk bleibt in requested_chunks, damit er erneut angefordert werden kann
-                                        // Entferne NICHT aus requested_chunks, damit Retry möglich ist
-                                        
-                                        // Hinweis: Wir versuchen hier NICHT sofort neue Chunks anzufordern.
-                                        // Das periodische `update_download_progress` im UI-Thread übernimmt das Nachfüllen
-                                        // der Requests auf Basis des gecachten Manifests. Dadurch bleibt die Logik einfacher
-                                        // und vermeidet zusätzliche komplexe Pfade im Chunk-Schreibthread.
-                                    }
-                                }
-                                    } else {
-                                        eprintln!("❌ KRITISCH: Fehler beim Laden des Manifests (für Schreibvorgang) für {}: {}", game_id, manifest_path.display());
-                                        // Cleanup bei Fehler: Entferne start_times (writing_chunks wird durch Guard aufgeräumt)
-                                        if let Ok(mut start_times) = chunk_download_start_times_for_thread.lock() {
-                                            start_times.remove(&chunk_hash_clone);
-                                        }
-                                    }
-                                }
-                            } else {
-                                println!("Download pausiert, überspringe Chunk {}", chunk_hash_clone);
-                            }
-                        }
-                    } else {
-                        eprintln!("Konnte game_id für Chunk {} nicht finden", chunk_hash_clone);
-                    }
-                    
-                    // Robustheit: Entferne Retry-Info bei erfolgreichem Download
-                    if let Ok(mut retries) = chunk_retries_for_thread.lock() {
-                        retries.remove(&chunk_hash_clone);
-                    }
-                });
+                }
             }
             DiscoveryEvent::ChunkRequestSent { peer_id, chunk_hash, game_id: _ } => {
                 let start_time = std::time::Instant::now();
@@ -5242,6 +5110,141 @@ fn container_box_style(theme: &Theme) -> iced::widget::container::Style {
         },
         text_color: Some(palette.text),
         shadow: Default::default(),
+    }
+}
+
+/// Worker-Funktion für sequentielles Schreiben von Chunks (verhindert Thread-Explosion)
+fn run_chunk_writer(
+    rx: std::sync::mpsc::Receiver<ChunkWriteTask>,
+    writing_chunks: Arc<std::sync::Mutex<HashSet<String>>>,
+    requested_chunks: Arc<std::sync::Mutex<HashSet<String>>>,
+    chunk_peer_requests: Arc<std::sync::Mutex<HashMap<String, String>>>,
+    active_requests_per_peer: Arc<std::sync::Mutex<HashMap<String, usize>>>,
+    chunk_download_start_times: Arc<std::sync::Mutex<HashMap<String, std::time::Instant>>>,
+    chunk_retries: Arc<std::sync::Mutex<HashMap<String, ChunkRetryInfo>>>,
+) {
+    eprintln!("ChunkWriter Thread gestartet (sequentiell)");
+    
+    while let Ok(task) = rx.recv() {
+        let chunk_hash = task.chunk_hash;
+        let chunk_data = task.chunk_data; // Move ownership
+        let _peer_id = task.peer_id; // Wird aktuell nicht direkt hier verwendet, aber gut für Debugging
+        
+        // Drop-Guard: Entfernt Chunk aus "wird geschrieben" Set am Ende (egal ob Erfolg oder Fehler)
+        struct WritingChunksGuard {
+            writing_chunks: Arc<std::sync::Mutex<HashSet<String>>>,
+            chunk_hash: String,
+        }
+        impl Drop for WritingChunksGuard {
+            fn drop(&mut self) {
+                if let Ok(mut writing) = self.writing_chunks.lock() {
+                    writing.remove(&self.chunk_hash);
+                }
+            }
+        }
+
+        // Markiere als "wird geschrieben"
+        if let Ok(mut writing) = writing_chunks.lock() {
+            writing.insert(chunk_hash.clone());
+        }
+        
+        // Erstelle Guard
+        let _writing_guard = WritingChunksGuard {
+            writing_chunks: writing_chunks.clone(),
+            chunk_hash: chunk_hash.clone(),
+        };
+
+        // Finde Game-ID
+        if let Ok(game_id) = deckdrop_core::find_game_id_for_chunk(&chunk_hash) {
+            // Prüfe ob Download pausiert ist
+            let mut is_paused = false;
+            if let Ok(manifest_path) = deckdrop_core::get_manifest_path(&game_id) {
+                if let Ok(manifest) = deckdrop_core::DownloadManifest::load(&manifest_path) {
+                    if matches!(manifest.overall_status, deckdrop_core::DownloadStatus::Paused) {
+                        is_paused = true;
+                    } else {
+                        // Validierung
+                        if let Err(e) = deckdrop_core::validate_chunk_size(&chunk_hash, &chunk_data, &manifest) {
+                            eprintln!("Chunk-Validierung fehlgeschlagen für {}: {}", chunk_hash, e);
+                            // Cleanup requested/start_times
+                            if let Ok(mut requested) = requested_chunks.lock() { requested.remove(&chunk_hash); }
+                            if let Ok(mut start_times) = chunk_download_start_times.lock() { start_times.remove(&chunk_hash); }
+                            continue;
+                        }
+                        
+                        // Schreiben
+                        eprintln!("DEBUG: Starte Schreiben für Chunk {}", chunk_hash);
+                        match deckdrop_core::write_chunk_to_file(&chunk_hash, &chunk_data, &manifest) {
+                            Ok(()) => {
+                                eprintln!("DEBUG: Schreiben erfolgreich für Chunk {}. Starte DB-Update...", chunk_hash);
+                                // DB Update
+                                match deckdrop_core::synch::mark_chunk_downloaded_sqlite(&game_id, &chunk_hash) {
+                                    Ok(()) => {
+                                        eprintln!("DEBUG: DB-Update erfolgreich für Chunk {}", chunk_hash);
+                                        // Notify Network
+                                        if let Some(tx) = crate::network_bridge::get_download_request_tx() {
+                                            let _ = tx.send(deckdrop_network::network::discovery::DownloadRequest::ChunkDownloadCompleted {
+                                                chunk_hash: chunk_hash.clone(),
+                                            });
+                                        }
+                                        
+                                        // Remove from requested_chunks
+                                        if let Ok(mut requested) = requested_chunks.lock() {
+                                            if requested.remove(&chunk_hash) {
+                                                println!("🗑️ Chunk {} aus requested_chunks entfernt (Worker)", chunk_hash);
+                                                // Decrement peer active requests
+                                                if let Ok(mut chunk_peers) = chunk_peer_requests.lock() {
+                                                    if let Some(pid) = chunk_peers.remove(&chunk_hash) {
+                                                        if let Ok(mut active) = active_requests_per_peer.lock() {
+                                                            if let Some(c) = active.get_mut(&pid) {
+                                                                if *c > 0 { *c -= 1; }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        
+                                        // Cleanup start_times
+                                        if let Ok(mut start_times) = chunk_download_start_times.lock() { start_times.remove(&chunk_hash); }
+                                        
+                                        // Force Update Active Downloads
+                                        let _ = deckdrop_core::force_update_active_downloads();
+                                        
+                                        // Check Single File Integrity (Sequentiell im Worker)
+                                        if let Ok(manifest_reloaded) = deckdrop_core::DownloadManifest::load(&manifest_path) {
+                                             if let Some(file_path) = deckdrop_core::find_file_for_chunk(&manifest_reloaded, &chunk_hash) {
+                                                 let _ = deckdrop_core::check_and_validate_single_file(&game_id, &manifest_reloaded, &file_path);
+                                             }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        eprintln!("KRITISCH: DB Update Fehler für {}: {}", chunk_hash, e);
+                                        // Nicht entfernen aus requested, Retry folgt durch Scheduler Timeout
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("KRITISCH: Schreibfehler für {}: {}", chunk_hash, e);
+                                // Cleanup start_times bei Schreibfehler
+                                if let Ok(mut start_times) = chunk_download_start_times.lock() { start_times.remove(&chunk_hash); }
+                            }
+                        }
+                    }
+                }
+            }
+            
+            if is_paused {
+                 println!("Download pausiert, überspringe Chunk {}", chunk_hash);
+            }
+            
+            // Retry cleanup
+            if let Ok(mut retries) = chunk_retries.lock() {
+                retries.remove(&chunk_hash);
+            }
+        } else {
+            eprintln!("Konnte game_id für Chunk {} nicht finden", chunk_hash);
+        }
     }
 }
 
