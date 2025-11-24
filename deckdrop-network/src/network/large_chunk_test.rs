@@ -27,7 +27,7 @@ mod tests {
         println!("Peer 2 (Downloader) ID: {}", peer_id2_str);
         
         // Erstelle Test-Chunk-Daten (10MB)
-        let chunk_hash = "test_chunk:0";
+        let chunk_hash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:0";
         let chunk_size = 10 * 1024 * 1024; // 10MB
         let chunk_data: Vec<u8> = (0..chunk_size).map(|i| (i % 256) as u8).collect();
         
@@ -213,7 +213,7 @@ mod tests {
         println!("Peer 4 (Downloader) ID: {}", peer_id4_str);
         
         // Erstelle Test-Chunk-Daten (10MB)
-        let chunk_hash = "test_chunk:0";
+        let chunk_hash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:0";
         let chunk_size = 10 * 1024 * 1024; // 10MB
         let chunk_data: Vec<u8> = (0..chunk_size).map(|i| (i % 256) as u8).collect();
         

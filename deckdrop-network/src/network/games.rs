@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 use std::io;
 use std::time::Duration;
 use futures::{AsyncRead, AsyncWrite, AsyncReadExt, AsyncWriteExt};
+use std::convert::TryInto;
+use hex;
 
 /// Request zum Abfragen der Spiele-Liste eines Peers
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -207,8 +209,8 @@ pub struct GameMetadataRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(dead_code)]
 pub struct GameMetadataResponse {
-    pub deckdrop_toml: String,
-    pub deckdrop_chunks_toml: String,
+    pub deckdrop_toml: Vec<u8>,
+    pub deckdrop_chunks_toml: Vec<u8>,
 }
 
 /// Codec für Game-Metadaten-Requests/Responses
@@ -241,15 +243,39 @@ impl Codec for GameMetadataCodec {
     where
         T: AsyncRead + Unpin + Send,
     {
-        let mut len_bytes = [0u8; 4];
-        io.read_exact(&mut len_bytes).await?;
-        let len = u32::from_be_bytes(len_bytes) as usize;
+        // Binäres Format:
+        // [Len A (4)] [Bytes A] [Len B (4)] [Bytes B]
         
-        let mut buf = vec![0u8; len];
-        io.read_exact(&mut buf).await?;
+        // 1. deckdrop.toml Länge
+        let mut len_a_bytes = [0u8; 4];
+        io.read_exact(&mut len_a_bytes).await?;
+        let len_a = u32::from_be_bytes(len_a_bytes) as usize;
         
-        serde_json::from_slice(&buf)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+        // Limit check (z.B. max 1MB für config)
+        if len_a > 1024 * 1024 {
+             return Err(io::Error::new(io::ErrorKind::InvalidData, "deckdrop.toml zu groß"));
+        }
+        
+        let mut deckdrop_toml = vec![0u8; len_a];
+        io.read_exact(&mut deckdrop_toml).await?;
+        
+        // 2. deckdrop_chunks.toml Länge
+        let mut len_b_bytes = [0u8; 4];
+        io.read_exact(&mut len_b_bytes).await?;
+        let len_b = u32::from_be_bytes(len_b_bytes) as usize;
+        
+        // Limit check (z.B. max 10MB für chunks list)
+        if len_b > 10 * 1024 * 1024 {
+             return Err(io::Error::new(io::ErrorKind::InvalidData, "deckdrop_chunks.toml zu groß"));
+        }
+        
+        let mut deckdrop_chunks_toml = vec![0u8; len_b];
+        io.read_exact(&mut deckdrop_chunks_toml).await?;
+        
+        Ok(GameMetadataResponse {
+            deckdrop_toml,
+            deckdrop_chunks_toml,
+        })
     }
 
     async fn write_request<T>(&mut self, _protocol: &Self::Protocol, io: &mut T, req: Self::Request) -> io::Result<()>
@@ -271,12 +297,15 @@ impl Codec for GameMetadataCodec {
     where
         T: AsyncWrite + Unpin + Send,
     {
-        let json = serde_json::to_vec(&res)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        // Binäres Format ohne JSON Wrapper
+        let len_a = res.deckdrop_toml.len() as u32;
+        io.write_all(&len_a.to_be_bytes()).await?;
+        io.write_all(&res.deckdrop_toml).await?;
         
-        let len = json.len() as u32;
-        io.write_all(&len.to_be_bytes()).await?;
-        io.write_all(&json).await?;
+        let len_b = res.deckdrop_chunks_toml.len() as u32;
+        io.write_all(&len_b.to_be_bytes()).await?;
+        io.write_all(&res.deckdrop_chunks_toml).await?;
+        
         io.flush().await?;
         
         Ok(())
@@ -304,19 +333,80 @@ pub fn create_game_metadata_behaviour() -> GameMetadataBehaviour {
 // Chunk Request/Response (für Download)
 // ============================================================================
 
+use bytes::Bytes;
+
 /// Request zum Abfragen eines Chunks
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(dead_code)]
 pub struct ChunkRequest {
-    pub chunk_hash: String,  // Blake3 Hash im Format "{hash}:{chunk_index}"
+    pub file_hash: [u8; 32],
+    pub chunk_index: u32,
+}
+
+impl ChunkRequest {
+    /// Erstellt einen Request aus einem String-ID Format "hash:index"
+    pub fn from_string_id(id: &str) -> Option<Self> {
+        let parts: Vec<&str> = id.split(':').collect();
+        if parts.len() != 2 {
+            return None;
+        }
+        
+        let hash_bytes = hex::decode(parts[0]).ok()?;
+        if hash_bytes.len() != 32 {
+            return None;
+        }
+        
+        let index = parts[1].parse::<u32>().ok()?;
+        
+        Some(Self {
+            file_hash: hash_bytes.try_into().ok()?,
+            chunk_index: index,
+        })
+    }
+    
+    /// Gibt die ID als String zurück "hash:index"
+    pub fn to_string_id(&self) -> String {
+        format!("{}:{}", hex::encode(self.file_hash), self.chunk_index)
+    }
+}
+
+/// Status eines Chunk-Requests
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChunkStatus {
+    Ok = 0,
+    NotFound = 1,
+    Error = 2,
+}
+
+impl From<u8> for ChunkStatus {
+    fn from(byte: u8) -> Self {
+        match byte {
+            0 => ChunkStatus::Ok,
+            1 => ChunkStatus::NotFound,
+            _ => ChunkStatus::Error,
+        }
+    }
 }
 
 /// Response mit Chunk-Daten
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(dead_code)]
 pub struct ChunkResponse {
-    pub chunk_hash: String,   // Der Hash des Chunks (zur Identifikation)
-    pub chunk_data: Vec<u8>,  // Die Chunk-Daten (max 10MB)
+    pub file_hash: [u8; 32],
+    pub chunk_index: u32,
+    pub status: u8, // 0 = OK, 1 = NotFound, 2 = Error
+    #[serde(skip)]
+    pub chunk_data: Bytes,
+}
+
+impl ChunkResponse {
+    pub fn to_string_id(&self) -> String {
+        format!("{}:{}", hex::encode(self.file_hash), self.chunk_index)
+    }
+    
+    pub fn status(&self) -> ChunkStatus {
+        self.status.into()
+    }
 }
 
 /// Codec für Chunk-Requests/Responses
@@ -334,47 +424,45 @@ impl Codec for ChunkCodec {
     where
         T: AsyncRead + Unpin + Send,
     {
-        let mut len_bytes = [0u8; 4];
-        io.read_exact(&mut len_bytes).await?;
-        let len = u32::from_be_bytes(len_bytes) as usize;
-        
-        let mut buf = vec![0u8; len];
-        io.read_exact(&mut buf).await?;
-        
-        serde_json::from_slice(&buf)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+        // 1. Hash lesen (32 Bytes)
+        let mut hash_bytes = [0u8; 32];
+        io.read_exact(&mut hash_bytes).await?;
+
+        // 2. Index lesen (4 Bytes)
+        let mut index_bytes = [0u8; 4];
+        io.read_exact(&mut index_bytes).await?;
+        let chunk_index = u32::from_be_bytes(index_bytes);
+
+        Ok(ChunkRequest {
+            file_hash: hash_bytes,
+            chunk_index,
+        })
     }
 
     async fn read_response<T>(&mut self, _protocol: &Self::Protocol, io: &mut T) -> io::Result<Self::Response>
     where
         T: AsyncRead + Unpin + Send,
     {
-        // Für Chunk-Responses verwenden wir binäres Format (nicht JSON)
-        // Lese chunk_hash Länge (4 Bytes)
-        let mut hash_len_bytes = [0u8; 4];
-        io.read_exact(&mut hash_len_bytes).await?;
-        let hash_len = u32::from_be_bytes(hash_len_bytes) as usize;
+        // 1. Hash lesen (32 Bytes)
+        let mut hash_bytes = [0u8; 32];
+        io.read_exact(&mut hash_bytes).await?;
+
+        // 2. Index lesen (4 Bytes)
+        let mut index_bytes = [0u8; 4];
+        io.read_exact(&mut index_bytes).await?;
+        let chunk_index = u32::from_be_bytes(index_bytes);
         
-        // Validierung: Hash-Länge sollte vernünftig sein (max 256 Bytes für einen Hash-String)
-        if hash_len > 256 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("Hash-Länge zu groß: {} Bytes (max 256)", hash_len),
-            ));
-        }
+        // 3. Status lesen (1 Byte)
+        let mut status_byte = [0u8; 1];
+        io.read_exact(&mut status_byte).await?;
+        let status = status_byte[0];
         
-        // Lese chunk_hash
-        let mut chunk_hash_bytes = vec![0u8; hash_len];
-        io.read_exact(&mut chunk_hash_bytes).await?;
-        let chunk_hash = String::from_utf8(chunk_hash_bytes)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        
-        // Lese Chunk-Daten Länge (4 Bytes)
+        // 4. Daten-Länge lesen (4 Bytes)
         let mut len_bytes = [0u8; 4];
         io.read_exact(&mut len_bytes).await?;
         let data_len = u32::from_be_bytes(len_bytes) as usize;
         
-        // Validierung: Chunk-Daten sollten maximal 15MB sein (10MB + Overhead für Sicherheit)
+        // Validierung: Chunk-Daten sollten maximal 15MB sein
         const MAX_CHUNK_SIZE: usize = 15 * 1024 * 1024; // 15MB
         if data_len > MAX_CHUNK_SIZE {
             return Err(io::Error::new(
@@ -383,25 +471,28 @@ impl Codec for ChunkCodec {
             ));
         }
         
-        // Lese Chunk-Daten
+        // 5. Chunk-Daten lesen
         let mut chunk_data = vec![0u8; data_len];
-        io.read_exact(&mut chunk_data).await?;
+        if data_len > 0 {
+            io.read_exact(&mut chunk_data).await?;
+        }
         
-        Ok(ChunkResponse { chunk_hash, chunk_data })
+        Ok(ChunkResponse { 
+            file_hash: hash_bytes, 
+            chunk_index,
+            status,
+            chunk_data: Bytes::from(chunk_data)
+        })
     }
 
     async fn write_request<T>(&mut self, _protocol: &Self::Protocol, io: &mut T, req: Self::Request) -> io::Result<()>
     where
         T: AsyncWrite + Unpin + Send,
     {
-        let json = serde_json::to_vec(&req)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        
-        let len = json.len() as u32;
-        io.write_all(&len.to_be_bytes()).await?;
-        io.write_all(&json).await?;
+        // Binäres Format schreiben: Hash (32) + Index (4) = 36 Bytes
+        io.write_all(&req.file_hash).await?;
+        io.write_all(&req.chunk_index.to_be_bytes()).await?;
         io.flush().await?;
-        
         Ok(())
     }
 
@@ -409,17 +500,16 @@ impl Codec for ChunkCodec {
     where
         T: AsyncWrite + Unpin + Send,
     {
-        // Für Chunk-Responses verwenden wir binäres Format (nicht JSON)
-        // Schreibe chunk_hash Länge und chunk_hash
-        let hash_bytes = res.chunk_hash.as_bytes();
-        let hash_len = hash_bytes.len() as u32;
-        io.write_all(&hash_len.to_be_bytes()).await?;
-        io.write_all(hash_bytes).await?;
+        // Binäres Format: Hash (32) + Index (4) + Status (1) + Len (4) + Data (N)
+        io.write_all(&res.file_hash).await?;
+        io.write_all(&res.chunk_index.to_be_bytes()).await?;
+        io.write_all(&[res.status]).await?;
         
-        // Schreibe Chunk-Daten Länge und Chunk-Daten
         let data_len = res.chunk_data.len() as u32;
         io.write_all(&data_len.to_be_bytes()).await?;
-        io.write_all(&res.chunk_data).await?;
+        if data_len > 0 {
+            io.write_all(&res.chunk_data).await?;
+        }
         io.flush().await?;
         
         Ok(())
@@ -775,257 +865,6 @@ mod tests {
         assert!(json.contains("creator-456"));
     }
 
-// ============================================================================
-// Game Metadata Request/Response (für Download)
-// ============================================================================
-
-/// Request zum Abfragen der Metadaten eines Spiels (deckdrop.toml und deckdrop_chunks.toml)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[allow(dead_code)]
-pub struct GameMetadataRequest {
-    pub game_id: String,
-}
-
-/// Response mit den Metadaten eines Spiels
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[allow(dead_code)]
-pub struct GameMetadataResponse {
-    pub deckdrop_toml: String,
-    pub deckdrop_chunks_toml: String,
-}
-
-/// Codec für Game-Metadaten-Requests/Responses
-#[derive(Clone, Default)]
-#[allow(dead_code)]
-pub struct GameMetadataCodec;
-
-#[async_trait::async_trait]
-impl Codec for GameMetadataCodec {
-    type Protocol = String;
-    type Request = GameMetadataRequest;
-    type Response = GameMetadataResponse;
-
-    async fn read_request<T>(&mut self, _protocol: &Self::Protocol, io: &mut T) -> io::Result<Self::Request>
-    where
-        T: AsyncRead + Unpin + Send,
-    {
-        let mut len_bytes = [0u8; 4];
-        io.read_exact(&mut len_bytes).await?;
-        let len = u32::from_be_bytes(len_bytes) as usize;
-        
-        let mut buf = vec![0u8; len];
-        io.read_exact(&mut buf).await?;
-        
-        serde_json::from_slice(&buf)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
-    }
-
-    async fn read_response<T>(&mut self, _protocol: &Self::Protocol, io: &mut T) -> io::Result<Self::Response>
-    where
-        T: AsyncRead + Unpin + Send,
-    {
-        let mut len_bytes = [0u8; 4];
-        io.read_exact(&mut len_bytes).await?;
-        let len = u32::from_be_bytes(len_bytes) as usize;
-        
-        let mut buf = vec![0u8; len];
-        io.read_exact(&mut buf).await?;
-        
-        serde_json::from_slice(&buf)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
-    }
-
-    async fn write_request<T>(&mut self, _protocol: &Self::Protocol, io: &mut T, req: Self::Request) -> io::Result<()>
-    where
-        T: AsyncWrite + Unpin + Send,
-    {
-        let json = serde_json::to_vec(&req)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        
-        let len = json.len() as u32;
-        io.write_all(&len.to_be_bytes()).await?;
-        io.write_all(&json).await?;
-        io.flush().await?;
-        
-        Ok(())
-    }
-
-    async fn write_response<T>(&mut self, _protocol: &Self::Protocol, io: &mut T, res: Self::Response) -> io::Result<()>
-    where
-        T: AsyncWrite + Unpin + Send,
-    {
-        let json = serde_json::to_vec(&res)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        
-        let len = json.len() as u32;
-        io.write_all(&len.to_be_bytes()).await?;
-        io.write_all(&json).await?;
-        io.flush().await?;
-        
-        Ok(())
-    }
-}
-
-/// Network Behaviour für Game-Metadaten
-#[allow(dead_code)]
-pub type GameMetadataBehaviour = libp2p::request_response::Behaviour<GameMetadataCodec>;
-
-/// Erstellt ein GameMetadataBehaviour
-#[allow(dead_code)]
-pub fn create_game_metadata_behaviour() -> GameMetadataBehaviour {
-    let config = libp2p::request_response::Config::default()
-        // Robustheit: Erhöhe Timeout auf 60 Sekunden für größere Daten und langsamere Verbindungen
-        .with_request_timeout(Duration::from_secs(60));
-    
-    libp2p::request_response::Behaviour::new(
-        [(String::from("/deckdrop/game-metadata/1.0.0"), ProtocolSupport::Full)],
-        config,
-    )
-}
-
-// ============================================================================
-// Chunk Request/Response (für Download)
-// ============================================================================
-
-/// Request zum Abfragen eines Chunks
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[allow(dead_code)]
-pub struct ChunkRequest {
-    pub chunk_hash: String,  // Blake3 Hash im Format "{hash}:{chunk_index}"
-}
-
-/// Response mit Chunk-Daten
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[allow(dead_code)]
-pub struct ChunkResponse {
-    pub chunk_hash: String,   // Der Hash des Chunks (zur Identifikation)
-    pub chunk_data: Vec<u8>,  // Die Chunk-Daten (max 10MB)
-}
-
-/// Codec für Chunk-Requests/Responses
-#[derive(Clone, Default)]
-#[allow(dead_code)]
-pub struct ChunkCodec;
-
-#[async_trait::async_trait]
-impl Codec for ChunkCodec {
-    type Protocol = String;
-    type Request = ChunkRequest;
-    type Response = ChunkResponse;
-
-    async fn read_request<T>(&mut self, _protocol: &Self::Protocol, io: &mut T) -> io::Result<Self::Request>
-    where
-        T: AsyncRead + Unpin + Send,
-    {
-        let mut len_bytes = [0u8; 4];
-        io.read_exact(&mut len_bytes).await?;
-        let len = u32::from_be_bytes(len_bytes) as usize;
-        
-        let mut buf = vec![0u8; len];
-        io.read_exact(&mut buf).await?;
-        
-        serde_json::from_slice(&buf)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
-    }
-
-    async fn read_response<T>(&mut self, _protocol: &Self::Protocol, io: &mut T) -> io::Result<Self::Response>
-    where
-        T: AsyncRead + Unpin + Send,
-    {
-        // Für Chunk-Responses verwenden wir binäres Format (nicht JSON)
-        // Lese chunk_hash Länge (4 Bytes)
-        let mut hash_len_bytes = [0u8; 4];
-        io.read_exact(&mut hash_len_bytes).await?;
-        let hash_len = u32::from_be_bytes(hash_len_bytes) as usize;
-        
-        // Validierung: Hash-Länge sollte vernünftig sein (max 256 Bytes für einen Hash-String)
-        if hash_len > 256 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("Hash-Länge zu groß: {} Bytes (max 256)", hash_len),
-            ));
-        }
-        
-        // Lese chunk_hash
-        let mut chunk_hash_bytes = vec![0u8; hash_len];
-        io.read_exact(&mut chunk_hash_bytes).await?;
-        let chunk_hash = String::from_utf8(chunk_hash_bytes)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        
-        // Lese Chunk-Daten Länge (4 Bytes)
-        let mut len_bytes = [0u8; 4];
-        io.read_exact(&mut len_bytes).await?;
-        let data_len = u32::from_be_bytes(len_bytes) as usize;
-        
-        // Validierung: Chunk-Daten sollten maximal 15MB sein (10MB + Overhead für Sicherheit)
-        const MAX_CHUNK_SIZE: usize = 15 * 1024 * 1024; // 15MB
-        if data_len > MAX_CHUNK_SIZE {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("Chunk-Daten zu groß: {} Bytes (max {} Bytes)", data_len, MAX_CHUNK_SIZE),
-            ));
-        }
-        
-        // Lese Chunk-Daten
-        let mut chunk_data = vec![0u8; data_len];
-        io.read_exact(&mut chunk_data).await?;
-        
-        Ok(ChunkResponse { chunk_hash, chunk_data })
-    }
-
-    async fn write_request<T>(&mut self, _protocol: &Self::Protocol, io: &mut T, req: Self::Request) -> io::Result<()>
-    where
-        T: AsyncWrite + Unpin + Send,
-    {
-        let json = serde_json::to_vec(&req)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        
-        let len = json.len() as u32;
-        io.write_all(&len.to_be_bytes()).await?;
-        io.write_all(&json).await?;
-        io.flush().await?;
-        
-        Ok(())
-    }
-
-    async fn write_response<T>(&mut self, _protocol: &Self::Protocol, io: &mut T, res: Self::Response) -> io::Result<()>
-    where
-        T: AsyncWrite + Unpin + Send,
-    {
-        // Für Chunk-Responses verwenden wir binäres Format (nicht JSON)
-        // Schreibe chunk_hash Länge und chunk_hash
-        let hash_bytes = res.chunk_hash.as_bytes();
-        let hash_len = hash_bytes.len() as u32;
-        io.write_all(&hash_len.to_be_bytes()).await?;
-        io.write_all(hash_bytes).await?;
-        
-        // Schreibe Chunk-Daten Länge und Chunk-Daten
-        let data_len = res.chunk_data.len() as u32;
-        io.write_all(&data_len.to_be_bytes()).await?;
-        io.write_all(&res.chunk_data).await?;
-        io.flush().await?;
-        
-        Ok(())
-    }
-}
-
-/// Network Behaviour für Chunks
-#[allow(dead_code)]
-pub type ChunkBehaviour = libp2p::request_response::Behaviour<ChunkCodec>;
-
-/// Erstellt ein ChunkBehaviour
-#[allow(dead_code)]
-pub fn create_chunk_behaviour() -> ChunkBehaviour {
-    let config = libp2p::request_response::Config::default()
-        // Robustheit: Erhöhe Timeout auf 300 Sekunden (5 Minuten) für große Chunks
-        // Dies gibt genug Zeit für langsame Verbindungen und verhindert vorzeitige Timeouts
-        .with_request_timeout(Duration::from_secs(300));
-    
-    libp2p::request_response::Behaviour::new(
-        [(String::from("/deckdrop/chunks/1.0.0"), ProtocolSupport::Full)],
-        config,
-    )
-}
 
     #[test]
     fn test_network_game_info_unique_key() {

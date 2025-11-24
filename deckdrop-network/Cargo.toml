@@ -12,3 +12,5 @@ futures = "0.3"
 tokio-util = { version = "0.7", features = ["codec"] }
 bytes = "1"
 async-trait = "0.1"
+hex = "0.4.3"
+bincode = "2.0.1"

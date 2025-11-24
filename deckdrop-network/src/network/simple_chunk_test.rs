@@ -27,7 +27,7 @@ mod tests {
         println!("Peer 2 (Downloader) ID: {}", peer_id2_str);
         
         // Erstelle Test-Chunk-Daten (1KB - sehr klein)
-        let chunk_hash = "test_chunk:0";
+        let chunk_hash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:0";
         let chunk_data = vec![42u8; 1024]; // 1KB
         
         let mut chunks_data: HashMap<String, Vec<u8>> = HashMap::new();
@@ -162,6 +162,7 @@ mod tests {
         }
     }
 }
+
 
 
 

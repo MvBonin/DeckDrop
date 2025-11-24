@@ -349,9 +349,14 @@ impl Default for DeckDropApp {
                 eprintln!("AsyncLoader (Default): Starte Laden von aktiven Downloads...");
                 let active_downloads_from_manifests = deckdrop_core::load_active_downloads();
                 eprintln!("AsyncLoader (Default): {} aktive Downloads geladen. Sende an UI...", active_downloads_from_manifests.len());
+                // Entferne das Logging, da es bei großen Manifesten die Konsole spammt
+                /*
                 if let Err(e) = tx.send(Message::ActiveDownloadsLoaded(active_downloads_from_manifests)) {
                     eprintln!("Fehler beim Senden von ActiveDownloadsLoaded: {}", e);
                 }
+                */
+                // Stattdessen nur senden ohne Logging des Manifests
+                let _ = tx.send(Message::ActiveDownloadsLoaded(active_downloads_from_manifests));
             });
         } else {
             eprintln!("KRITISCHER FEHLER: Download-Prep-Sender nicht verfügbar in Default::default()! UI wird leer bleiben.");
@@ -683,9 +688,14 @@ impl DeckDropApp {
                 eprintln!("AsyncLoader: Starte Laden von aktiven Downloads...");
                 let active_downloads_from_manifests = deckdrop_core::load_active_downloads();
                 eprintln!("AsyncLoader: {} aktive Downloads geladen. Sende an UI...", active_downloads_from_manifests.len());
+                // Entferne das Logging, da es bei großen Manifesten die Konsole spammt
+                /*
                 if let Err(e) = tx.send(Message::ActiveDownloadsLoaded(active_downloads_from_manifests)) {
                     eprintln!("Fehler beim Senden von ActiveDownloadsLoaded: {}", e);
                 }
+                */
+                // Stattdessen nur senden ohne Logging des Manifests
+                let _ = tx.send(Message::ActiveDownloadsLoaded(active_downloads_from_manifests));
             });
         } else {
             eprintln!("KRITISCHER FEHLER: Download-Prep-Sender nicht verfügbar in new_with_network_rx!");
@@ -2216,6 +2226,23 @@ impl DeckDropApp {
                     games.retain(|(pid, _)| pid != &peer_id);
                     !games.is_empty()
                 });
+                
+                // WICHTIG: Aktualisiere Scheduler für alle aktiven Downloads, die diesen Peer genutzt haben
+                for (game_id, download_state) in &self.active_downloads {
+                    if matches!(download_state.manifest.overall_status, deckdrop_core::DownloadStatus::Downloading) {
+                        // Wenn dieser Peer für dieses Spiel relevant war, aktualisiere die Liste
+                        if let Some(peers) = self.network_games.get(game_id) {
+                            let peer_ids: Vec<String> = peers.iter().map(|(pid, _)| pid.clone()).collect();
+                            // Auch wenn leer, registrieren (Scheduler stoppt dann Requests)
+                            crate::network_bridge::register_download_peers(game_id, &peer_ids);
+                            eprintln!("PeerLost: Scheduler aktualisiert für Spiel {} ({} Peers verbleibend)", game_id, peer_ids.len());
+                        } else {
+                            // Keine Peers mehr für dieses Spiel
+                            crate::network_bridge::register_download_peers(game_id, &[]);
+                            eprintln!("PeerLost: Scheduler aktualisiert für Spiel {} (0 Peers verbleibend)", game_id);
+                        }
+                    }
+                }
             }
             DiscoveryEvent::GamesListReceived { peer_id, games } => {
                 // Aktualisiere Spiele-Liste für diesen Peer
@@ -2240,9 +2267,9 @@ impl DeckDropApp {
                 }
                 
                 // WICHTIG: Prüfe ob wir Pending-Downloads haben, die jetzt gestartet werden können
-                // Wenn ein Peer online geht, der ein Spiel hat, das wir haben wollen, muss direkt gedownloaded werden
+                // Oder ob wir laufende Downloads haben, für die dieser Peer neue Quellen bietet
                 for (game_id, download_state) in &self.active_downloads {
-                    // Prüfe ob Download Pending ist und ob dieser Peer das Spiel hat
+                    // Fall 1: Download ist Pending - Starte Download wenn Peer das Spiel hat
                     if matches!(download_state.manifest.overall_status, deckdrop_core::DownloadStatus::Pending) {
                         // Prüfe ob dieser Peer das Spiel hat
                         if let Some(peers) = self.network_games.get(game_id) {
@@ -2256,6 +2283,27 @@ impl DeckDropApp {
                                             game_id: game_id.clone(),
                                         });
                                         eprintln!("GameMetadata-Request gesendet für {} an {}", game_id, peer_id_for_download);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // Fall 2: Download läuft bereits (Downloading) - Aktualisiere Scheduler mit neuem Peer
+                    else if matches!(download_state.manifest.overall_status, deckdrop_core::DownloadStatus::Downloading) {
+                        // Prüfe ob dieser Peer das Spiel hat
+                        if let Some(peers) = self.network_games.get(game_id) {
+                            // Wenn der neue Peer in der Liste ist (was er sein sollte, da wir network_games gerade geupdated haben)
+                            // UND das Spiel hat (impliziert durch network_games Eintrag)
+                            if peers.iter().any(|(pid, _)| pid == &peer_id) {
+                                // Hole alle Peers für dieses Spiel
+                                let peer_ids: Vec<String> = peers.iter().map(|(pid, _)| pid.clone()).collect();
+                                
+                                // Registriere neue Peer-Liste im Scheduler
+                                if !peer_ids.is_empty() {
+                                    let changed = crate::network_bridge::register_download_peers(game_id, &peer_ids);
+                                    if changed {
+                                        eprintln!("Scheduler aktualisiert für Spiel {}: {} Peers (Neuer Peer: {})", 
+                                            game_id, peer_ids.len(), peer_id);
                                     }
                                 }
                             }
@@ -2478,7 +2526,7 @@ impl DeckDropApp {
                 
                 let task = ChunkWriteTask {
                     chunk_hash: chunk_hash.clone(),
-                    chunk_data, // Move ownership
+                    chunk_data: chunk_data.to_vec(), // Move ownership
                     peer_id: peer_id.clone(),
                 };
                 

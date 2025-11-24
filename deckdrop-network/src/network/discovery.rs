@@ -13,8 +13,9 @@ use crate::network::{peer::PeerInfo, channel::PeerUpdateSender, games::{
     GamesListBehaviour, GamesListRequest, GamesListResponse, NetworkGameInfo, 
     create_games_list_behaviour,
     GameMetadataBehaviour, GameMetadataRequest, GameMetadataResponse, create_game_metadata_behaviour,
-    ChunkBehaviour, ChunkRequest, ChunkResponse, create_chunk_behaviour,
+    ChunkBehaviour, ChunkRequest, ChunkResponse, ChunkStatus, create_chunk_behaviour,
 }};
+use bytes::Bytes;
 
 #[derive(libp2p::swarm::NetworkBehaviour)]
 pub struct DiscoveryBehaviour {
@@ -48,7 +49,7 @@ pub enum DiscoveryEvent {
     ChunkReceived {
         peer_id: String,
         chunk_hash: String,
-        chunk_data: Vec<u8>,
+        chunk_data: Bytes,
     },
     ChunkRequestFailed {
         peer_id: String,
@@ -396,10 +397,10 @@ pub async fn run_discovery(
             Some((channel, response)) = chunk_response_rx.recv() => {
                 match swarm.behaviour_mut().chunks.send_response(channel, response.clone()) {
                     Ok(_) => {
-                         /* eprintln!("✅ Async Chunk Response gesendet für {}", response.chunk_hash); */
+                         /* eprintln!("✅ Async Chunk Response gesendet für {}", response.to_string_id()); */
                     }
                     Err(_) => {
-                         eprintln!("❌ Fehler beim Senden der Async Chunk Response für {}", response.chunk_hash);
+                         eprintln!("❌ Fehler beim Senden der Async Chunk Response für {}", response.to_string_id());
                     }
                 }
             }
@@ -858,7 +859,13 @@ pub async fn run_discovery(
                                 }
                             }
                             
-                            let request = ChunkRequest { chunk_hash: chunk_hash.clone() };
+                            let request = match ChunkRequest::from_string_id(&chunk_hash) {
+                                Some(r) => r,
+                                None => {
+                                    eprintln!("Ungültige Chunk ID: {}", chunk_hash);
+                                    continue;
+                                }
+                            };
                             let request_id = swarm.behaviour_mut().chunks.send_request(&peer_id_parsed, request);
                             
                             // Tracke Request-ID für bessere Zuordnung (inkl. Zeit für Timeout-Analyse)
@@ -946,7 +953,13 @@ pub async fn run_discovery(
                                     }
 
                                     // Sende den wartenden Chunk-Request
-                                    let request = ChunkRequest { chunk_hash: chunk_hash.clone() };
+                                    let request = match ChunkRequest::from_string_id(&chunk_hash) {
+                                Some(r) => r,
+                                None => {
+                                    eprintln!("Ungültige Chunk ID: {}", chunk_hash);
+                                    continue;
+                                }
+                            };
                                     let request_id = swarm.behaviour_mut().chunks.send_request(&peer_id_parsed, request);
 
                                     // Tracke Request
@@ -1223,21 +1236,21 @@ pub async fn run_discovery(
                                         let response = if let Some(ref loader) = game_metadata_loader_clone {
                                             if let Some((deckdrop_toml, deckdrop_chunks_toml)) = loader(&request.game_id) {
                                                 GameMetadataResponse {
-                                                    deckdrop_toml,
-                                                    deckdrop_chunks_toml,
+                                                    deckdrop_toml: deckdrop_toml.into_bytes(),
+                                                    deckdrop_chunks_toml: deckdrop_chunks_toml.into_bytes(),
                                                 }
                                             } else {
                                                 // Spiel nicht gefunden
                                                 eprintln!("Spiel {} nicht gefunden für GameMetadata Request", request.game_id);
                                                 GameMetadataResponse {
-                                                    deckdrop_toml: String::new(),
-                                                    deckdrop_chunks_toml: String::new(),
+                                                    deckdrop_toml: Vec::new(),
+                                                    deckdrop_chunks_toml: Vec::new(),
                                                 }
                                             }
                                         } else {
                                             GameMetadataResponse {
-                                                deckdrop_toml: String::new(),
-                                                deckdrop_chunks_toml: String::new(),
+                                                deckdrop_toml: Vec::new(),
+                                                deckdrop_chunks_toml: Vec::new(),
                                             }
                                         };
                                         let _ = swarm.behaviour_mut().game_metadata.send_response(channel, response);
@@ -1253,7 +1266,9 @@ pub async fn run_discovery(
                                                 tracked_game_id
                                             } else {
                                                 // Fallback: Extrahiere game_id aus deckdrop.toml
-                                                response.deckdrop_toml.lines()
+                                                // Konvertiere Vec<u8> temporär zu String für Parsing
+                                                let toml_str = String::from_utf8_lossy(&response.deckdrop_toml);
+                                                toml_str.lines()
                                                     .find(|l| l.trim().starts_with("game_id"))
                                                     .and_then(|l| l.split('=').nth(1))
                                                     .map(|s| s.trim().trim_matches('"').trim_matches('\'').to_string())
@@ -1269,8 +1284,8 @@ pub async fn run_discovery(
                                         let _ = event_tx_clone.send(DiscoveryEvent::GameMetadataReceived {
                                             peer_id: peer_id_str,
                                             game_id,
-                                            deckdrop_toml: response.deckdrop_toml,
-                                            deckdrop_chunks_toml: response.deckdrop_chunks_toml,
+                                            deckdrop_toml: String::from_utf8_lossy(&response.deckdrop_toml).to_string(),
+                                            deckdrop_chunks_toml: String::from_utf8_lossy(&response.deckdrop_chunks_toml).to_string(),
                                         }).await;
                                     }
                                 }
@@ -1350,12 +1365,12 @@ pub async fn run_discovery(
                             libp2p::request_response::Event::Message { message, .. } => {
                                 match message {
                                     libp2p::request_response::Message::Request { request, .. } => {
-                                        eprintln!("Chunks Event: Request für hash: {}", request.chunk_hash);
+                                        eprintln!("Chunks Event: Request für hash: {}", request.to_string_id());
                                     }
                                     libp2p::request_response::Message::Response { request_id, response, .. } => {
                                         /*
                                         eprintln!("Chunks Event: Response für RequestId: {:?}, hash: {}, size: {} MB", 
-                                            request_id, response.chunk_hash, response.chunk_data.len() / (1024 * 1024));
+                                            request_id, response.to_string_id(), response.chunk_data.len() / (1024 * 1024));
                                         */
                                     }
                                 }
@@ -1376,12 +1391,12 @@ pub async fn run_discovery(
                                 match message {
                                     libp2p::request_response::Message::Request { request, channel, .. } => {
                                         // Ein Peer fragt nach einem Chunk
-                                        eprintln!("Chunk Request von {} für hash: {}", peer, request.chunk_hash);
+                                        eprintln!("Chunk Request von {} für hash: {}", peer, request.to_string_id());
                                         
                                         let chunk_loader = chunk_loader_clone.clone();
                                         let chunk_response_tx = chunk_response_tx.clone();
                                         let event_tx = event_tx_clone.clone();
-                                        let chunk_hash = request.chunk_hash.clone();
+                                        let chunk_hash = request.to_string_id().clone();
                                         let peer_str = peer.to_string();
                                         
                                         // Asynchrones Laden des Chunks, um den Swarm-Loop nicht zu blockieren
@@ -1406,6 +1421,14 @@ pub async fn run_discovery(
                                                 None
                                             }).await.unwrap_or(None);
                                             
+                                            let chunk_parts = match ChunkRequest::from_string_id(&chunk_hash) {
+                                                Some(cp) => cp,
+                                                None => {
+                                                    eprintln!("Konnte ChunkHash nicht parsen für Response: {}", chunk_hash);
+                                                    return;
+                                                }
+                                            };
+
                                             let response_msg = if let Some((chunk_data, chunk_size)) = result {
                                                 // Sende Upload-Event
                                                 if let Err(e) = event_tx.send(DiscoveryEvent::ChunkUploaded {
@@ -1417,13 +1440,17 @@ pub async fn run_discovery(
                                                 }
                                                 
                                                 ChunkResponse { 
-                                                    chunk_hash: chunk_hash,
-                                                    chunk_data 
+                                                    file_hash: chunk_parts.file_hash,
+                                                    chunk_index: chunk_parts.chunk_index,
+                                                    status: ChunkStatus::Ok as u8,
+                                                    chunk_data: Bytes::from(chunk_data)
                                                 }
                                             } else {
                                                 ChunkResponse { 
-                                                    chunk_hash: chunk_hash,
-                                                    chunk_data: Vec::new() 
+                                                    file_hash: chunk_parts.file_hash,
+                                                    chunk_index: chunk_parts.chunk_index,
+                                                    status: ChunkStatus::NotFound as u8,
+                                                    chunk_data: Bytes::new() 
                                                 }
                                             };
                                             
@@ -1438,7 +1465,7 @@ pub async fn run_discovery(
                                         let peer_id_str = peer.to_string();
                                         /*
                                         eprintln!("🔵 Chunk Response Message empfangen von {} (RequestId: {:?}, Response-Hash: {})", 
-                                            peer_id_str, request_id, response.chunk_hash);
+                                            peer_id_str, request_id, response.to_string_id());
                                         */
                                         
                                         // Entferne Request aus Tracking und verwende getrackten Hash
@@ -1452,7 +1479,7 @@ pub async fn run_discovery(
                                                 (hash, gid, peer, time)
                                             } else {
                                                 // eprintln!("⚠️ Warnung: Chunk Request {} nicht im Tracking gefunden, verwende Hash aus Response", request_id);
-                                                (response.chunk_hash.clone(), "unknown".to_string(), peer_id_str.clone(), std::time::Instant::now())
+                                                (response.to_string_id().clone(), "unknown".to_string(), peer_id_str.clone(), std::time::Instant::now())
                                             }
                                         };
                                         
@@ -1492,6 +1519,23 @@ pub async fn run_discovery(
                                         eprintln!("   → Geschwindigkeit: {:.2} MB/s", speed_mbps);
                                         */
                                         
+                                        // Prüfe Status-Code der Response
+                                        if response.status() != ChunkStatus::Ok {
+                                            eprintln!("❌ Chunk Response Error: Status {:?} für {}", response.status(), chunk_hash);
+                                            
+                                            // Sende Failure Event
+                                            if let Err(e) = event_tx_clone.send(DiscoveryEvent::ChunkRequestFailed {
+                                                peer_id: peer_id_str.clone(),
+                                                chunk_hash: chunk_hash.clone(),
+                                                error: format!("Remote error: {:?}", response.status()),
+                                            }).await {
+                                                eprintln!("Fehler beim Senden von ChunkRequestFailed Event: {}", e);
+                                            }
+                                            
+                                            // Behandlung für nicht gefundenen Chunk (Retry Logik in UI)
+                                            continue;
+                                        }
+
                                         // Sende Event mit chunk_hash (verwende getrackten Hash, nicht Response-Hash)
                                         // WICHTIG: Klone chunk_data VOR dem tokio::spawn, da response moved wird
                                         let chunk_data_clone = response.chunk_data.clone();
@@ -1568,7 +1612,13 @@ pub async fn run_discovery(
                                                 }
                                                 
                                                 // Sende Chunk-Request
-                                                let request = ChunkRequest { chunk_hash: chunk_hash.clone() };
+                                                let request = match ChunkRequest::from_string_id(&chunk_hash) {
+                                Some(r) => r,
+                                None => {
+                                    eprintln!("Ungültige Chunk ID: {}", chunk_hash);
+                                    continue;
+                                }
+                            };
                                                 let request_id = swarm.behaviour_mut().chunks.send_request(&peer_id_parsed, request);
                                                 
                                                 // Tracke Request-ID
@@ -1732,7 +1782,13 @@ pub async fn run_discovery(
                                         }
                                         
                                         // Sende Chunk-Request
-                                        let request = ChunkRequest { chunk_hash: chunk_hash.clone() };
+                                        let request = match ChunkRequest::from_string_id(&chunk_hash) {
+                                Some(r) => r,
+                                None => {
+                                    eprintln!("Ungültige Chunk ID: {}", chunk_hash);
+                                    continue;
+                                }
+                            };
                                         let request_id = swarm.behaviour_mut().chunks.send_request(&peer_id_parsed, request);
                                         
                                         // Tracke Request-ID
@@ -3081,7 +3137,7 @@ mod tests {
         
         // Simuliere Timeout-Event (sollte kein Reconnect auslösen)
         let test_peer_id = "12D3KooWTestPeerTimeout".to_string();
-        let test_chunk_hash = "test_chunk:0".to_string();
+        let test_chunk_hash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:0".to_string();
         
         // Sende ChunkRequestFailed Event (simuliert Timeout)
         let _ = event_tx.send(DiscoveryEvent::ChunkRequestFailed {
