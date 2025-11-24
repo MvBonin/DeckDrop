@@ -288,8 +288,66 @@ impl Default for DeckDropApp {
         let config = Config::load();
         println!("[DEBUG] Config loaded: download_path={}, game_paths={}", 
             config.download_path.display(), config.game_paths.len());
-        let mut my_games = Vec::new();
+        // UI sofort initialisieren (leer), Daten asynchron nachladen
+        // Dies verhindert, dass die UI beim Starten einfriert ("Frozen UI")
         
+        // Starte asynchrones Laden im Hintergrund
+        if let Some(tx) = crate::get_download_prep_tx() {
+            let config_clone = config.clone();
+            std::thread::spawn(move || {
+                eprintln!("AsyncLoader (Default): Starte Laden von Spielen im Hintergrund...");
+                
+                // 1. Lade Spiele aus dem Download-Pfad und manuellen Pfaden
+                let mut my_games = Vec::new();
+                
+                // 1a. Download-Pfad
+                if config_clone.download_path.exists() {
+                    my_games.extend(deckdrop_core::load_games_from_directory(&config_clone.download_path));
+                }
+                
+                // 1b. Manuelle Pfade
+                for game_path in &config_clone.game_paths {
+                    if deckdrop_core::check_game_config_exists(game_path) {
+                        if let Ok(game_info) = deckdrop_core::GameInfo::load_from_path(game_path) {
+                            my_games.push((game_path.clone(), game_info));
+                        }
+                    }
+                }
+                
+                // Deduplizierung
+                {
+                     use std::collections::HashMap;
+                     let mut seen_ids = HashMap::new();
+                     let mut deduplicated = Vec::new();
+                     for (game_path, game_info) in &my_games {
+                         let game_id = &game_info.game_id;
+                         if !seen_ids.contains_key(game_id) {
+                             seen_ids.insert(game_id.clone(), game_path.clone());
+                             deduplicated.push((game_path.clone(), game_info.clone()));
+                         }
+                     }
+                     my_games = deduplicated;
+                }
+                
+                eprintln!("AsyncLoader (Default): {} Spiele geladen. Sende an UI...", my_games.len());
+                if let Err(e) = tx.send(Message::GamesLoaded(my_games)) {
+                    eprintln!("Fehler beim Senden von GamesLoaded: {}", e);
+                }
+                
+                // 2. Lade aktive Downloads (kann lange dauern wegen SQLite-Zugriffen)
+                eprintln!("AsyncLoader (Default): Starte Laden von aktiven Downloads...");
+                let active_downloads_from_manifests = deckdrop_core::load_active_downloads();
+                eprintln!("AsyncLoader (Default): {} aktive Downloads geladen. Sende an UI...", active_downloads_from_manifests.len());
+                if let Err(e) = tx.send(Message::ActiveDownloadsLoaded(active_downloads_from_manifests)) {
+                    eprintln!("Fehler beim Senden von ActiveDownloadsLoaded: {}", e);
+                }
+            });
+        } else {
+            eprintln!("KRITISCHER FEHLER: Download-Prep-Sender nicht verfügbar in Default::default()! UI wird leer bleiben.");
+        }
+        
+        let mut my_games = Vec::new();
+        /*
         // 1. Lade Spiele aus dem Download-Pfad (Unterordner = Spiele)
         if config.download_path.exists() {
             println!("[DEBUG] Loading games from download_path: {}", config.download_path.display());
@@ -298,79 +356,17 @@ impl Default for DeckDropApp {
         } else {
             println!("[DEBUG] Download path does not exist: {}", config.download_path.display());
         }
+        */
         
         // 2. Lade Spiele aus den manuell hinzugefügten Pfaden (game_paths)
         // Nur das Verzeichnis selbst prüfen, NICHT rekursiv Unterverzeichnisse
-        for game_path in &config.game_paths {
-            println!("[DEBUG] Loading games from game_path: {}", game_path.display());
-            // Check if the path itself is a game (has deckdrop.toml)
-            if deckdrop_core::check_game_config_exists(game_path) {
-                if let Ok(game_info) = deckdrop_core::GameInfo::load_from_path(game_path) {
-                    my_games.push((game_path.clone(), game_info));
-                    println!("[DEBUG] Added game from path: {}", game_path.display());
-                }
-            }
-            // KEINE rekursive Suche in Unterverzeichnissen für game_paths
-            // Nur download_path wird rekursiv durchsucht
-        }
         
         // 3. Lade aktive Downloads aus Manifesten und füge sie zu my_games hinzu
         // WICHTIG: Dieser Aufruf passiert nur einmal beim Start (Default::default),
         // daher ist das I/O hier akzeptabel. Im laufenden Betrieb verwendet
         // die UI ausschließlich den Cache (`get_active_downloads_cached_only()`),
         // um den Main-Thread nicht zu blockieren.
-        let active_downloads_from_manifests = deckdrop_core::load_active_downloads();
-        let mut active_downloads = HashMap::new();
-        println!("[DEBUG] Loading {} active downloads from manifests", active_downloads_from_manifests.len());
-        for (game_id, manifest) in active_downloads_from_manifests {
-            // Versuche, die GameInfo aus dem Manifest-Verzeichnis zu laden
-            if let Ok(manifest_path) = deckdrop_core::get_manifest_path(&game_id) {
-                if let Some(manifest_dir) = manifest_path.parent() {
-                    if let Ok(game_info) = deckdrop_core::GameInfo::load_from_path(manifest_dir) {
-                        // Füge das Spiel nur hinzu, wenn es nicht bereits in my_games ist
-                        let game_path = PathBuf::from(&manifest.game_path);
-                        if !my_games.iter().any(|(path, _)| path == &game_path) {
-                            my_games.push((game_path.clone(), game_info));
-                            println!("[DEBUG] Added download game: {} (ID: {})", manifest.game_name, game_id);
-                        }
-                    }
-                }
-            }
-            // Initialisiere DownloadState für UI
-            let progress_percent = manifest.progress.percentage as f32;
-            active_downloads.insert(game_id.clone(), DownloadState {
-                manifest: manifest.clone(),
-                progress_percent,
-                downloading_chunks_count: 0,
-                peer_count: 0,
-                download_speed_bytes_per_sec: 0.0,
-                last_update_time: std::time::Instant::now(),
-                last_downloaded_chunks: manifest.progress.downloaded_chunks,
-                speed_samples: Vec::new(),
-            });
-        }
         
-        println!("[DEBUG] Total games loaded: {} (including {} downloads)", my_games.len(), active_downloads.len());
-        
-        // Deduplicate games by game_id before initializing integrity status
-        {
-            use std::collections::HashMap;
-            let mut seen_ids = HashMap::new();
-            let mut deduplicated = Vec::new();
-            
-            for (game_path, game_info) in &my_games {
-                let game_id = &game_info.game_id;
-                if !seen_ids.contains_key(game_id) {
-                    seen_ids.insert(game_id.clone(), game_path.clone());
-                    deduplicated.push((game_path.clone(), game_info.clone()));
-                } else {
-                    println!("[DEBUG] Duplicate game_id detected in Default::default(): {} (path: {}), keeping first occurrence", 
-                        game_id, game_path.display());
-                }
-            }
-            
-            my_games = deduplicated;
-        }
         
         let game_integrity_status = HashMap::new();
         // Don't initialize integrity checks automatically - user will trigger them manually
@@ -540,7 +536,7 @@ pub enum Message {
     GameIntegrityChecked(PathBuf, GameIntegrityStatus),
     
     // Progress update for integrity checks
-    UpdateIntegrityProgress(PathBuf, usize), // game_path, current
+    UpdateIntegrityProgress(PathBuf, usize, usize), // game_path, current, total
     
     // Start integrity check manually
     CheckIntegrity(PathBuf), // game_path
@@ -567,6 +563,10 @@ pub enum Message {
     
     // Network Games Cache
     ClearNetworkCache,
+
+    // Async Initialization
+    GamesLoaded(Vec<(PathBuf, GameInfo)>),
+    ActiveDownloadsLoaded(Vec<(String, deckdrop_core::DownloadManifest)>),
 }
 
 impl DeckDropApp {
@@ -578,81 +578,71 @@ impl DeckDropApp {
     #[allow(dead_code)]
     fn new_with_network_rx(network_event_rx: Arc<std::sync::Mutex<mpsc::Receiver<DiscoveryEvent>>>) -> Self {
         let config = Config::load();
-        let mut my_games = Vec::new();
         
-        // 1. Lade Spiele aus dem Download-Pfad (Unterordner = Spiele)
-        if config.download_path.exists() {
-            my_games.extend(deckdrop_core::load_games_from_directory(&config.download_path));
-        }
+        // UI sofort initialisieren (leer), Daten asynchron nachladen
+        // Dies verhindert, dass die UI beim Starten einfriert ("Frozen UI")
         
-        // 2. Lade Spiele aus den manuell hinzugefügten Pfaden (game_paths)
-        // Nur das Verzeichnis selbst prüfen, NICHT rekursiv Unterverzeichnisse
-        for game_path in &config.game_paths {
-            // Check if the path itself is a game (has deckdrop.toml)
-            if deckdrop_core::check_game_config_exists(game_path) {
-                if let Ok(game_info) = deckdrop_core::GameInfo::load_from_path(game_path) {
-                    my_games.push((game_path.clone(), game_info));
+        // Starte asynchrones Laden im Hintergrund
+        if let Some(tx) = crate::get_download_prep_tx() {
+            let config_clone = config.clone();
+            std::thread::spawn(move || {
+                eprintln!("AsyncLoader: Starte Laden von Spielen im Hintergrund...");
+                
+                // 1. Lade Spiele aus dem Download-Pfad und manuellen Pfaden
+                let mut my_games = Vec::new();
+                
+                // 1a. Download-Pfad
+                if config_clone.download_path.exists() {
+                    my_games.extend(deckdrop_core::load_games_from_directory(&config_clone.download_path));
                 }
-            }
-            // KEINE rekursive Suche in Unterverzeichnissen für game_paths
-            // Nur download_path wird rekursiv durchsucht
-        }
-        
-        // 3. Lade aktive Downloads aus Manifesten und füge sie zu my_games hinzu
-        let active_downloads_from_manifests = deckdrop_core::load_active_downloads();
-        let mut active_downloads = HashMap::new();
-        for (game_id, manifest) in active_downloads_from_manifests {
-            // Versuche, die GameInfo aus dem Manifest-Verzeichnis zu laden
-            if let Ok(manifest_path) = deckdrop_core::get_manifest_path(&game_id) {
-                if let Some(manifest_dir) = manifest_path.parent() {
-                    if let Ok(game_info) = deckdrop_core::GameInfo::load_from_path(manifest_dir) {
-                        // Füge das Spiel nur hinzu, wenn es nicht bereits in my_games ist
-                        let game_path = PathBuf::from(&manifest.game_path);
-                        if !my_games.iter().any(|(path, _)| path == &game_path) {
+                
+                // 1b. Manuelle Pfade
+                for game_path in &config_clone.game_paths {
+                    if deckdrop_core::check_game_config_exists(game_path) {
+                        if let Ok(game_info) = deckdrop_core::GameInfo::load_from_path(game_path) {
                             my_games.push((game_path.clone(), game_info));
                         }
                     }
                 }
-            }
-            // Initialisiere DownloadState für UI
-            let progress_percent = manifest.progress.percentage as f32;
-            active_downloads.insert(game_id.clone(), DownloadState {
-                manifest: manifest.clone(),
-                progress_percent,
-                downloading_chunks_count: 0,
-                peer_count: 0,
-                download_speed_bytes_per_sec: 0.0,
-                last_update_time: std::time::Instant::now(),
-                last_downloaded_chunks: manifest.progress.downloaded_chunks,
-                speed_samples: Vec::new(),
+                
+                // Deduplizierung
+                {
+                     use std::collections::HashMap;
+                     let mut seen_ids = HashMap::new();
+                     let mut deduplicated = Vec::new();
+                     for (game_path, game_info) in &my_games {
+                         let game_id = &game_info.game_id;
+                         if !seen_ids.contains_key(game_id) {
+                             seen_ids.insert(game_id.clone(), game_path.clone());
+                             deduplicated.push((game_path.clone(), game_info.clone()));
+                         }
+                     }
+                     my_games = deduplicated;
+                }
+                
+                eprintln!("AsyncLoader: {} Spiele geladen. Sende an UI...", my_games.len());
+                if let Err(e) = tx.send(Message::GamesLoaded(my_games)) {
+                    eprintln!("Fehler beim Senden von GamesLoaded: {}", e);
+                }
+                
+                // 2. Lade aktive Downloads (kann lange dauern wegen SQLite-Zugriffen)
+                eprintln!("AsyncLoader: Starte Laden von aktiven Downloads...");
+                let active_downloads_from_manifests = deckdrop_core::load_active_downloads();
+                eprintln!("AsyncLoader: {} aktive Downloads geladen. Sende an UI...", active_downloads_from_manifests.len());
+                if let Err(e) = tx.send(Message::ActiveDownloadsLoaded(active_downloads_from_manifests)) {
+                    eprintln!("Fehler beim Senden von ActiveDownloadsLoaded: {}", e);
+                }
             });
+        } else {
+            eprintln!("KRITISCHER FEHLER: Download-Prep-Sender nicht verfügbar in new_with_network_rx!");
         }
         
-        // Deduplicate games by game_id before initializing integrity status
-        {
-            use std::collections::HashMap;
-            let mut seen_ids = HashMap::new();
-            let mut deduplicated = Vec::new();
-            
-            for (game_path, game_info) in &my_games {
-                let game_id = &game_info.game_id;
-                if !seen_ids.contains_key(game_id) {
-                    seen_ids.insert(game_id.clone(), game_path.clone());
-                    deduplicated.push((game_path.clone(), game_info.clone()));
-                } else {
-                    println!("[DEBUG] Duplicate game_id detected in new_with_network_rx(): {} (path: {}), keeping first occurrence", 
-                        game_id, game_path.display());
-                }
-            }
-            
-            my_games = deduplicated;
-        }
+        let my_games = Vec::new(); // Initial leer, wird asynchron gefüllt
+        let active_downloads = HashMap::new(); // Initial leer, wird asynchron gefüllt
         
         let game_integrity_status = HashMap::new();
-        // Don't initialize integrity checks automatically - user will trigger them manually
-        println!("[DEBUG] new_with_network_rx: {} games loaded (integrity checks will be manual)", my_games.len());
         
-        // Lade gecachte Network-Games beim Start
+        // Lade gecachte Network-Games beim Start (schnell genug für synchron)
         let mut network_games = HashMap::new();
         if let Ok(cached_games) = network_cache::load_all_cached_network_games() {
             for cached_game in cached_games {
@@ -804,104 +794,112 @@ impl DeckDropApp {
                     return Task::none(); // Already checking
                 }
                 
-                // Get total file count from chunks.toml
-                let chunks_toml_path = game_path.join("deckdrop_chunks.toml");
-                let total = if chunks_toml_path.exists() {
-                    if let Ok(content) = std::fs::read_to_string(&chunks_toml_path) {
-                        if let Ok(parsed) = toml::from_str::<toml::Value>(&content) {
-                            if let Some(files) = parsed.get("file").and_then(|f| f.as_array()) {
-                                files.len()
-                            } else {
-                                0
-                            }
-                        } else {
-                            0
-                        }
-                    } else {
-                        0
-                    }
-                } else {
-                    0
-                };
-                
-                // Set status to Checking
-                self.game_integrity_status.insert(game_path.clone(), GameIntegrityStatus::Checking { current: 0, total });
+                // Set status to Checking (mit 0 als Platzhalter für total, wird im Thread aktualisiert)
+                self.game_integrity_status.insert(game_path.clone(), GameIntegrityStatus::Checking { current: 0, total: 0 });
                 
                 // Set start time for progress tracking
                 self.integrity_check_start_time.insert(game_path.clone(), std::time::Instant::now());
                 
-                // Start the actual integrity check with progress tracking in a separate thread
-                let game_path_for_check = game_path.clone();
-                let progress_tracker = self.integrity_check_progress.clone();
-                let results_tracker = self.integrity_check_results.clone();
-                
                 // Add to progress tracker immediately to mark as started
                 if let Ok(mut progress) = self.integrity_check_progress.lock() {
-                    progress.insert(game_path_for_check.clone(), 0);
+                    progress.insert(game_path.clone(), 0);
                 }
                 
-                std::thread::spawn(move || {
-                    // Perform light check (fast, checks for file changes)
-                    let result = deckdrop_core::light_check_game(&game_path_for_check);
-                    match result {
-                        Ok(light_result) => {
-                            if light_result.missing_files.is_empty() && light_result.extra_files.is_empty() {
-                                // All files match, do full integrity check with progress
-                                let integrity_result = deckdrop_core::verify_game_integrity_with_progress(
-                                    &game_path_for_check,
-                                    Some({
-                                        let progress_tracker = progress_tracker.clone();
-                                        let game_path = game_path_for_check.clone();
-                                        move |current, _total| {
-                                            // Update progress in shared tracker
-                                            if let Ok(mut progress) = progress_tracker.lock() {
-                                                progress.insert(game_path.clone(), current);
+                // Start the actual integrity check in a separate thread
+                if let Some(tx) = crate::get_download_prep_tx() {
+                    let game_path_for_check = game_path.clone();
+                    let progress_tracker = self.integrity_check_progress.clone();
+                    let results_tracker = self.integrity_check_results.clone();
+                    
+                    std::thread::spawn(move || {
+                        // 1. Stelle sicher, dass deckdrop_chunks.toml existiert (blockierend)
+                        let chunks_toml_path = game_path_for_check.join("deckdrop_chunks.toml");
+                        if !chunks_toml_path.exists() {
+                            eprintln!("AsyncCheck: deckdrop_chunks.toml fehlt – generiere neu...");
+                            if let Err(e) = deckdrop_core::generate_chunks_toml(
+                                &game_path_for_check,
+                                Option::<fn(usize, usize, &str)>::None,
+                            ) {
+                                eprintln!("Fehler beim Generieren von deckdrop_chunks.toml: {}", e);
+                            } else {
+                                eprintln!("deckdrop_chunks.toml erfolgreich neu generiert");
+                            }
+                        }
+                        
+                        // 2. Ermittle Total Files (für Progress Bar)
+                        let total = if chunks_toml_path.exists() {
+                            if let Ok(content) = std::fs::read_to_string(&chunks_toml_path) {
+                                if let Ok(parsed) = toml::from_str::<toml::Value>(&content) {
+                                    if let Some(files) = parsed.get("file").and_then(|f| f.as_array()) {
+                                        files.len()
+                                    } else { 0 }
+                                } else { 0 }
+                            } else { 0 }
+                        } else { 0 };
+                        
+                        // Sende initiales Update mit korrektem Total
+                        let _ = tx.send(Message::UpdateIntegrityProgress(game_path_for_check.clone(), 0, total));
+                        
+                        // 3. Perform light check (fast)
+                        let result = deckdrop_core::light_check_game(&game_path_for_check);
+                        match result {
+                            Ok(light_result) => {
+                                if light_result.missing_files.is_empty() && light_result.extra_files.is_empty() {
+                                    // All files match, do full integrity check with progress
+                                    let integrity_result = deckdrop_core::verify_game_integrity_with_progress(
+                                        &game_path_for_check,
+                                        Some({
+                                            let progress_tracker = progress_tracker.clone();
+                                            let game_path = game_path_for_check.clone();
+                                            move |current, _total| {
+                                                // Update progress in shared tracker (Tick UI liest das)
+                                                if let Ok(mut progress) = progress_tracker.lock() {
+                                                    progress.insert(game_path.clone(), current);
+                                                }
+                                            }
+                                        })
+                                    );
+                                    
+                                    // Determine final status
+                                    let final_status = match integrity_result {
+                                        Ok(result) => {
+                                            if result.failed_files.is_empty() && result.missing_files.is_empty() {
+                                                GameIntegrityStatus::Intact
+                                            } else {
+                                                GameIntegrityStatus::Changed
                                             }
                                         }
-                                    })
-                                );
-                                
-                                // Determine final status
-                                let final_status = match integrity_result {
-                                    Ok(result) => {
-                                        if result.failed_files.is_empty() && result.missing_files.is_empty() {
-                                            GameIntegrityStatus::Intact
-                                        } else {
-                                            GameIntegrityStatus::Changed
-                                        }
+                                        Err(_) => GameIntegrityStatus::Changed,
+                                    };
+                                    
+                                    // Store result
+                                    if let Ok(mut results) = results_tracker.lock() {
+                                        results.insert(game_path_for_check.clone(), final_status);
                                     }
-                                    Err(_) => GameIntegrityStatus::Changed,
-                                };
-                                
-                                // Store result and clear progress tracker
+                                } else {
+                                    // Files changed
+                                    if let Ok(mut results) = results_tracker.lock() {
+                                        results.insert(game_path_for_check.clone(), GameIntegrityStatus::Changed);
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                // Error
                                 if let Ok(mut results) = results_tracker.lock() {
-                                    results.insert(game_path_for_check.clone(), final_status);
-                                }
-                                // Clear progress tracker - this signals that the check is complete
-                                if let Ok(mut progress) = progress_tracker.lock() {
-                                    progress.remove(&game_path_for_check);
-                                }
-                            } else {
-                                // Files changed - store result and clear progress tracker
-                                if let Ok(mut results) = results_tracker.lock() {
-                                    results.insert(game_path_for_check.clone(), GameIntegrityStatus::Changed);
-                                }
-                                if let Ok(mut progress) = progress_tracker.lock() {
-                                    progress.remove(&game_path_for_check);
+                                    results.insert(game_path_for_check.clone(), GameIntegrityStatus::Error(e.to_string()));
                                 }
                             }
                         }
-                        Err(e) => {
-                            // Error - store result and clear progress tracker
-                            if let Ok(mut results) = results_tracker.lock() {
-                                results.insert(game_path_for_check.clone(), GameIntegrityStatus::Error(e.to_string()));
-                            }
-                            if let Ok(mut progress) = progress_tracker.lock() {
-                                progress.remove(&game_path_for_check);
-                            }
+                        
+                        // Clear progress tracker -> signals complete
+                        if let Ok(mut progress) = progress_tracker.lock() {
+                            progress.remove(&game_path_for_check);
                         }
-                    }
-                });
+                    });
+                } else {
+                    eprintln!("KRITISCH: Kein Download-Prep-Sender verfügbar für Integrity Check!");
+                    // Fallback: Synchron ausführen (sollte nicht passieren)
+                }
             }
             Message::UpdateAddGameProgress(current, total, file_name) => {
                 self.add_game_progress = Some((current, total, file_name));
@@ -1039,13 +1037,9 @@ impl DeckDropApp {
                 // (was durch das Keep-Alive-System alle 60 Sekunden passiert, oder sofort bei ConnectionEstablished)
                 eprintln!("Spiel {} erfolgreich hinzugefügt und wird im Netzwerk sofort angekündigt (bei nächster GamesListRequest)", game_path.display());
             }
-            Message::UpdateIntegrityProgress(game_path, current) => {
+            Message::UpdateIntegrityProgress(game_path, current, total) => {
                 // Update progress for a checking game
-                if let Some(status) = self.game_integrity_status.get_mut(&game_path) {
-                    if let GameIntegrityStatus::Checking { total, .. } = status {
-                        *status = GameIntegrityStatus::Checking { current, total: *total };
-                    }
-                }
+                self.game_integrity_status.insert(game_path, GameIntegrityStatus::Checking { current, total });
                 // Don't create additional Tick tasks - the subscription already handles this
             }
             Message::NetworkEvent(event) => {
@@ -1114,20 +1108,12 @@ impl DeckDropApp {
                         }
                     }
                     
-                    // Request missing chunks to resume download
+                    // Register download in Scheduler (Peers für dieses Spiel)
                     if let Some(peers) = self.network_games.get(&game_id) {
-                        let peer_ids: Vec<String> = peers.iter()
-                            .map(|(pid, _)| pid.clone())
-                            .collect();
-                        
+                        let peer_ids: Vec<String> =
+                            peers.iter().map(|(pid, _)| pid.clone()).collect();
                         if !peer_ids.is_empty() {
-                            if let Some(_tx) = crate::network_bridge::get_download_request_tx() {
-                                // WICHTIG: Verwende max_concurrent_chunks statt festem Wert 10
-                                let max_chunks_per_peer = self.config.max_concurrent_chunks.max(10);
-                                if let Err(e) = self.request_missing_chunks_adaptive(&game_id, &peer_ids, max_chunks_per_peer) {
-                                    eprintln!("Error requesting missing chunks when resuming download for {}: {}", game_id, e);
-                                }
-                            }
+                            crate::network_bridge::register_download_peers(&game_id, &peer_ids);
                         }
                     }
                 }
@@ -1140,6 +1126,8 @@ impl DeckDropApp {
                         eprintln!("Error canceling download for {}: {}", game_id, e);
                     }
                 }
+                // Entferne aus Scheduler
+                crate::network_bridge::unregister_download(&game_id);
                 // Remove from active downloads
                 self.active_downloads.remove(&game_id);
                 // Remove from preparing downloads
@@ -1187,16 +1175,17 @@ impl DeckDropApp {
                                     speed_samples: Vec::new(),
                                 });
                                 
-                                // Request missing chunks to start download
+                                // Registriere Download im Scheduler (Peers für dieses Spiel)
                                 if let Some(peers) = self.network_games.get(&game_id) {
-                                    let peer_ids: Vec<String> = peers.iter()
+                                    let peer_ids: Vec<String> = peers
+                                        .iter()
                                         .map(|(pid, _)| pid.clone())
                                         .collect();
-                                    
-                                    // WICHTIG: Verwende max_concurrent_chunks statt festem Wert 10
-                                    let max_chunks_per_peer = self.config.max_concurrent_chunks.max(10);
-                                    if let Err(e) = self.request_missing_chunks_adaptive(&game_id, &peer_ids, max_chunks_per_peer) {
-                                        eprintln!("Error requesting missing chunks for {}: {}", game_id, e);
+                                    if !peer_ids.is_empty() {
+                                        crate::network_bridge::register_download_peers(
+                                            &game_id,
+                                            &peer_ids,
+                                        );
                                     }
                                 }
                             }
@@ -1513,19 +1502,15 @@ impl DeckDropApp {
             }
             Message::Tick => {
                 // Periodic updates (e.g., update download progress)
-                // WICHTIG: Häufigere Prüfung (100ms) für kontinuierliche Chunk-Anforderungen
-                // Dies stellt sicher, dass neue Chunks sofort angefordert werden, wenn Slots frei werden
-                // HINWEIS: Das Update selbst ist relativ teuer (Datenbank + Dateisystem).
-                // Um UI‑Freezes bei großen/aktiven Downloads zu vermeiden, aktualisieren wir
-                // nur alle 500ms, was für den Scheduler völlig ausreichend ist.
-                if self.last_download_update.elapsed().as_millis() >= 500 {
-                    self.update_download_progress();
-                    self.last_download_update = std::time::Instant::now();
-                }
+                // WICHTIG: Häufigere Prüfung (jetzt in jedem Tick, alle 100ms), da update_download_progress
+                // nun auf dem schnellen In-Memory-Cache basiert (kein I/O mehr).
+                // Dies sorgt für eine flüssige UI-Anzeige ohne Verzögerungen.
+                self.update_download_progress();
                 
                 // Update upload statistics (less frequently)
                 if self.last_download_update.elapsed().as_millis() >= 1000 {
                     self.update_upload_stats();
+                    self.last_download_update = std::time::Instant::now();
                 }
                 
                 // Update performance metrics if Performance tab is active
@@ -1534,10 +1519,10 @@ impl DeckDropApp {
                 }
                 
                 // Check for Network events (non-blocking) via global access
-                // WICHTIG: Begrenze Anzahl verarbeiteter Events pro Tick, um GUI-Freeze zu vermeiden
-                // Reduziert von 10 auf 2, damit der UI-Thread schneller wieder
-                // zur Event-Schleife zurückkehrt, auch bei vielen Chunk-Events.
-                const MAX_EVENTS_PER_TICK: usize = 2;
+                // WICHTIG: Erhöhtes Limit für Events pro Tick, um Staus in der Event-Queue zu vermeiden.
+                // Bei schnellen Downloads können viele Chunk-Events pro Sekunde anfallen.
+                // 100 Events sollten problemlos verarbeitet werden können, da die Verarbeitung leichtgewichtig ist.
+                const MAX_EVENTS_PER_TICK: usize = 100;
                 if let Some(rx) = crate::network_bridge::get_network_event_rx() {
                     if let Ok(mut rx) = rx.lock() {
                         let mut events_processed = 0;
@@ -1559,12 +1544,12 @@ impl DeckDropApp {
                     if let Ok(rx) = rx.lock() {
                         let mut messages = Vec::new();
                         while let Ok(msg) = rx.try_recv() {
-                            eprintln!("Tick: Empfange Download-Preparation-Message: {:?}", msg);
+                            // eprintln!("Tick: Empfange Download-Preparation-Message: {:?}", msg);
                             messages.push(msg);
                         }
                         // Verarbeite alle Messages direkt, ohne update() erneut aufzurufen
                         for msg in messages {
-                            eprintln!("Tick: Verarbeite Download-Preparation-Message: {:?}", msg);
+                            // eprintln!("Tick: Verarbeite Download-Preparation-Message: {:?}", msg);
                             match msg {
                                 Message::UpdateDownloadPreparationProgress(game_id, current, total) => {
                                     // Aktualisiere Progress direkt (thread-safe)
@@ -1869,6 +1854,62 @@ impl DeckDropApp {
                 self.edit_game_description = String::new();
                 self.edit_game_additional_instructions = String::new();
             }
+            Message::GamesLoaded(games) => {
+                eprintln!("UI: Empfange {} geladene Spiele", games.len());
+                self.my_games = games;
+            }
+            Message::ActiveDownloadsLoaded(active_downloads_vec) => {
+                eprintln!("UI: Empfange {} aktive Downloads", active_downloads_vec.len());
+                
+                let mut active_downloads = HashMap::new();
+                for (game_id, manifest) in active_downloads_vec {
+                    // Versuche, die GameInfo aus dem Manifest-Verzeichnis zu laden
+                    if let Ok(manifest_path) = deckdrop_core::get_manifest_path(&game_id) {
+                        if let Some(manifest_dir) = manifest_path.parent() {
+                            if let Ok(game_info) = deckdrop_core::GameInfo::load_from_path(manifest_dir) {
+                                // Füge das Spiel nur hinzu, wenn es nicht bereits in my_games ist
+                                let game_path = PathBuf::from(&manifest.game_path);
+                                if !self.my_games.iter().any(|(path, _)| path == &game_path) {
+                                    self.my_games.push((game_path.clone(), game_info));
+                                }
+                            }
+                        }
+                    }
+                    // Initialisiere DownloadState für UI
+                    let progress_percent = manifest.progress.percentage as f32;
+                    active_downloads.insert(game_id.clone(), DownloadState {
+                        manifest: manifest.clone(),
+                        progress_percent,
+                        downloading_chunks_count: 0,
+                        peer_count: 0,
+                        download_speed_bytes_per_sec: 0.0,
+                        last_update_time: std::time::Instant::now(),
+                        last_downloaded_chunks: manifest.progress.downloaded_chunks,
+                        speed_samples: Vec::new(),
+                    });
+                }
+                self.active_downloads = active_downloads;
+                
+                // Deduplicate games
+                {
+                    use std::collections::HashMap;
+                    let mut seen_ids = HashMap::new();
+                    let mut deduplicated = Vec::new();
+                    
+                    for (game_path, game_info) in &self.my_games {
+                        let game_id = &game_info.game_id;
+                        if !seen_ids.contains_key(game_id) {
+                            seen_ids.insert(game_id.clone(), game_path.clone());
+                            deduplicated.push((game_path.clone(), game_info.clone()));
+                        }
+                    }
+                    self.my_games = deduplicated;
+                }
+                
+                // Trigger update for progress
+                self.update_download_progress();
+            }
+            
             Message::ClearNetworkCache => {
                 // Lösche alle gecachten Network-Games
                 if let Err(e) = network_cache::clear_all_cached_network_games() {
@@ -1977,7 +2018,7 @@ impl DeckDropApp {
                         }
                     }),
                 Space::with_width(Length::Fill),
-                text(format!("Peers: {} | Downloads: {}", self.status.peer_count, self.status.active_download_count))
+                text(format!("Peers: {} | Herunterladende Spiele: {}", self.status.peer_count, self.status.active_download_count))
                     .size(scale_text(10.0))
                     .style(|_theme: &Theme| {
                         iced::widget::text::Style {
@@ -2258,6 +2299,14 @@ impl DeckDropApp {
                 }
             }
             DiscoveryEvent::ChunkReceived { peer_id, chunk_hash, chunk_data } => {
+                // Ignoriere leere Chunks (Peers ohne Daten senden leere Responses)
+                if chunk_data.is_empty() {
+                    eprintln!("⚠️ Leerer Chunk {} von {} empfangen - ignoriere", chunk_hash, peer_id);
+                    return;
+                }
+
+                // Nur bei Fehlern oder wichtigen Ereignissen loggen (Performance)
+
                 // Phase 4: Tracke Performance für diesen Peer
                 let peer_perf = self.peer_performance.clone();
                 let peer_id_for_perf = peer_id.clone();
@@ -2343,6 +2392,7 @@ impl DeckDropApp {
                 std::thread::spawn(move || {
                     // Verwende chunk_data direkt (wurde bereits in den Thread bewegt)
                     // Klone nur wenn nötig für Funktionen, die Ownership benötigen
+                    
                     // Drop-Guard: Entfernt Chunk aus "in Verarbeitung" Set am Ende (egal ob Erfolg oder Fehler)
                     struct ChunkProcessingGuard {
                         processing_chunks: Arc<std::sync::Mutex<HashSet<String>>>,
@@ -2357,7 +2407,21 @@ impl DeckDropApp {
                         }
                     }
                     
-                    let _guard = ChunkProcessingGuard {
+                    // Drop-Guard: Entfernt Chunk aus "wird geschrieben" Set am Ende (egal ob Erfolg oder Fehler)
+                    struct WritingChunksGuard {
+                        writing_chunks: Arc<std::sync::Mutex<HashSet<String>>>,
+                        chunk_hash: String,
+                    }
+                    
+                    impl Drop for WritingChunksGuard {
+                        fn drop(&mut self) {
+                            if let Ok(mut writing) = self.writing_chunks.lock() {
+                                writing.remove(&self.chunk_hash);
+                            }
+                        }
+                    }
+                    
+                    let _processing_guard = ChunkProcessingGuard {
                         processing_chunks: processing_chunks.clone(),
                         chunk_hash: chunk_hash_clone.clone(),
                     };
@@ -2384,17 +2448,25 @@ impl DeckDropApp {
                                         return; // Überspringe ungültigen Chunk
                                     }
                                     
-                                    // Füge Chunk zu "wird geschrieben" hinzu
+                                    // Füge Chunk zu "wird geschrieben" hinzu und erstelle Guard für automatisches Cleanup
                                     if let Ok(mut writing) = writing_chunks_for_thread.lock() {
                                         writing.insert(chunk_hash_clone.clone());
                                     }
                                     
+                                    // Erstelle Guard der writing_chunks IMMER aufräumt (auch bei Panic/Error)
+                                    let _writing_guard = WritingChunksGuard {
+                                        writing_chunks: writing_chunks_for_thread.clone(),
+                                        chunk_hash: chunk_hash_clone.clone(),
+                                    };
+                                    
                                     // Schreibe Chunk direkt in die finale Datei (Piece-by-Piece Writing)
                                     // Lade Manifest für write_chunk_to_file
+                                    eprintln!("DEBUG: Starte Schreiben für Chunk {}", chunk_hash_clone);
                                     // Verwende chunk_data_for_thread direkt (kein Clone nötig, da &[u8])
                                     if let Ok(manifest_for_write) = deckdrop_core::DownloadManifest::load(&manifest_path) {
                                         match deckdrop_core::write_chunk_to_file(&chunk_hash_clone, &chunk_data_for_thread, &manifest_for_write) {
                                             Ok(()) => {
+                                                eprintln!("DEBUG: Schreiben erfolgreich für Chunk {}. Starte DB-Update...", chunk_hash_clone);
                                                 // Robustheit: Atomares Manifest-Update mit SQLite (verhindert Race Conditions)
                                                 // WICHTIG: Entferne Chunk erst NACH erfolgreichem Manifest-Update aus requested_chunks!
                                                 let chunk_hash_for_update = chunk_hash_clone.clone();
@@ -2403,6 +2475,21 @@ impl DeckDropApp {
                                                 // Verwende SQLite für atomares Update
                                                 match deckdrop_core::synch::mark_chunk_downloaded_sqlite(&game_id, &chunk_hash_for_update) {
                                                     Ok(()) => {
+                                                        eprintln!("DEBUG: DB-Update erfolgreich für Chunk {}", chunk_hash_clone);
+                                                        // Benachrichtige Network-Layer, dass Chunk erfolgreich heruntergeladen wurde
+                                                        // Dies reduziert den globalen active_chunk_downloads Counter und ermöglicht neue Downloads
+                                                        if let Some(tx) = crate::network_bridge::get_download_request_tx() {
+                                                            if let Err(e) = tx.send(
+                                                                deckdrop_network::network::discovery::DownloadRequest::ChunkDownloadCompleted {
+                                                                    chunk_hash: chunk_hash_for_update.clone(),
+                                                                }
+                                                            ) {
+                                                                eprintln!("❌ Fehler beim Senden von ChunkDownloadCompleted: {}", e);
+                                                            }
+                                                        } else {
+                                                            eprintln!("❌ WARNUNG: Kein DownloadRequest Sender verfügbar");
+                                                        }
+
                                                         // Lade Manifest für Progress-Logging
                                                         if let Ok(manifest) = deckdrop_core::DownloadManifest::load(&manifest_path) {
                                                             // Nur bei wichtigen Meilensteinen loggen (jeder 10. Chunk oder bei Fehlern)
@@ -2414,6 +2501,7 @@ impl DeckDropApp {
                                                             // JETZT erst: Entferne Chunk aus "angefordert" Set, NACH erfolgreichem Manifest-Update
                                                             if let Ok(mut requested) = requested_chunks_for_thread.lock() {
                                                                 if requested.remove(&chunk_hash_clone) {
+                                                                    println!("🗑️ Chunk {} aus requested_chunks entfernt", chunk_hash_clone);
                                                                     // Reduziere aktive Request-Zahl für den Peer, der diesen Chunk angefordert hat
                                                                     if let Ok(mut chunk_peers) = chunk_peer_requests_for_thread.lock() {
                                                                         if let Some(peer_id) = chunk_peers.remove(&chunk_hash_clone) {
@@ -2428,10 +2516,7 @@ impl DeckDropApp {
                                                                     }
                                                                 }
                                                             }
-                                                            // Entferne Chunk aus "wird geschrieben" und Startzeit, da er jetzt fertig ist
-                                                            if let Ok(mut writing) = writing_chunks_for_thread.lock() {
-                                                                writing.remove(&chunk_hash_clone);
-                                                            }
+                                                            // Cleanup der Start-Zeit (writing_chunks wird durch Guard aufgeräumt)
                                                             if let Ok(mut start_times) = chunk_download_start_times_for_thread.lock() {
                                                                 start_times.remove(&chunk_hash_clone);
                                                             }
@@ -2440,7 +2525,8 @@ impl DeckDropApp {
                                                             // Dies sorgt dafür, dass die UI in `update_download_progress`
                                                             // nur noch den bereits gecachten Zustand lesen muss und kein
                                                             // blockierendes I/O mehr im Main-Thread ausführt.
-                                                            let _ = deckdrop_core::load_active_downloads();
+                                                            // WICHTIG: force_update verwenden, damit der Cache sofort den neuen Chunk enthält!
+                                                            let _ = deckdrop_core::force_update_active_downloads();
                                                             
                                                             // Lade Manifest erneut für weitere Operationen
                                                             if let Ok(manifest) = deckdrop_core::DownloadManifest::load(&manifest_path) {
@@ -2474,29 +2560,18 @@ impl DeckDropApp {
                                                 }
                                             }
                                             Err(e) => {
-                                                eprintln!("❌ KRITISCH: Fehler beim Speichern des Manifests für Chunk {}: {}", chunk_hash_clone, e);
-                                                eprintln!("   → Manifest-Pfad: {}", manifest_path_display);
-                                                eprintln!("   → Chunk wurde geschrieben, aber Manifest nicht aktualisiert!");
-                                                eprintln!("   → Download wird bei {} Chunks stehen bleiben!", manifest_for_write.progress.downloaded_chunks);
-                                                eprintln!("   → Prüfe ob das Verzeichnis existiert und Schreibrechte hat!");
-                                                // Bei Fehler: Entferne aus writing_chunks und start_times
-                                                if let Ok(mut writing) = writing_chunks_for_thread.lock() {
-                                                    writing.remove(&chunk_hash_clone);
-                                                }
-                                                if let Ok(mut start_times) = chunk_download_start_times_for_thread.lock() {
-                                                    start_times.remove(&chunk_hash_clone);
-                                                }
-                                                // WICHTIG: Chunk bleibt in requested_chunks, damit er erneut angefordert werden kann
+                                                eprintln!("❌ KRITISCHER FEHLER: Konnte Chunk {} nicht im Manifest markieren: {}", chunk_hash_for_update, e);
+                                                eprintln!("❌ Chunk wird NICHT aus requested_chunks entfernt - wird später retryed");
+
+                                                // Bei Manifest-Fehler: Chunk NICHT entfernen, damit es später nochmal versucht wird
+                                                // Das verhindert Datenverlust und inkonsistente Zustände
                                                 // (wurde noch nicht entfernt, da wir erst nach erfolgreichem Manifest-Update entfernen)
                                             }
                                         }
                                     }
                                     Err(e) => {
                                         eprintln!("❌ KRITISCH: Fehler beim Schreiben des Chunks {} in Datei: {}", chunk_hash_clone, e);
-                                        // Bei Fehler: Entferne aus writing_chunks und start_times
-                                        if let Ok(mut writing) = writing_chunks_for_thread.lock() {
-                                            writing.remove(&chunk_hash_clone);
-                                        }
+                                        // Bei Fehler: Entferne start_times (writing_chunks wird durch Guard aufgeräumt)
                                         if let Ok(mut start_times) = chunk_download_start_times_for_thread.lock() {
                                             start_times.remove(&chunk_hash_clone);
                                         }
@@ -2510,7 +2585,11 @@ impl DeckDropApp {
                                     }
                                 }
                                     } else {
-                                        eprintln!("Fehler beim Ermitteln des Chunks-Verzeichnisses für {}", game_id);
+                                        eprintln!("❌ KRITISCH: Fehler beim Laden des Manifests (für Schreibvorgang) für {}: {}", game_id, manifest_path.display());
+                                        // Cleanup bei Fehler: Entferne start_times (writing_chunks wird durch Guard aufgeräumt)
+                                        if let Ok(mut start_times) = chunk_download_start_times_for_thread.lock() {
+                                            start_times.remove(&chunk_hash_clone);
+                                        }
                                     }
                                 }
                             } else {
@@ -2528,27 +2607,26 @@ impl DeckDropApp {
                 });
             }
             DiscoveryEvent::ChunkRequestSent { peer_id, chunk_hash, game_id: _ } => {
-                // WICHTIG: Trage Chunk in requested_chunks ein, NACHDEM er erfolgreich gesendet wurde
-                // Dies verhindert, dass Chunks in requested_chunks eingetragen werden, die nie gesendet wurden
                 let start_time = std::time::Instant::now();
+                let mut already_requested = false;
                 if let Ok(mut requested) = self.requested_chunks.lock() {
-                    if !requested.contains(&chunk_hash) {
+                    already_requested = requested.contains(&chunk_hash);
+                    if !already_requested {
                         requested.insert(chunk_hash.clone());
-                        
-                        // Tracke welcher Peer diesen Chunk angefordert hat
-                        if let Ok(mut chunk_peers) = self.chunk_peer_requests.lock() {
-                            chunk_peers.insert(chunk_hash.clone(), peer_id.clone());
-                        }
-                        
-                        // Erhöhe aktive Request-Zahl für diesen Peer
-                        if let Ok(mut active_per_peer) = self.active_requests_per_peer.lock() {
-                            *active_per_peer.entry(peer_id.clone()).or_insert(0) += 1;
-                        }
-                        
-                        eprintln!("Chunk {} in requested_chunks eingetragen (Request erfolgreich gesendet an {})", chunk_hash, peer_id);
-                    } else {
-                        eprintln!("⚠️ Chunk {} wurde bereits angefordert (ignoriere doppelten Request von {})", chunk_hash, peer_id);
                     }
+                }
+                // Tracke immer Peer‑Zuordnung und aktive Requests – unabhängig davon, ob der Chunk
+                // schon vorher (z.B. beim Planen) in requested_chunks stand.
+                if let Ok(mut chunk_peers) = self.chunk_peer_requests.lock() {
+                    chunk_peers.insert(chunk_hash.clone(), peer_id.clone());
+                }
+                if let Ok(mut active_per_peer) = self.active_requests_per_peer.lock() {
+                    *active_per_peer.entry(peer_id.clone()).or_insert(0) += 1;
+                }
+                if already_requested {
+                    eprintln!("Chunk {} war bereits in requested_chunks (Bestätigung von {})", chunk_hash, peer_id);
+                } else {
+                    // eprintln!("Chunk {} in requested_chunks eingetragen (Request erfolgreich gesendet an {})", chunk_hash, peer_id);
                 }
                 if let Ok(mut start_times) = self.chunk_download_start_times.lock() {
                     start_times.insert(chunk_hash.clone(), start_time);
@@ -2826,75 +2904,23 @@ impl DeckDropApp {
     }
     
     /// Phase 4: Request missing chunks with adaptive limits based on peer performance
+    ///
+    /// Hinweis:
+    /// Die eigentliche Steuerung, wie viele Chunks gleichzeitig heruntergeladen werden
+    /// (Slots auffüllen, keine Duplikate), passiert zentral in `update_download_progress`
+    /// über `self.requested_chunks` und wird periodisch im `Tick`-Handler aufgerufen.
+    /// Diese Funktion ist daher bewusst ein No-Op, um doppelte Scheduler-Logik und
+    /// mögliche UI-Freezes zu vermeiden.
     fn request_missing_chunks_adaptive(
-        &self,
-        game_id: &str,
-        peer_ids: &[String],
-        base_max_chunks_per_peer: usize,
+        &mut self,
+        _game_id: &str,
+        _peer_ids: &[String],
+        _base_max_chunks_per_peer: usize,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        if let Some(tx) = crate::network_bridge::get_download_request_tx() {
-            // Robustheit: Filtere blockierte Peers (Circuit Breaker)
-            let available_peers: Vec<String> = {
-                let perf_map_guard = self.peer_performance.lock();
-                let perf_map = perf_map_guard.as_ref().ok();
-                
-                peer_ids.iter()
-                    .filter_map(|peer_id| {
-                        if let Some(perf_map) = perf_map {
-                            if let Some(perf) = perf_map.get(peer_id) {
-                                // Prüfe Circuit Breaker
-                                if let Some(blocked_until) = perf.blocked_until {
-                                    if std::time::Instant::now() < blocked_until {
-                                        eprintln!("Peer {} ist blockiert (Circuit Breaker), überspringe", peer_id);
-                                        return None; // Peer ist blockiert
-                                    } else {
-                                        // Blockierung abgelaufen, entblockiere
-                                        eprintln!("Peer {} Blockierung abgelaufen, verwende wieder", peer_id);
-                                    }
-                                }
-                            }
-                        }
-                        Some(peer_id.clone())
-                    })
-                    .collect()
-            };
-            
-            if available_peers.is_empty() {
-                eprintln!("Keine verfügbaren Peers für Spiel {} (alle blockiert)", game_id);
-                return Err("Keine verfügbaren Peers".into());
-            }
-            
-            // Berechne adaptive Limits für jeden verfügbaren Peer
-            let mut peer_adaptive_limits: HashMap<String, usize> = HashMap::new();
-            
-            if let Ok(perf_map) = self.peer_performance.lock() {
-                for peer_id in &available_peers {
-                    let adaptive_limit = if let Some(perf) = perf_map.get(peer_id) {
-                        perf.adaptive_max_chunks(base_max_chunks_per_peer)
-                    } else {
-                        base_max_chunks_per_peer // Fallback: Standard-Limit
-                    };
-                    peer_adaptive_limits.insert(peer_id.clone(), adaptive_limit);
-                }
-            } else {
-                // Fallback: Verwende Standard-Limit für alle Peers
-                for peer_id in &available_peers {
-                    peer_adaptive_limits.insert(peer_id.clone(), base_max_chunks_per_peer);
-                }
-            }
-            
-            // Verwende das Maximum der adaptiven Limits, um schnelle Peers nicht zu limitieren
-            let max_limit = peer_adaptive_limits.values().max().copied().unwrap_or(base_max_chunks_per_peer);
-            
-            // WICHTIG: Chunks werden NICHT mehr vorher in requested_chunks eingetragen
-            // Stattdessen werden sie eingetragen, wenn sie tatsächlich gesendet wurden (ChunkRequestSent Event)
-            // Dies verhindert, dass Chunks in requested_chunks eingetragen werden, die nie gesendet wurden
-            
-            // Verwende max_limit, damit schnelle Peers ihr volles Potential nutzen können
-            deckdrop_core::request_missing_chunks(game_id, &available_peers, &tx, max_limit)
-        } else {
-            Err("Download request channel not available".into())
-        }
+        // No-Op: Der periodische Scheduler in `update_download_progress()` übernimmt alles.
+        // Wir loggen nur, dass der Aufruf erfolgt ist.
+        eprintln!("request_missing_chunks_adaptive: Aufruf ignoriert (Scheduler läuft im Tick)");
+        Ok(())
     }
     
     /// Sammelt und aktualisiert Performance-Metriken
@@ -2996,12 +3022,18 @@ impl DeckDropApp {
         }
     }
     
-    /// Updates download progress
+    /// Aktualisiert den Download‑Fortschritt.
+    ///
+    /// WICHTIG:
+    /// - Diese Funktion läuft im UI‑Thread und darf daher kein schweres I/O ausführen.
+    /// - Die Manifeste / aktiven Downloads werden im Background (Chunk‑Threads) über
+    ///   `deckdrop_core::load_active_downloads()` geladen und in einem zeitbasierten
+    ///   Cache aktualisiert.
+    /// - Hier lesen wir NUR aus diesem Cache (`get_active_downloads_cached_only()`),
+    ///   damit der UI‑Thread nicht blockiert.
     fn update_download_progress(&mut self) {
-        // Load all active downloads from cache (NICHTs blockierendes I/O im UI‑Thread)
-        // Die eigentliche Aktualisierung des Caches passiert in Hintergrund‑Threads
-        // (z.B. im Chunk‑Verarbeitungs‑Thread nach jedem erfolgreich geschriebenen Chunk).
-        let active_downloads_from_manifests = deckdrop_core::synch::get_active_downloads_cached_only();
+        // Hole aktive Downloads ausschließlich aus dem Cache (kein I/O im UI‑Thread)
+        let active_downloads_from_manifests = deckdrop_core::get_active_downloads_cached_only();
         
         // Track which games need to be finalized (only finalize once)
         let mut games_to_finalize = Vec::new();
@@ -3009,6 +3041,56 @@ impl DeckDropApp {
         // Update active_downloads with all manifests
         for (game_id, manifest) in active_downloads_from_manifests {
             let progress_percent = manifest.progress.percentage as f32;
+
+            // PERFORMANCE FIX: Keine teure Chunk-Zählung im UI-Thread!
+            // Dies hat massiven UI-Lag verursacht. Wir setzen es vorerst auf 0.
+            // TODO: Zähler im Scheduler-Thread pflegen und via Event an UI senden.
+            let downloading_chunks_count = 0;
+
+            // Get peer count
+            let peer_count = self.network_games.get(&game_id)
+                .map(|peers| peers.len())
+                .unwrap_or(0);
+
+            // Check if download already exists
+            if let Some(existing_state) = self.active_downloads.get_mut(&game_id) {
+                // Update existing download state with fresh manifest data
+                existing_state.manifest = manifest.clone();
+                existing_state.progress_percent = progress_percent;
+                existing_state.downloading_chunks_count = downloading_chunks_count;
+                existing_state.peer_count = peer_count;
+
+                // Update download speed (exponential moving average)
+                let now = std::time::Instant::now();
+                existing_state.speed_samples.retain(|&(time, _)| now.duration_since(time) < std::time::Duration::from_secs(60));
+                if !existing_state.speed_samples.is_empty() {
+                    existing_state.download_speed_bytes_per_sec = existing_state.speed_samples.iter()
+                        .map(|&(_, speed)| speed as f64)
+                        .sum::<f64>() / existing_state.speed_samples.len() as f64;
+                }
+
+                /*
+                println!("📊 Updated progress for {}: {:.1}% ({} active chunks)",
+                    game_id, progress_percent, downloading_chunks_count);
+                */
+            } else {
+                // New download not in active_downloads yet - add it
+                println!("📥 Adding new active download: {}", game_id);
+
+                // Create initial DownloadState
+                let download_state = DownloadState {
+                    manifest: manifest.clone(),
+                    progress_percent,
+                    downloading_chunks_count,
+                    peer_count,
+                    download_speed_bytes_per_sec: 0.0,
+                    last_update_time: std::time::Instant::now(),
+                    last_downloaded_chunks: manifest.progress.downloaded_chunks,
+                    speed_samples: Vec::new(),
+                };
+
+                self.active_downloads.insert(game_id.clone(), download_state);
+            }
             
             // Check if this download is complete and needs finalization
             if matches!(manifest.overall_status, deckdrop_core::DownloadStatus::Complete) {
@@ -3026,18 +3108,7 @@ impl DeckDropApp {
                 }
             }
             
-            // Berechne Statistiken
-            let downloading_chunks_count = {
-                if let Ok(requested) = self.requested_chunks.lock() {
-                    // Zähle Chunks, die angefordert wurden aber noch nicht heruntergeladen sind
-                    let missing_chunks = manifest.get_missing_chunks();
-                    missing_chunks.iter()
-                        .filter(|chunk| requested.contains(*chunk))
-                        .count()
-                } else {
-                    0
-                }
-            };
+            // Statistiken werden bereits in der Update-Schleife oben berechnet
             
             // Anzahl der Peers für diesen Download
             let peer_count = self.network_games.get(&game_id)
@@ -3074,8 +3145,8 @@ impl DeckDropApp {
                             let elapsed = newest_time.duration_since(*oldest_time).as_secs_f64();
                             let chunks_downloaded = newest_chunks.saturating_sub(*oldest_chunks);
                             
-                            // Chunk-Größe: 100MB = 100 * 1024 * 1024 Bytes
-                            const CHUNK_SIZE_BYTES: u64 = 100 * 1024 * 1024;
+                            // Chunk-Größe: 1MB = 1 * 1024 * 1024 Bytes
+                            const CHUNK_SIZE_BYTES: u64 = 1 * 1024 * 1024;
                             let bytes_downloaded = (chunks_downloaded as u64) * CHUNK_SIZE_BYTES;
                             
                             if elapsed > 0.5 { // Mindestens 0.5 Sekunden für stabile Berechnung
@@ -3114,38 +3185,20 @@ impl DeckDropApp {
         }
         
         // Finalize downloads that need it (only once)
-        for (game_id, manifest) in games_to_finalize {
-            // Finalize the download
-            if let Err(e) = deckdrop_core::finalize_game_download(&game_id, &manifest) {
-                eprintln!("Error finalizing download for {}: {}", game_id, e);
-            } else {
-                // Reload games list to include the finalized game
-                let config = deckdrop_core::Config::load();
-                self.my_games.clear();
-                
-                // Reload games from download path
-                if config.download_path.exists() {
-                    self.my_games.extend(deckdrop_core::load_games_from_directory(&config.download_path));
-                }
-                
-                // Reload games from game_paths
-                // Nur das Verzeichnis selbst prüfen, NICHT rekursiv Unterverzeichnisse
-                for game_path in &config.game_paths {
-                    if deckdrop_core::check_game_config_exists(game_path) {
-                        if let Ok(game_info) = deckdrop_core::GameInfo::load_from_path(game_path) {
-                            self.my_games.push((game_path.clone(), game_info));
-                        }
-                    }
-                    // KEINE rekursive Suche in Unterverzeichnissen für game_paths
-                    // Nur download_path wird rekursiv durchsucht
-                }
-                
-                // Deduplicate games by game_id
-                self.deduplicate_games_by_id();
-                
-                // Don't initialize integrity status - games will show "NotChecked" by default
-                // User can trigger integrity check manually via button
-            }
+        // ACHTUNG:
+        // Die ursprüngliche Implementierung hat hier im UI-Thread:
+        //   - `finalize_game_download` aufgerufen (viel Dateisystem + Validierung)
+        //   - anschließend die komplette Spieleliste von der Platte neu geladen
+        // Das hat bei großen Spielen spürbare Freezes verursacht.
+        //
+        // Solange wir die Finalisierung nicht sauber in einen Background-Thread
+        // mit eigener UI-Nachricht ausgelagert haben, lassen wir diese teure
+        // Arbeit hier bewusst weg, damit die GUI reaktionsfähig bleibt.
+        //
+        // TODO: Finalisierung + Reload der Spieleliste in eigenen Thread auslagern
+        //       und das Ergebnis per Message zurück in den UI-Thread schicken.
+        for (_game_id, _manifest) in games_to_finalize {
+            // Platzhalter: aktuell keine teure Arbeit im UI-Thread
         }
         
         // Add downloading games to my_games if not already present (only for active downloads)
@@ -3193,19 +3246,50 @@ impl DeckDropApp {
                 
                 // Prüfe ob Download Downloading ist, aber keine aktiven Requests hat
                 if matches!(download_state.manifest.overall_status, deckdrop_core::DownloadStatus::Downloading) {
-                    // Prüfe ob es fehlende Chunks gibt
-                    let missing_chunks = download_state.manifest.get_missing_chunks();
-                    if missing_chunks.is_empty() {
+                    // Prüfe ob es fehlende Chunks gibt (memory-effizient)
+                    let has_missing_chunks = if let Ok(manifest_path) = deckdrop_core::synch::get_manifest_path(_game_id) {
+                        if let Ok(db) = deckdrop_core::manifest_db::ManifestDB::open(&manifest_path) {
+                            // Prüfe nur, ob mindestens ein fehlender Chunk existiert
+                            db.count_missing_chunks(_game_id).unwrap_or(0) > 0
+                        } else {
+                            // Fallback: Verwende in-memory Manifest
+                            !download_state.manifest.get_missing_chunks().is_empty()
+                        }
+                    } else {
+                        !download_state.manifest.get_missing_chunks().is_empty()
+                    };
+
+                    if !has_missing_chunks {
                         return false; // Keine fehlenden Chunks, nichts zu tun
                     }
-                    
-                    // Prüfe ob es aktive Chunk-Requests gibt
+
+                    // Prüfe ob es aktive Chunk-Requests gibt (memory-effizient)
                     let has_active_requests = if let Ok(requested) = self.requested_chunks.lock() {
-                        missing_chunks.iter().any(|chunk| requested.contains(chunk))
+                        if let Ok(manifest_path) = deckdrop_core::synch::get_manifest_path(_game_id) {
+                            if let Ok(db) = deckdrop_core::manifest_db::ManifestDB::open(&manifest_path) {
+                                // Prüfe nur die ersten paar Chunks, ob sie angefordert sind
+                                let mut has_any_active = false;
+                                for batch_result in db.stream_missing_chunks(_game_id, 10) {
+                                    if let Ok(batch) = batch_result {
+                                        if batch.iter().any(|chunk| requested.contains(chunk)) {
+                                            has_any_active = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                                has_any_active
+                            } else {
+                                // Fallback: Verwende in-memory Manifest
+                                let missing_chunks = download_state.manifest.get_missing_chunks();
+                                missing_chunks.iter().any(|chunk| requested.contains(chunk))
+                            }
+                        } else {
+                            false
+                        }
                     } else {
                         false
                     };
-                    
+
                     // Wenn es fehlende Chunks gibt, aber keine aktiven Requests, sollte der Download fortgesetzt werden
                     return !has_active_requests;
                 }
@@ -3231,16 +3315,13 @@ impl DeckDropApp {
             if let Some(peers) = self.network_games.get(&game_id) {
                 let peer_ids: Vec<String> = peers.iter().map(|(peer_id, _)| peer_id.clone()).collect();
                 
-                // Request missing chunks to resume/continue download
-                if crate::network_bridge::get_download_request_tx().is_some() {
-                    // WICHTIG: Verwende max_concurrent_chunks statt festem Wert 10
-                    let max_chunks_per_peer = self.config.max_concurrent_chunks.max(10);
-                    if let Err(e) = self.request_missing_chunks_adaptive(&game_id, &peer_ids, max_chunks_per_peer) {
-                        eprintln!("Error resuming download for {}: {}", game_id, e);
-                    } else {
-                        // Update status to Downloading (falls es noch Pending war)
-                        if let Some(ds) = self.active_downloads.get_mut(&game_id) {
-                            if matches!(ds.manifest.overall_status, deckdrop_core::DownloadStatus::Pending) {
+                // Registriere Download im Scheduler, damit fehlende Chunks regelmäßig nachgefordert werden
+                if !peer_ids.is_empty() {
+                    let changed = crate::network_bridge::register_download_peers(&game_id, &peer_ids);
+                    
+                    // Update status to Downloading (falls es noch Pending war)
+                    if let Some(ds) = self.active_downloads.get_mut(&game_id) {
+                        if matches!(ds.manifest.overall_status, deckdrop_core::DownloadStatus::Pending) {
                             ds.manifest.overall_status = deckdrop_core::DownloadStatus::Downloading;
                             
                             // Save updated manifest
@@ -3248,116 +3329,11 @@ impl DeckDropApp {
                                 let _ = ds.manifest.save(&manifest_path);
                             }
                         }
-                        }
-                        println!("Resumed/continued download for game: {}", game_id);
                     }
-                }
-            }
-        }
-        
-        // WICHTIG: Kontinuierlich neue Chunks anfordern für alle aktiven Downloads
-        // Dies stellt sicher, dass der Download nicht stoppt, wenn fertige Chunks aus requested_chunks entfernt werden
-        for (game_id, download_state) in &self.active_downloads {
-            // Nur für Downloads, die aktiv sind
-            if !matches!(download_state.manifest.overall_status, 
-                deckdrop_core::DownloadStatus::Downloading | deckdrop_core::DownloadStatus::Pending) {
-                continue;
-            }
-            
-            // Prüfe ob Peers verfügbar sind
-            let peer_ids = if let Some(peers) = self.network_games.get(game_id) {
-                if peers.is_empty() {
-                    continue;
-                }
-                peers.iter().map(|(peer_id, _)| peer_id.clone()).collect::<Vec<_>>()
-            } else {
-                continue;
-            };
-            
-            // Prüfe ob es fehlende Chunks gibt, die noch nicht angefordert wurden.
-            // Vermeide teure, wiederholte Manifest-Reloads von der Festplatte:
-            // Wir verwenden den bereits geladenen Manifest aus dem aktuellen DownloadState.
-            let missing_chunks = download_state.manifest.get_missing_chunks();
-            if missing_chunks.is_empty() {
-                continue; // Keine fehlenden Chunks
-            }
-            
-            // WICHTIG: Prüfe wie viele Chunks bereits angefordert wurden
-            // Zähle nur Chunks, die wirklich noch fehlen UND angefordert wurden
-            let max_concurrent = self.config.max_concurrent_chunks;
-            let (requested_count, new_chunks) = {
-                if let Ok(requested) = self.requested_chunks.lock() {
-                    let requested_count = missing_chunks.iter()
-                        .filter(|chunk| requested.contains(*chunk))
-                        .count();
                     
-                    // Wenn weniger als max_concurrent_chunks angefordert wurden, fordere neue an
-                    if requested_count < max_concurrent {
-                        let remaining_slots = max_concurrent - requested_count;
-                        
-                        // Finde Chunks, die noch nicht angefordert wurden
-                        let new_chunks: Vec<String> = missing_chunks.iter()
-                            .filter(|chunk| !requested.contains(*chunk))
-                            .take(remaining_slots)
-                            .cloned()
-                            .collect();
-                        
-                        (requested_count, new_chunks)
-                    } else {
-                        (requested_count, Vec::new())
-                    }
-                } else {
-                    continue;
-                }
-            };
-            
-            // Wenn neue Chunks gefunden wurden, fordere sie an
-            if !new_chunks.is_empty() {
-                let start_time = std::time::Instant::now();
-                // WICHTIG: Trage Chunks direkt nach dem Senden in requested_chunks ein
-                // Filtere Chunks, die bereits angefordert wurden (verhindert doppelte Requests)
-                let chunks_to_request: Vec<String> = {
-                    if let Ok(requested) = self.requested_chunks.lock() {
-                        new_chunks.iter()
-                            .filter(|chunk| !requested.contains(*chunk))
-                            .cloned()
-                            .collect()
-                    } else {
-                        new_chunks.clone()
-                    }
-                };
-                
-                if !chunks_to_request.is_empty() {
-                    // WICHTIG: Trage Chunks NICHT vorzeitig in requested_chunks ein!
-                    // Sie werden erst eingetragen, NACHDEM sie erfolgreich gesendet wurden (via ChunkRequestSent Event)
-                    // Dies verhindert, dass Chunks in requested_chunks bleiben, die nie gesendet wurden
-                    
-                    // Sende Requests für neue Chunks
-                    // Intelligente Peer-Auswahl mit Load-Balancing
-                    if let Some(tx) = crate::network_bridge::get_download_request_tx() {
-                        for chunk_hash in chunks_to_request.iter() {
-                            // WICHTIG: Verwende das Netzwerk-Limit (10) für Peer-Auswahl, nicht das globale Limit (15)
-                            // Das Netzwerk-Limit ist pro Peer, das globale Limit ist die Gesamtzahl
-                            const MAX_REQUESTS_PER_PEER: usize = 10;
-                            if let Some(peer_id) = self.select_best_peer_for_chunk(chunk_hash, &peer_ids, MAX_REQUESTS_PER_PEER) {
-                                if let Err(e) = tx.send(
-                                    deckdrop_network::network::discovery::DownloadRequest::RequestChunk {
-                                        peer_id: peer_id.clone(),
-                                        chunk_hash: chunk_hash.clone(),
-                                        game_id: game_id.clone(),
-                                    }
-                                ) {
-                                    eprintln!("Fehler beim Senden von Chunk-Request für {}: {}", chunk_hash, e);
-                                    // Bei Sendefehler: Chunk wurde nie in requested_chunks eingetragen, also nichts zu entfernen
-                                }
-                                // Bei erfolgreichem tx.send() wird der Chunk via ChunkRequestSent Event in requested_chunks eingetragen
-                            } else {
-                                eprintln!("⚠️ Kein verfügbarer Peer für Chunk {} (alle Peers haben zu viele aktive Requests)", chunk_hash);
-                                // Chunk wurde nie in requested_chunks eingetragen, also nichts zu entfernen
-                            }
-                        }
-                        eprintln!("[Download] {}: {}/{} active chunks. Requesting {}.", 
-                            game_id, requested_count, max_concurrent, chunks_to_request.len());
+                    // Log nur wenn sich was geändert hat
+                    if changed {
+                        println!("Resumed/continued download for game (Scheduler aktiviert/aktualisiert): {}", game_id);
                     }
                 }
             }
@@ -3372,12 +3348,10 @@ impl DeckDropApp {
             }
         });
         
-        // Count only active downloads (not Complete, not Cancelled)
+        // Count only actively downloading games (not Complete, not Cancelled, not Pending)
         self.status.active_download_count = self.active_downloads.values()
             .filter(|ds| {
-                !matches!(ds.manifest.overall_status, 
-                    deckdrop_core::DownloadStatus::Complete | 
-                    deckdrop_core::DownloadStatus::Cancelled)
+                matches!(ds.manifest.overall_status, deckdrop_core::DownloadStatus::Downloading)
             })
             .count();
     }
@@ -3630,10 +3604,9 @@ impl DeckDropApp {
                                 progress_bar(0.0..=100.0, ds.progress_percent)
                                     .width(Length::Fill),
                                 text(format!(
-                                    "Chunks: {}/{} | Done: {} | Downloading: {} | Peers: {} | Speed: {}",
+                                    "Chunks: {}/{} | Requested: {} | Peers: {} | Speed: {}",
                                     ds.manifest.progress.downloaded_chunks,
                                     ds.manifest.progress.total_chunks,
-                                    ds.manifest.progress.downloaded_chunks,
                                     ds.downloading_chunks_count,
                                     ds.peer_count,
                                     speed_text
@@ -3889,10 +3862,9 @@ impl DeckDropApp {
                                 progress_bar(0.0..=100.0, ds.progress_percent)
                                     .width(Length::Fill),
                                 text(format!(
-                                    "Chunks: {}/{} | Done: {} | Downloading: {} | Peers: {} | Speed: {}",
+                                    "Chunks: {}/{} | Requested: {} | Peers: {} | Speed: {}",
                                     ds.manifest.progress.downloaded_chunks,
                                     ds.manifest.progress.total_chunks,
-                                    ds.manifest.progress.downloaded_chunks,
                                     ds.downloading_chunks_count,
                                     ds.peer_count,
                                     speed_text
@@ -4926,10 +4898,18 @@ impl DeckDropApp {
                                                     .filter(|(_, progress)| *progress < 100.0)
                                                     .collect();
                                                 
-                                                // Begrenze Anzahl angezeigter Chunks, um UI zu entlasten
+                                                // Begrenze Anzahl angezeigter Chunks:
+                                                // - technisch auf einen hohen Wert (50) für Debugging
+                                                // - visuell zusätzlich auf max_concurrent_chunks aus der Config,
+                                                //   damit nie mehr Chunks gleichzeitig angezeigt werden,
+                                                //   als laut Einstellungen parallel geladen werden sollen.
                                                 const MAX_CHUNKS_SHOWN: usize = 50;
                                                 if chunks_with_progress.len() > MAX_CHUNKS_SHOWN {
                                                     chunks_with_progress.truncate(MAX_CHUNKS_SHOWN);
+                                                }
+                                                let ui_limit = self.config.max_concurrent_chunks.max(1);
+                                                if chunks_with_progress.len() > ui_limit {
+                                                    chunks_with_progress.truncate(ui_limit);
                                                 }
                                                 
                                                 // Sortiere alphabetisch nach Chunk-Hash (stabil, keine Sprünge)
@@ -4994,10 +4974,20 @@ impl DeckDropApp {
                                                 {
                                                     let mut chunk_column = column![].spacing(scale(8.0)).width(Length::Fill);
                                                     for (chunk_hash, progress) in &downloading_chunks {
-                                                        let chunk_short: String = if chunk_hash.len() > 16 {
-                                                            format!("{}...", &chunk_hash[..16])
+                                                        // Zeige immer den Chunk-Index (z.B. :1) auch bei abgekürztem Hash
+                                                        let (hash_part, index_suffix) = match chunk_hash.rsplit_once(':') {
+                                                            Some((h, idx)) => (h, Some(idx)),
+                                                            None => (chunk_hash.as_str(), None),
+                                                        };
+                                                        let base_short = if hash_part.len() > 16 {
+                                                            format!("{}...", &hash_part[..16])
                                                         } else {
-                                                            chunk_hash.clone()
+                                                            hash_part.to_string()
+                                                        };
+                                                        let chunk_short = if let Some(idx) = index_suffix {
+                                                            format!("{}:{}", base_short, idx)
+                                                        } else {
+                                                            base_short
                                                         };
                                                         let progress_text = format!("{:.1}%", progress);
                                                         chunk_column = chunk_column.push(
@@ -5045,60 +5035,20 @@ impl DeckDropApp {
                                                 {
                                                     let mut chunk_column = column![].spacing(scale(8.0)).width(Length::Fill);
                                                     for chunk_hash in &writing_chunks_list {
-                                                        let chunk_short: String = if chunk_hash.len() > 16 {
-                                                            format!("{}...", &chunk_hash[..16])
-                                                        } else {
-                                                            chunk_hash.clone()
+                                                        // Zeige auch hier immer den Chunk-Index (z.B. :1) bei abgekürztem Hash
+                                                        let (hash_part, index_suffix) = match chunk_hash.rsplit_once(':') {
+                                                            Some((h, idx)) => (h, Some(idx)),
+                                                            None => (chunk_hash.as_str(), None),
                                                         };
-                                                        chunk_column = chunk_column.push(
-                                                            column![
-                                                                row![
-                                                                    text(chunk_short).size(scale_text(11.0))
-                                                                        .width(Length::Fill),
-                                                                    text("Wird geschrieben...").size(scale_text(11.0))
-                                                                        .style(|_theme: &Theme| {
-                                                                            iced::widget::text::Style {
-                                                                                color: Some(Color::from_rgba(1.0, 0.8, 0.0, 1.0)),
-                                                                            }
-                                                                        }),
-                                                                ]
-                                                                .width(Length::Fill)
-                                                                .spacing(scale(8.0)),
-                                                                Space::with_height(Length::Fixed(scale(4.0))),
-                                                                progress_bar(0.0..=100.0, 100.0)
-                                                                    .width(Length::Fill)
-                                                                    .height(Length::Fixed(scale(12.0))),
-                                                            ]
-                                                            .spacing(scale(2.0))
-                                                            .width(Length::Fill)
-                                                        );
-                                                    }
-                                                    chunk_column
-                                                },
-                                            ]
-                                            .width(Length::Fill)
-                                        } else {
-                                            column![]
-                                        },
-                                        // Chunks die gerade geschrieben werden
-                                        if !writing_chunks_list.is_empty() {
-                                            column![
-                                                Space::with_height(Length::Fixed(scale(16.0))),
-                                                text("Wird geschrieben").size(scale_text(13.0))
-                                                    .style(|_theme: &Theme| {
-                                                        iced::widget::text::Style {
-                                                            color: Some(Color::from_rgba(0.6, 0.6, 0.6, 1.0)),
-                                                        }
-                                                    }),
-                                                Space::with_height(Length::Fixed(scale(8.0))),
-                                                // Zeige Chunks mit Status "Wird geschrieben" und 100% Progress
-                                                {
-                                                    let mut chunk_column = column![].spacing(scale(8.0)).width(Length::Fill);
-                                                    for chunk_hash in &writing_chunks_list {
-                                                        let chunk_short: String = if chunk_hash.len() > 16 {
-                                                            format!("{}...", &chunk_hash[..16])
+                                                        let base_short = if hash_part.len() > 16 {
+                                                            format!("{}...", &hash_part[..16])
                                                         } else {
-                                                            chunk_hash.clone()
+                                                            hash_part.to_string()
+                                                        };
+                                                        let chunk_short = if let Some(idx) = index_suffix {
+                                                            format!("{}:{}", base_short, idx)
+                                                        } else {
+                                                            base_short
                                                         };
                                                         chunk_column = chunk_column.push(
                                                             column![

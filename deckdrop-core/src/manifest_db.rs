@@ -25,6 +25,9 @@ impl ManifestDB {
         
         let conn = Connection::open(db_path)?;
         
+        // Setze Busy Timeout auf 5 Sekunden, um "database is locked" Fehler bei parallelem Zugriff zu vermeiden
+        conn.busy_timeout(std::time::Duration::from_secs(30))?;
+        
         // Aktiviere WAL-Modus für bessere Performance und parallele Zugriffe
         // PRAGMA journal_mode gibt einen Wert zurück, daher query_row verwenden
         let _: String = conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
@@ -490,24 +493,111 @@ impl ManifestDB {
     /// Gibt alle fehlenden Chunks zurück
     pub fn get_missing_chunks(&self, game_id: &str) -> SqliteResult<Vec<String>> {
         let conn = self.conn.lock().unwrap();
-        
+
+        // Optimiert: JOIN statt Subquery für bessere Performance
         let mut stmt = conn.prepare(
-            "SELECT chunk_hash FROM chunks 
-             WHERE file_id IN (SELECT id FROM files WHERE game_id = ?1)
-             AND is_downloaded = 0
-             ORDER BY chunk_index"
+            "SELECT c.chunk_hash FROM chunks c
+             INNER JOIN files f ON c.file_id = f.id
+             WHERE f.game_id = ?1 AND c.is_downloaded = 0
+             ORDER BY c.chunk_index"
         )?;
-        
+
         let chunks_iter = stmt.query_map(params![game_id], |row| {
             Ok(row.get::<_, String>(0)?)
         })?;
-        
+
         let mut missing = Vec::new();
         for chunk_hash in chunks_iter {
             missing.push(chunk_hash?);
         }
-        
+
         Ok(missing)
+    }
+
+    /// Gibt fehlende Chunks in Batches zurück (memory-effizient für große Manifeste)
+    /// `limit`: Maximale Anzahl der zurückzugebenden Chunks
+    /// `offset`: Offset für Pagination (0-basiert)
+    pub fn get_missing_chunks_paginated(&self, game_id: &str, limit: usize, offset: usize) -> SqliteResult<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+
+        // Optimiert: JOIN statt Subquery für bessere Performance
+        let mut stmt = conn.prepare(
+            "SELECT c.chunk_hash FROM chunks c
+             INNER JOIN files f ON c.file_id = f.id
+             WHERE f.game_id = ?1 AND c.is_downloaded = 0
+             ORDER BY c.chunk_index
+             LIMIT ?2 OFFSET ?3"
+        )?;
+
+        let chunks_iter = stmt.query_map(params![game_id, limit as i64, offset as i64], |row| {
+            Ok(row.get::<_, String>(0)?)
+        })?;
+
+        let mut missing = Vec::new();
+        for chunk_hash in chunks_iter {
+            missing.push(chunk_hash?);
+        }
+
+        Ok(missing)
+    }
+
+    /// Gibt die Gesamtanzahl fehlender Chunks zurück (ohne die Chunks selbst zu laden)
+    pub fn count_missing_chunks(&self, game_id: &str) -> SqliteResult<usize> {
+        let conn = self.conn.lock().unwrap();
+
+        // Optimiert: JOIN statt Subquery für bessere Performance
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM chunks c
+             INNER JOIN files f ON c.file_id = f.id
+             WHERE f.game_id = ?1 AND c.is_downloaded = 0",
+            params![game_id],
+            |row| row.get(0)
+        )?;
+
+        Ok(count as usize)
+    }
+
+    /// Iterator für fehlende Chunks (memory-effizient)
+    /// Gibt Chunks in kleinen Batches zurück, ohne alles auf einmal zu laden
+    pub fn stream_missing_chunks(&self, game_id: &str, batch_size: usize) -> impl Iterator<Item = SqliteResult<Vec<String>>> + '_ {
+        let conn = self.conn.clone();
+        let game_id = game_id.to_string();
+
+        (0..).map(move |batch_index| {
+            let offset = batch_index * batch_size;
+            let conn = conn.lock().unwrap();
+
+            // Optimiert: JOIN statt Subquery für bessere Performance
+            let mut stmt = conn.prepare(
+                "SELECT c.chunk_hash FROM chunks c
+                 INNER JOIN files f ON c.file_id = f.id
+                 WHERE f.game_id = ?1 AND c.is_downloaded = 0
+                 ORDER BY c.chunk_index
+                 LIMIT ?2 OFFSET ?3"
+            )?;
+
+            let chunks_iter = stmt.query_map(params![&game_id, batch_size as i64, offset as i64], |row| {
+                Ok(row.get::<_, String>(0)?)
+            })?;
+
+            let mut batch = Vec::new();
+            for chunk_hash in chunks_iter {
+                batch.push(chunk_hash?);
+            }
+
+            // Wenn der Batch leer ist, sind wir fertig
+            if batch.is_empty() {
+                return Ok(vec![]);
+            }
+
+            Ok(batch)
+        }).take_while(|result| {
+            // Stoppe bei leerem Batch oder Fehler
+            match result {
+                Ok(batch) => !batch.is_empty(),
+                Err(_) => false,
+            }
+        })
     }
     
     /// Gibt alle game_ids zurück

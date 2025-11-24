@@ -79,6 +79,9 @@ pub enum DownloadRequest {
         chunk_hash: String,
         game_id: String, // Für Tracking
     },
+    ChunkDownloadCompleted {
+        chunk_hash: String,
+    },
 }
 
 /// Callback-Typ zum Laden von Spielen
@@ -202,9 +205,14 @@ pub async fn run_discovery(
     let pending_metadata_requests_clone = pending_metadata_requests.clone();
     
     // Tracking für Peer-Adressen: peer_id -> Multiaddr (für Reconnects)
-    let peer_addrs: Arc<tokio::sync::Mutex<HashMap<String, libp2p::Multiaddr>>> = 
+    let peer_addrs: Arc<tokio::sync::Mutex<HashMap<String, libp2p::Multiaddr>>> =
         Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     let peer_addrs_clone = peer_addrs.clone();
+
+    // Tracking für gescheiterte Peer-Verbindungen: peer_id -> (letzter_versuch, gescheiterte_versuche)
+    let failed_peers: Arc<tokio::sync::Mutex<HashMap<String, (std::time::Instant, usize)>>> =
+        Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let failed_peers_clone = failed_peers.clone();
     
     // Channel für Reconnect-Anfragen
     let (reconnect_tx, mut reconnect_rx) = tokio::sync::mpsc::unbounded_channel::<libp2p::Multiaddr>();
@@ -533,13 +541,15 @@ pub async fn run_discovery(
                         .collect::<Vec<_>>();
                     
                     if !peers_with_active.is_empty() {
+                        /*
                         println!("KeepAlive (aktiv): Sende GamesList-Requests an {} Peers mit aktiven Downloads", peers_with_active.len());
                         eprintln!("KeepAlive (aktiv): Sende GamesList-Requests an {} Peers mit aktiven Downloads", peers_with_active.len());
+                        */
                         
                         for peer_id in peers_with_active {
                             let request = GamesListRequest;
                             let _request_id = swarm.behaviour_mut().games_list.send_request(&peer_id, request);
-                            println!("KeepAlive (aktiv): GamesList-Request gesendet an {}", peer_id);
+                            // println!("KeepAlive (aktiv): GamesList-Request gesendet an {}", peer_id);
                         }
                     }
                 }
@@ -680,6 +690,13 @@ pub async fn run_discovery(
                             eprintln!("GameMetadata Request gesendet an {} für game_id: {} (RequestId: {:?})", peer_id, game_id, request_id);
                         }
                         DownloadRequest::RequestChunk { peer_id, chunk_hash, game_id } => {
+                            // Cleanup: Entferne alte failed peer Einträge (älter als 1 Stunde)
+                            {
+                                let mut failed = failed_peers_clone.lock().await;
+                                let now = std::time::Instant::now();
+                                failed.retain(|_, (last_attempt, _)| now.duration_since(*last_attempt) < Duration::from_secs(3600));
+                            }
+
                             // Prüfe globale Begrenzung: Maximal max_concurrent_chunks Chunk-Downloads gleichzeitig
                             let global_active_count = {
                                 let active = active_chunk_downloads_clone.lock().await;
@@ -690,8 +707,15 @@ pub async fn run_discovery(
                                 // Füge Request zur Warteschlange hinzu
                                 let mut queue = pending_chunk_queue_clone.lock().await;
                                 queue.push_back((peer_id.clone(), chunk_hash.clone(), game_id.clone()));
-                                eprintln!("Maximal 5 Chunk-Downloads aktiv ({}), füge Request zur Warteschlange hinzu: {} von {}", 
-                                    global_active_count, chunk_hash, peer_id);
+                                /*
+                                eprintln!(
+                                    "Maximal {} Chunk-Downloads aktiv ({}), füge Request zur Warteschlange hinzu: {} von {}", 
+                                    max_concurrent_chunks,
+                                    global_active_count,
+                                    chunk_hash,
+                                    peer_id
+                                );
+                                */
                                 continue;
                             }
                             
@@ -703,9 +727,10 @@ pub async fn run_discovery(
                                 }
                             };
                             
-                            // Robustheit: Rate-Limiting - Max 10 gleichzeitige Requests pro Peer
-                            // Erhöht von 5 auf 10 für bessere Parallelisierung mit kleineren Chunks (10MB)
-                            let max_requests_per_peer = 10;
+                            // Robustheit: Rate-Limiting - Max gleichzeitige Requests pro Peer
+                            // Verwende denselben Wert wie für die globale Begrenzung, damit
+                            // max_concurrent_chunks aus der Config wirklich das Gesamt-Limit widerspiegelt.
+                            let max_requests_per_peer = max_concurrent_chunks;
                             let active_count = {
                                 let mut active = active_requests_per_peer_clone.lock().await;
                                 *active.entry(peer_id.clone()).or_insert(0)
@@ -719,38 +744,102 @@ pub async fn run_discovery(
                             
                             // Prüfe ob Peer verbunden ist, versuche Reconnect falls nicht
                             if !swarm.connected_peers().any(|p| p == &peer_id_parsed) {
-                                eprintln!("Peer {} nicht verbunden für Chunk Request, versuche Reconnect...", peer_id);
-                                
+                                // Prüfe zuerst, ob Peer als failed markiert ist
+                                let should_skip = {
+                                    let failed = failed_peers_clone.lock().await;
+                                    if let Some((last_attempt, fail_count)) = failed.get(&peer_id) {
+                                        let now = std::time::Instant::now();
+                                        // Wenn zu viele Versuche gescheitert sind, überspringe für 5 Minuten
+                                        if *fail_count >= 3 && now.duration_since(*last_attempt) < Duration::from_secs(300) {
+                                            true
+                                        } else if *fail_count >= 10 {
+                                            // Nach 10 Versuchen überspringe für 30 Minuten
+                                            now.duration_since(*last_attempt) < Duration::from_secs(1800)
+                                        } else {
+                                            false
+                                        }
+                                    } else {
+                                        false
+                                    }
+                                };
+
+                                if should_skip {
+                                    // Logge nur sehr selten (alle 30 Sekunden) um Spam zu vermeiden
+                                    let now = std::time::Instant::now();
+                                    let last_log = {
+                                        let mut failed = failed_peers_clone.lock().await;
+                                        if let Some((last_attempt, _)) = failed.get(&peer_id) {
+                                            *last_attempt
+                                        } else {
+                                            now
+                                        }
+                                    };
+                                    
+                                    // Nur loggen, wenn seit dem letzten Versuch > 30s vergangen sind (ungefähr)
+                                    // Da wir den Zeitstempel in failed_peers nicht aktualisieren wenn wir skippen (sonst würden wir ewig skippen),
+                                    // nutzen wir hier einfach eine Wahrscheinlichkeit oder zählen im Scheduler.
+                                    // Einfacher: Nur debug loggen oder gar nicht.
+                                    // eprintln!("Peer {} übersprungen (zu viele gescheiterte Verbindungsversuche)", peer_id);
+                                    continue;
+                                }
+
+                                // eprintln!("Peer {} nicht verbunden für Chunk Request, versuche Reconnect...", peer_id);
+
                                 // Versuche Reconnect mit gespeicherter Adresse
                                 let addr_opt = {
                                     let addrs = peer_addrs_clone.lock().await;
                                     addrs.get(&peer_id).cloned()
                                 };
-                                
+
                                 if let Some(addr) = addr_opt {
                                     let addr_with_peer = if addr.iter().any(|p| matches!(p, libp2p::multiaddr::Protocol::P2p(_))) {
                                         addr.clone()
                                     } else {
                                         addr.with(libp2p::multiaddr::Protocol::P2p(peer_id_parsed))
                                     };
-                                    
+
                                     if let Err(e) = swarm.dial(addr_with_peer) {
                                         eprintln!("Reconnect fehlgeschlagen für {}: {}", peer_id, e);
+
+                                        // Markiere Peer als failed
+                                        {
+                                            let mut failed = failed_peers_clone.lock().await;
+                                            let entry = failed.entry(peer_id.clone()).or_insert((std::time::Instant::now(), 0));
+                                            entry.0 = std::time::Instant::now();
+                                            entry.1 += 1;
+                                            eprintln!("Peer {} markiert als failed (Versuch {}/{})", peer_id, entry.1, if entry.1 >= 10 { "∞" } else { "3" });
+                                        }
+
                                         continue; // Überspringe Request bei Reconnect-Fehler
                                     } else {
                                         println!("Reconnect initiiert für {}, warte auf Verbindung...", peer_id);
-                                        // Warte kurz auf Verbindung
-                                        tokio::time::sleep(Duration::from_millis(500)).await;
+                                        // Warte kurz auf Verbindung - Reduziert auf 100ms um Blockieren zu minimieren
+                                        tokio::time::sleep(Duration::from_millis(100)).await;
                                     }
                                 } else {
-                                    eprintln!("Keine Adresse für Peer {} gefunden, überspringe Request", peer_id);
+                                    // eprintln!("Keine Adresse für Peer {} gefunden, überspringe Request", peer_id);
                                     continue;
                                 }
-                                
+
                                 // Prüfe erneut, ob Peer jetzt verbunden ist
                                 if !swarm.connected_peers().any(|p| p == &peer_id_parsed) {
                                     eprintln!("Peer {} immer noch nicht verbunden nach Reconnect-Versuch", peer_id);
+
+                                    // Markiere Peer als failed
+                                    {
+                                        let mut failed = failed_peers_clone.lock().await;
+                                        let entry = failed.entry(peer_id.clone()).or_insert((std::time::Instant::now(), 0));
+                                        entry.0 = std::time::Instant::now();
+                                        entry.1 += 1;
+                                        eprintln!("Peer {} markiert als failed (Versuch {}/{})", peer_id, entry.1, if entry.1 >= 10 { "∞" } else { "3" });
+                                    }
+
                                     continue;
+                                } else {
+                                    // Erfolgreich verbunden - reset failed counter
+                                    let mut failed = failed_peers_clone.lock().await;
+                                    failed.remove(&peer_id);
+                                    println!("Peer {} erfolgreich reconnected!", peer_id);
                                 }
                             }
                             
@@ -775,10 +864,12 @@ pub async fn run_discovery(
                                 *global_active += 1;
                             }
                             
+                            /*
                             println!("Chunk Request gesendet an {} für hash: {} (RequestId: {:?}, globale aktive Downloads: {})", 
                                 peer_id, chunk_hash, request_id, global_active_count + 1);
                             eprintln!("Chunk Request gesendet an {} für hash: {} (RequestId: {:?}, globale aktive Downloads: {})", 
                                 peer_id, chunk_hash, request_id, global_active_count + 1);
+                            */
                             
                             // Sende Event, dass Chunk-Request erfolgreich gesendet wurde
                             if let Err(e) = event_tx.send(DiscoveryEvent::ChunkRequestSent {
@@ -788,6 +879,88 @@ pub async fn run_discovery(
                             }).await {
                                 eprintln!("Fehler beim Senden von ChunkRequestSent Event: {}", e);
                             }
+                        }
+                        DownloadRequest::ChunkDownloadCompleted { chunk_hash } => {
+                            println!("📥 ChunkDownloadCompleted empfangen für: {}", chunk_hash);
+                            eprintln!("📥 ChunkDownloadCompleted empfangen für: {}", chunk_hash);
+
+                            // Reduziere globale Anzahl aktiver Chunk-Downloads
+                            {
+                                let mut global_active = active_chunk_downloads_clone.lock().await;
+                                if *global_active > 0 {
+                                    *global_active -= 1;
+                                    println!("✅ Chunk {} abgeschlossen, globale aktive Downloads: {}", chunk_hash, *global_active);
+                                    eprintln!("✅ Chunk {} abgeschlossen, globale aktive Downloads: {}", chunk_hash, *global_active);
+                                } else {
+                                    eprintln!("⚠️ WARNUNG: Chunk {} abgeschlossen, aber globale aktive Downloads waren bereits 0", chunk_hash);
+                                }
+                            }
+
+                            // Verarbeite wartende Chunk-Requests aus der Warteschlange
+                            let mut processed_count = 0;
+                            loop {
+                                let global_active_count = {
+                                    let active = active_chunk_downloads_clone.lock().await;
+                                    *active
+                                };
+
+                                if global_active_count >= max_concurrent_chunks {
+                                    break; // Keine Slots mehr frei
+                                }
+
+                                let next_request = {
+                                    let mut queue = pending_chunk_queue_clone.lock().await;
+                                    queue.pop_front() // FIFO: Erste Element zuerst
+                                };
+
+                                if let Some((peer_id, chunk_hash, game_id)) = next_request {
+                                    println!("🚀 Starte wartenden Request: {} von {}", chunk_hash, peer_id);
+
+                                    let peer_id_parsed = match PeerId::from_str(&peer_id) {
+                                        Ok(id) => id,
+                                        Err(_) => {
+                                            eprintln!("Ungültige Peer-ID in Warteschlange: {}", peer_id);
+                                            continue;
+                                        }
+                                    };
+
+                                    // Prüfe ob Peer verbunden ist
+                                    if !swarm.connected_peers().any(|p| p == &peer_id_parsed) {
+                                        eprintln!("Peer {} nicht verbunden, überspringe wartenden Request", peer_id);
+                                        continue;
+                                    }
+
+                                    // Sende den wartenden Chunk-Request
+                                    let request = ChunkRequest { chunk_hash: chunk_hash.clone() };
+                                    let request_id = swarm.behaviour_mut().chunks.send_request(&peer_id_parsed, request);
+
+                                    // Tracke Request
+                                    {
+                                        let mut pending = pending_chunk_requests_clone.lock().await;
+                                        pending.insert(request_id, (chunk_hash.clone(), game_id.clone(), peer_id.clone(), std::time::Instant::now()));
+                                    }
+
+                                    // Erhöhe globale Anzahl aktiver Chunk-Downloads
+                                    {
+                                        let mut global_active = active_chunk_downloads_clone.lock().await;
+                                        *global_active += 1;
+                                    }
+
+                                    println!("✅ Wartender Chunk Request gesendet: {} von {}", chunk_hash, peer_id);
+
+                                    // Sende Event
+                                    let _ = event_tx.send(DiscoveryEvent::ChunkRequestSent {
+                                        peer_id: peer_id.clone(),
+                                        chunk_hash: chunk_hash.clone(),
+                                        game_id: game_id.clone(),
+                                    }).await;
+
+                                    processed_count += 1;
+                                } else {
+                                    break; // Keine weiteren Requests
+                                }
+                            }
+                            println!("📊 Warteschlangen-Verarbeitung abgeschlossen, {} Chunks neu gestartet", processed_count);
                         }
                     }
                 }
@@ -959,8 +1132,10 @@ pub async fn run_discovery(
                         }
                     }
                     DiscoveryBehaviourEvent::GamesList(games_event) => {
+                        /*
                         println!("GamesList Event empfangen: {:?}", games_event);
                         eprintln!("GamesList Event empfangen: {:?}", games_event);
+                        */
                         match games_event {
                             libp2p::request_response::Event::Message { message, peer, .. } => {
                                 match message {
@@ -980,23 +1155,29 @@ pub async fn run_discovery(
                                     libp2p::request_response::Message::Response { response, .. } => {
                                         // Wir haben eine Spiele-Liste von einem Peer erhalten
                                         let peer_id_str = peer.to_string();
+                                        /*
                                         println!("GamesList Response erhalten von {}: {} Spiele", peer_id_str, response.games.len());
                                         eprintln!("GamesList Response erhalten von {}: {} Spiele", peer_id_str, response.games.len());
                                         for game in &response.games {
                                             println!("  - {} (v{}) [key: {}]", game.name, game.version, game.unique_key());
                                             eprintln!("  - {} (v{}) [key: {}]", game.name, game.version, game.unique_key());
                                         }
+                                        */
                                         match event_tx_clone.send(DiscoveryEvent::GamesListReceived {
                                             peer_id: peer_id_str,
                                             games: response.games,
                                         }).await {
                                             Ok(()) => {
+                                                /*
                                                 println!("GamesListReceived Event erfolgreich an GTK Thread gesendet");
                                                 eprintln!("GamesListReceived Event erfolgreich an GTK Thread gesendet");
+                                                */
                                             }
                                             Err(e) => {
+                                                /*
                                                 eprintln!("FEHLER beim Senden von GamesListReceived Event: {}", e);
                                                 println!("FEHLER beim Senden von GamesListReceived Event: {}", e);
+                                                */
                                             }
                                         }
                                     }
@@ -1099,7 +1280,7 @@ pub async fn run_discovery(
                                 let should_retry = matches!(error, 
                                     libp2p::request_response::OutboundFailure::Timeout |
                                     libp2p::request_response::OutboundFailure::ConnectionClosed
-                                );
+    );
                                 
                                 let mut retry_successful = false;
                                 
@@ -1157,8 +1338,10 @@ pub async fn run_discovery(
                                         eprintln!("Chunks Event: Request für hash: {}", request.chunk_hash);
                                     }
                                     libp2p::request_response::Message::Response { request_id, response, .. } => {
+                                        /*
                                         eprintln!("Chunks Event: Response für RequestId: {:?}, hash: {}, size: {} MB", 
                                             request_id, response.chunk_hash, response.chunk_data.len() / (1024 * 1024));
+                                        */
                                     }
                                 }
                             }
@@ -1217,10 +1400,10 @@ pub async fn run_discovery(
                                                 }
                                             }
                                         } else {
-                                            eprintln!("⚠️ ChunkLoader nicht verfügbar für Chunk {}", request.chunk_hash);
-                                            ChunkResponse { 
+                                            eprintln!("⚠️ ChunkLoader nicht verfügbar für Chunk {} - sende leere Response", request.chunk_hash);
+                                            ChunkResponse {
                                                 chunk_hash: request.chunk_hash.clone(),
-                                                chunk_data: Vec::new() 
+                                                chunk_data: Vec::new()
                                             }
                                         };
                                         
@@ -1238,18 +1421,22 @@ pub async fn run_discovery(
                                     libp2p::request_response::Message::Response { request_id, response, .. } => {
                                         // Wir haben einen Chunk erhalten
                                         let peer_id_str = peer.to_string();
+                                        /*
                                         eprintln!("🔵 Chunk Response Message empfangen von {} (RequestId: {:?}, Response-Hash: {})", 
                                             peer_id_str, request_id, response.chunk_hash);
+                                        */
                                         
                                         // Entferne Request aus Tracking und verwende getrackten Hash
                                         let (chunk_hash, game_id, peer_id_from_tracking, request_time) = {
                                             let mut pending = pending_chunk_requests_clone.lock().await;
                                             if let Some((hash, gid, peer, time)) = pending.remove(&request_id) {
+                                                /*
                                                 eprintln!("✅ Chunk Request {} im Tracking gefunden: hash={}, game_id={}", 
                                                     request_id, hash, gid);
+                                                */
                                                 (hash, gid, peer, time)
                                             } else {
-                                                eprintln!("⚠️ Warnung: Chunk Request {} nicht im Tracking gefunden, verwende Hash aus Response", request_id);
+                                                // eprintln!("⚠️ Warnung: Chunk Request {} nicht im Tracking gefunden, verwende Hash aus Response", request_id);
                                                 (response.chunk_hash.clone(), "unknown".to_string(), peer_id_str.clone(), std::time::Instant::now())
                                             }
                                         };
@@ -1280,6 +1467,7 @@ pub async fn run_discovery(
                                             *global_active = global_active.saturating_sub(1);
                                         }
                                         
+                                        /* 
                                         println!("✅ Chunk Response erhalten von {} für hash {} (RequestId: {:?}, game_id: {})", 
                                             peer_id_str, chunk_hash, request_id, game_id);
                                         eprintln!("✅ Chunk Response erhalten von {} für hash {} (RequestId: {:?}, game_id: {})", 
@@ -1287,6 +1475,7 @@ pub async fn run_discovery(
                                         eprintln!("   → Chunk-Größe: {:.2} MB", chunk_size_mb);
                                         eprintln!("   → Download-Dauer: {:.2}s", download_duration.as_secs_f64());
                                         eprintln!("   → Geschwindigkeit: {:.2} MB/s", speed_mbps);
+                                        */
                                         
                                         // Sende Event mit chunk_hash (verwende getrackten Hash, nicht Response-Hash)
                                         // WICHTIG: Klone chunk_data VOR dem tokio::spawn, da response moved wird
@@ -1294,7 +1483,15 @@ pub async fn run_discovery(
                                         let event_tx_for_chunk = event_tx_clone.clone();
                                         let chunk_hash_clone = chunk_hash.clone();
                                         let peer_id_str_clone = peer_id_str.clone();
-                                        
+
+                                        // Peer hat erfolgreich geantwortet - entferne aus failed_peers
+                                        {
+                                            let mut failed = failed_peers_clone.lock().await;
+                                            if failed.remove(&peer_id_str).is_some() {
+                                                println!("✅ Peer {} wieder verfügbar (erfolgreiche Chunk-Response)", peer_id_str);
+                                            }
+                                        }
+
                                         // Sende Event synchron (nicht in separatem Task), um Race Conditions zu vermeiden
                                         // Das Event-Senden sollte schnell sein und blockiert nicht lange
                                         if let Err(e) = event_tx_for_chunk.send(DiscoveryEvent::ChunkReceived {
@@ -1303,9 +1500,10 @@ pub async fn run_discovery(
                                             chunk_data: chunk_data_clone,
                                         }).await {
                                             eprintln!("❌ Fehler beim Senden von ChunkReceived Event: {}", e);
-                                        } else {
+                                        } 
+                                        /* else {
                                             eprintln!("✅ ChunkReceived Event erfolgreich gesendet für hash: {}", chunk_hash);
-                                        }
+                                        } */
                                         
                                         // Verarbeite wartende Chunk-Requests aus der Warteschlange
                                         loop {
@@ -1376,10 +1574,12 @@ pub async fn run_discovery(
                                                     *global_active += 1;
                                                 }
                                                 
+                                                /*
                                                 println!("Chunk Request aus Warteschlange gesendet an {} für hash: {} (RequestId: {:?})", 
                                                     peer_id, chunk_hash, request_id);
                                                 eprintln!("Chunk Request aus Warteschlange gesendet an {} für hash: {} (RequestId: {:?})", 
                                                     peer_id, chunk_hash, request_id);
+                                                */
                                                 
                                                 // Sende Event, dass Chunk-Request erfolgreich gesendet wurde
                                                 if let Err(e) = event_tx.send(DiscoveryEvent::ChunkRequestSent {
@@ -1538,10 +1738,12 @@ pub async fn run_discovery(
                                             *global_active += 1;
                                         }
                                         
+                                        /*
                                         println!("Chunk Request aus Warteschlange gesendet an {} für hash: {} (RequestId: {:?})", 
                                             peer_id, chunk_hash, request_id);
                                         eprintln!("Chunk Request aus Warteschlange gesendet an {} für hash: {} (RequestId: {:?})", 
                                             peer_id, chunk_hash, request_id);
+                                        */
                                         
                                         // WICHTIG: Sende Event, dass Chunk-Request erfolgreich gesendet wurde
                                         // Dies ist kritisch, damit der Chunk in requested_chunks eingetragen wird
@@ -1565,13 +1767,17 @@ pub async fn run_discovery(
                         }
                     }
                     DiscoveryBehaviourEvent::Mdns(mdns_event) => {
+                        /*
                         println!("mDNS Event empfangen: {:?}", mdns_event);
                         eprintln!("mDNS Event empfangen: {:?}", mdns_event);
+                        */
                         match mdns_event {
                             MdnsEvent::Discovered(peers) => {
+                                /*
                                 println!("mDNS discovered {} peers", peers.len());
                                 eprintln!("mDNS discovered {} peers", peers.len());
-                        for (peer_id, addr) in peers {
+                                */
+                                for (peer_id, addr) in peers {
                             // Extract IP address from multiaddr
                             let ip: Option<IpAddr> = addr.iter()
                                 .find_map(|proto| {

@@ -144,7 +144,7 @@ impl GameInfo {
 struct FileChunkEntry {
     path: String,
     file_hash: String,      // Blake3 Hash der gesamten Datei
-    chunk_count: i64,       // Anzahl der 100MB Chunks (i64 für TOML)
+    chunk_count: i64,       // Anzahl der Chunks (Standard: 1MB) (i64 für TOML)
     file_size: i64,         // Dateigröße in Bytes (i64 für TOML)
 }
 
@@ -161,7 +161,7 @@ pub fn generate_chunks_toml<F>(game_path: &Path, progress_callback: Option<F>) -
 where
     F: Fn(usize, usize, &str),
 {
-    const CHUNK_SIZE: usize = 10 * 1024 * 1024; // 10MB (reduziert von 100MB)
+    const CHUNK_SIZE: usize = 1 * 1024 * 1024; // 1MB Chunk-Größe
     
     let chunks_toml_path = game_path.join("deckdrop_chunks.toml");
     let mut file_entries = Vec::new();

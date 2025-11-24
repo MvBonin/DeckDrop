@@ -23,7 +23,7 @@ pub use synch::{
     finalize_game_download, cancel_game_download,
     get_manifest_path, get_chunks_dir, find_game_id_for_chunk,
     check_and_validate_complete_files, check_and_validate_single_file, find_file_for_chunk,
-    load_active_downloads, get_active_downloads_cached_only,
+    load_active_downloads, get_active_downloads_cached_only, force_update_active_downloads,
     validate_chunk_size,
     preallocate_file, write_chunk_to_position, write_chunk_to_file, validate_complete_file,
     mark_chunk_downloaded_sqlite,

@@ -528,7 +528,7 @@ pub fn validate_chunk_size(
     
     // Berechne erwartete Chunk-Größe
     if let Some(file_size) = file_info.file_size {
-        const CHUNK_SIZE: u64 = 10 * 1024 * 1024; // 10MB (reduziert von 100MB)
+        const CHUNK_SIZE: u64 = 1 * 1024 * 1024; // 1MB Chunks wie gewünscht
         let total_chunks = file_info.chunk_hashes.len();
         let is_last_chunk = chunk_index == total_chunks - 1;
         
@@ -667,8 +667,8 @@ pub fn write_chunk_to_file(
     let chunk_size = if let Some(file_size) = file_info.file_size {
         let total_chunks = file_info.chunk_hashes.len();
         if total_chunks > 0 {
-            // Standard-Chunk-Größe: 10MB (reduziert von 100MB für bessere Parallelisierung)
-            const STANDARD_CHUNK_SIZE: u64 = 10 * 1024 * 1024; // 10MB
+            // Standard-Chunk-Größe: 1MB wie gewünscht
+            const STANDARD_CHUNK_SIZE: u64 = 1 * 1024 * 1024; // 1MB
             // Berechne Größe pro Chunk (aufrunden für letzte Chunk)
             let calculated_size = (file_size + total_chunks as u64 - 1) / total_chunks as u64;
             // Verwende berechnete Größe wenn kleiner als Standard (für kleine Dateien)
@@ -679,7 +679,7 @@ pub fn write_chunk_to_file(
                 STANDARD_CHUNK_SIZE
             }
         } else {
-            10 * 1024 * 1024 // Fallback: 10MB
+            1 * 1024 * 1024 // Fallback: 1MB
         }
     } else {
         10 * 1024 * 1024 // Fallback: 10MB
@@ -969,8 +969,9 @@ pub fn load_active_downloads() -> Vec<(String, DownloadManifest)> {
 
     {
         // Schnellpfad: Wenn die letzte Aktualisierung sehr frisch ist, gib eine Kopie zurück
+        // WICHTIG: Cache-Zeit auf 100ms reduziert für schnellere Reaktion im Scheduler!
         if let Ok(cache_guard) = cache.lock() {
-            if cache_guard.last_update.elapsed() < Duration::from_millis(800) {
+            if cache_guard.last_update.elapsed() < Duration::from_millis(100) {
                 return cache_guard.data.clone();
             }
         }
@@ -1019,6 +1020,18 @@ pub fn load_active_downloads() -> Vec<(String, DownloadManifest)> {
     }
     
     downloads
+}
+
+/// Erzwingt ein Neuladen der aktiven Downloads aus der DB und aktualisiert den Cache
+/// Ignoriert den Cache-Timeout.
+pub fn force_update_active_downloads() -> Vec<(String, DownloadManifest)> {
+    let cache = get_active_downloads_cache();
+    // Setze Zeitstempel zurück, um Neu-Laden zu erzwingen
+    if let Ok(mut cache_guard) = cache.lock() {
+        // Setze auf "vor 60 Sekunden"
+        cache_guard.last_update = Instant::now().checked_sub(Duration::from_secs(60)).unwrap_or(Instant::now());
+    }
+    load_active_downloads()
 }
 
 /// Findet die game_id für einen Chunk durch Suche in allen SQLite-Datenbanken
@@ -1289,8 +1302,8 @@ file_size = 150000000
         let game_path = temp_dir.path().join("game");
         fs::create_dir_all(&game_path).unwrap();
         
-        // Erstelle Test-Datei (reduziert auf 10MB für bessere Kompatibilität)
-        let mut test_data = vec![0u8; 10 * 1024 * 1024]; // 10MB
+        // Erstelle Test-Datei (2MB für 2 Chunks à 1MB)
+        let mut test_data = vec![0u8; 2 * 1024 * 1024]; // 2MB
         for i in 0..test_data.len() {
             // Fülle mit Mustern
             test_data[i] = (i % 256) as u8;
@@ -1328,9 +1341,9 @@ file_size = {}
         let file_path = game_path.join("test.bin");
         preallocate_file(&file_path, test_data.len() as u64).unwrap();
         
-        // Teile in Chunks (2 Chunks: 5MB + 5MB)
-        let chunk1 = &test_data[0..5 * 1024 * 1024];
-        let chunk2 = &test_data[5 * 1024 * 1024..];
+        // Teile in Chunks (2 Chunks: 1MB + 1MB)
+        let chunk1 = &test_data[0..1 * 1024 * 1024];
+        let chunk2 = &test_data[1 * 1024 * 1024..];
         
         // Schreibe Chunks direkt in Datei (Piece-by-Piece, in beliebiger Reihenfolge)
         write_chunk_to_file(&format!("{}:1", file_hash), chunk2, &manifest).unwrap(); // Zweiter Chunk zuerst
@@ -1352,14 +1365,20 @@ file_size = {}
         let temp_dir1 = TempDir::new().unwrap();
         let temp_dir2 = TempDir::new().unwrap();
         
-        let game_id = "test-game-2peers";
+        // Eindeutige game_id basierend auf Timestamp (verhindert Konflikte bei parallelen Tests)
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let unique_id = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let game_id = format!("test-game-2peers-{}", unique_id);
         
         // Peer 1: Hat das Spiel
         let game_path1 = temp_dir1.path().join("game");
         fs::create_dir_all(&game_path1).unwrap();
         
-        // Erstelle Test-Datei für Peer 1 (reduziert auf 10MB für bessere Kompatibilität)
-        let test_data = vec![42u8; 10 * 1024 * 1024]; // 10MB
+        // Erstelle Test-Datei für Peer 1 (2MB für 2 Chunks à 1MB)
+        let test_data = vec![42u8; 2 * 1024 * 1024]; // 2MB
         let test_file_path = game_path1.join("test.bin");
         fs::write(&test_file_path, &test_data).unwrap();
         
@@ -1386,7 +1405,7 @@ file_size = {}
         // Erstelle Manifest für Peer 2
         let deckdrop_toml = format!(
             r#"game_id = "{}"
-name = "Test Game"
+name = "Test Game 2Peers"
 version = "1.0"
 start_file = "test.bin"
 "#,
@@ -1404,20 +1423,20 @@ file_size = {}
         );
         
         // Starte Download für Peer 2 (pre-allokiert Dateien)
-        start_game_download(game_id, &deckdrop_toml, &deckdrop_chunks_toml).unwrap();
+        start_game_download(&game_id, &deckdrop_toml, &deckdrop_chunks_toml).unwrap();
         
         // Lade Manifest für write_chunk_to_file
-        let manifest_path = get_manifest_path(game_id).unwrap();
+        let manifest_path = get_manifest_path(&game_id).unwrap();
         let manifest = DownloadManifest::load(&manifest_path).unwrap();
         
         // Simuliere Chunk-Transfer von Peer 1 zu Peer 2 (Piece-by-Piece Writing)
-        // Chunk 1: 0-5MB
-        let chunk1 = &test_data[0..5 * 1024 * 1024];
+        // Chunk 1: 0-1MB
+        let chunk1 = &test_data[0..1 * 1024 * 1024];
         let chunk1_hash = format!("{}:0", computed_hash);
         write_chunk_to_file(&chunk1_hash, chunk1, &manifest).unwrap();
         
-        // Chunk 2: 5-10MB
-        let chunk2 = &test_data[5 * 1024 * 1024..];
+        // Chunk 2: 1-2MB
+        let chunk2 = &test_data[1 * 1024 * 1024..];
         let chunk2_hash = format!("{}:1", computed_hash);
         write_chunk_to_file(&chunk2_hash, chunk2, &manifest).unwrap();
         
@@ -1464,14 +1483,15 @@ file_size = {}
         
         // Aufräumen: Lösche Test-Spiel (Manifest, Chunks-Verzeichnis und Spielverzeichnis)
         // 1. Manifest/chunks über cancel_game_download
-        let _ = cancel_game_download(game_id);
+        let _ = cancel_game_download(&game_id);
         
         // 2. Spielverzeichnis unter download_path entfernen (wurde in prepare_download_with_progress angelegt)
-        let manifest_for_cleanup = DownloadManifest::load(&manifest_path).unwrap();
-        let game_dir = PathBuf::from(&manifest_for_cleanup.game_path);
-        if game_dir.exists() {
-            if let Err(e) = fs::remove_dir_all(&game_dir) {
-                eprintln!("Warnung: Konnte Test-Spielverzeichnis nicht löschen ({}): {}", game_dir.display(), e);
+        if let Ok(manifest_for_cleanup) = DownloadManifest::load(&manifest_path) {
+            let game_dir = PathBuf::from(&manifest_for_cleanup.game_path);
+            if game_dir.exists() {
+                if let Err(e) = fs::remove_dir_all(&game_dir) {
+                    eprintln!("Warnung: Konnte Test-Spielverzeichnis nicht löschen ({}): {}", game_dir.display(), e);
+                }
             }
         }
         
@@ -1480,10 +1500,10 @@ file_size = {}
     
     #[test]
     fn test_validate_chunk_size() {
-        // Verwende eine kleine Test-Datei (20MB für 2 Chunks à 10MB)
-        // Die validate_chunk_size Funktion verwendet eine fest codierte CHUNK_SIZE von 10MB
-        const CHUNK_SIZE: usize = 10 * 1024 * 1024; // 10MB
-        let file_size = 20 * 1024 * 1024; // 20MB
+        // Verwende eine kleine Test-Datei (2MB für 2 Chunks à 1MB)
+        // Die validate_chunk_size Funktion verwendet eine fest codierte CHUNK_SIZE von 1MB
+        const CHUNK_SIZE: usize = 1 * 1024 * 1024; // 1MB
+        let file_size = 2 * 1024 * 1024; // 2MB
         
         // Erstelle Manifest ohne tatsächliche Datei (nur für Validierung)
         let file_hash = "test_file_hash_1234567890abcdef";
@@ -1510,12 +1530,12 @@ file_size = {}
         assert!(validate_chunk_size(&chunk0_hash, &chunk0_data, &manifest).is_ok());
         
         // Test 2: Falsche Chunk-Größe (zu klein)
-        let chunk0_small = vec![1u8; 1 * 1024 * 1024]; // 1MB statt 10MB
+        let chunk0_small = vec![1u8; 100 * 1024]; // 100KB statt 1MB
         assert!(validate_chunk_size(&chunk0_hash, &chunk0_small, &manifest).is_err());
         
-        // Test 3: Letzter Chunk kann kleiner sein (10MB für letzten Chunk)
+        // Test 3: Letzter Chunk kann kleiner sein (1MB für letzten Chunk)
         let chunk1_hash = format!("{}:1", file_hash);
-        let chunk1_data = vec![1u8; CHUNK_SIZE]; // 10MB für letzten Chunk
+        let chunk1_data = vec![1u8; CHUNK_SIZE]; // 1MB für letzten Chunk
         assert!(validate_chunk_size(&chunk1_hash, &chunk1_data, &manifest).is_ok());
         
         // Test 4: Ungültiges Chunk-Hash-Format
