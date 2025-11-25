@@ -205,8 +205,19 @@ impl FileTreeNode {
         content = content.push(row_content);
 
         // Kinder rendern (wenn Ordner und ausgeklappt)
+        // WICHTIG: Blende fertige Dateien aus (is_complete=true)
         if is_dir && expanded {
+            let mut visible_children = Vec::new();
             for child in children {
+                // Überspringe fertige Dateien (nicht Ordner)
+                if !child.is_dir && child.is_complete {
+                    continue;
+                }
+                visible_children.push(child);
+            }
+            
+            // Rendere nur sichtbare Kinder
+            for child in visible_children {
                 content = content.push(child.view(indent + scale(20.0)));
             }
         }

@@ -280,6 +280,41 @@ impl NetworkBridge {
                     // Cleanup: Hier könnte später ein Cleanup für failed peers hinzugefügt werden
                     // (aber failed peers werden im Network-Layer verwaltet)
 
+                // WICHTIG: Cache-Cleanup ZUERST, bevor wir prüfen ob der Cache voll ist!
+                // ROBUSTE LÖSUNG: Einfache und zuverlässige Cleanup-Logik
+                // Wir entfernen Chunks, die:
+                // 1. Zu alt sind (Timeout, älter als 30 Sekunden) - definitiv hängende Requests
+                // 2. Nicht mehr in requested_chunks sind UND mindestens 2 Sekunden alt - fertig (mit kleinem Puffer für Race Conditions)
+                // Der 2-Sekunden-Puffer ist ausreichend für Event-Verarbeitung, aber kurz genug, um fertige Chunks schnell zu entfernen
+                if let Some(requested_global) = get_requested_chunks_global() {
+                    if let Ok(requested) = requested_global.lock() {
+                        // Entferne Chunks, die:
+                        // - Zu alt sind (Timeout, > 30 Sekunden) ODER
+                        // - Nicht mehr in requested_chunks sind UND mindestens 2 Sekunden alt (fertig, mit kleinem Puffer)
+                        requested_chunks_cache.retain(|hash, time| {
+                            let age = time.elapsed();
+                            let is_timeout = age >= Duration::from_secs(30);
+                            let still_requested = requested.contains(hash);
+                            let is_old_enough = age >= Duration::from_secs(2);
+                            
+                            // Behalte Chunk nur wenn:
+                            // - Nicht zu alt (Timeout) UND
+                            // - (Noch angefordert ODER sehr neu < 2 Sekunden)
+                            !is_timeout && (still_requested || !is_old_enough)
+                        });
+                    } else {
+                        // Fallback: Nur Timeouts entfernen, wenn Lock fehlschlägt
+                        requested_chunks_cache.retain(|_hash, time| {
+                            time.elapsed() < Duration::from_secs(30)
+                        });
+                    }
+                } else {
+                    // Fallback: Nur Timeouts entfernen, wenn requested_chunks nicht verfügbar ist
+                    requested_chunks_cache.retain(|_hash, time| {
+                        time.elapsed() < Duration::from_secs(30)
+                    });
+                }
+
                 // Lade aktive Downloads (mit eigener Cache-Schicht im Core)
                 let active_downloads = load_active_downloads();
 
@@ -293,7 +328,7 @@ impl NetworkBridge {
                 const GLOBAL_MAX_REQUESTS: usize = 80;
                 let current_active_requests = requested_chunks_cache.len();
                 if current_active_requests >= GLOBAL_MAX_REQUESTS {
-                    // Warte, bis Requests abgearbeitet sind
+                    // Warte, bis Requests abgearbeitet sind (aber Cache wurde bereits aufgeräumt!)
                     continue;
                 }
                 let available_slots = GLOBAL_MAX_REQUESTS - current_active_requests;
@@ -374,37 +409,6 @@ impl NetworkBridge {
                 if current_active_requests < 10 || needs_refill {
                    eprintln!("SCHEDULER: Missing={} Cached={} Slots={} Refill={}", 
                        all_currently_missing.len(), requested_chunks_cache.len(), available_slots, needs_refill);
-                }
-                
-                // WICHTIG: Aufräumen des Caches basierend auf Timeout UND Synchronisation mit requested_chunks
-                // Wir entfernen Chunks, die:
-                // 1. Zu alt sind (Timeout, älter als 30 Sekunden)
-                // 2. Nicht mehr in requested_chunks sind (fertig heruntergeladen)
-                // Das stellt sicher, dass der Cache synchronisiert bleibt und neue Requests gesendet werden können
-                let cache_size_before = requested_chunks_cache.len();
-                
-                // Synchronisiere mit requested_chunks (wenn verfügbar)
-                if let Some(requested_global) = get_requested_chunks_global() {
-                    if let Ok(requested) = requested_global.lock() {
-                        // Entferne Chunks, die nicht mehr in requested_chunks sind (fertig) ODER zu alt sind
-                        requested_chunks_cache.retain(|hash, time| {
-                            let still_requested = requested.contains(hash);
-                            let not_timeout = time.elapsed() < Duration::from_secs(30);
-                            still_requested && not_timeout
-                        });
-                    }
-                } else {
-                    // Fallback: Nur Timeouts entfernen, wenn requested_chunks nicht verfügbar ist
-                    requested_chunks_cache.retain(|_hash, time| {
-                        time.elapsed() < Duration::from_secs(30)
-                    });
-                }
-                let cache_size_after = requested_chunks_cache.len();
-                
-                // Logge nur bei signifikanten Änderungen (weniger Spam)
-                if cache_size_before != cache_size_after && (cache_size_before - cache_size_after) >= 5 {
-                    eprintln!("🧹 Cache aufgeräumt: {} → {} Chunks ({} entfernt)", 
-                        cache_size_before, cache_size_after, cache_size_before - cache_size_after);
                 }
 
                 if let Some(map) = SCHEDULER_DOWNLOADS.get() {
