@@ -3,6 +3,7 @@
 mod app;
 mod network_bridge;
 mod window_control;
+mod file_tree;
 
 use app::{DeckDropApp, Message};
 use iced::application;

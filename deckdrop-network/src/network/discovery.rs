@@ -1428,7 +1428,7 @@ pub async fn run_discovery(
                                                     return;
                                                 }
                                             };
-
+                                            
                                             let response_msg = if let Some((chunk_data, chunk_size)) = result {
                                                 // Sende Upload-Event
                                                 if let Err(e) = event_tx.send(DiscoveryEvent::ChunkUploaded {
@@ -1535,7 +1535,7 @@ pub async fn run_discovery(
                                             // Behandlung für nicht gefundenen Chunk (Retry Logik in UI)
                                             continue;
                                         }
-
+                                        
                                         // Sende Event mit chunk_hash (verwende getrackten Hash, nicht Response-Hash)
                                         // WICHTIG: Klone chunk_data VOR dem tokio::spawn, da response moved wird
                                         let chunk_data_clone = response.chunk_data.clone();

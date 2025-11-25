@@ -287,29 +287,22 @@ impl ManifestDB {
         for file_row in files_iter {
             let (file_id, file_path, file_size, status_str) = file_row?;
             
-            // Lade Chunks für diese Datei
-            let mut chunks_stmt = conn.prepare(
-                "SELECT chunk_hash, chunk_index, is_downloaded FROM chunks WHERE file_id = ?1 ORDER BY chunk_index"
+            // OPTIMIERUNG: Lade NICHT alle Chunks in den RAM!
+            // Wir laden nur die Zähler (Count). Die eigentlichen Chunk-Listen werden nur on-demand benötigt (Streaming).
+            
+            // Zähle heruntergeladene Chunks
+            let downloaded_chunks_count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM chunks WHERE file_id = ?1 AND is_downloaded = 1",
+                params![file_id],
+                |row| row.get(0)
             )?;
             
-            let mut chunk_hashes = Vec::new();
-            let mut downloaded_chunks_list = Vec::new();
-            
-            let chunks_iter = chunks_stmt.query_map(params![file_id], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,  // chunk_hash
-                    row.get::<_, i64>(1)?,  // chunk_index
-                    row.get::<_, i64>(2)?,  // is_downloaded
-                ))
-            })?;
-            
-            for chunk_row in chunks_iter {
-                let (chunk_hash, _, is_downloaded) = chunk_row?;
-                chunk_hashes.push(chunk_hash.clone());
-                if is_downloaded == 1 {
-                    downloaded_chunks_list.push(chunk_hash);
-                }
-            }
+            // Zähle alle Chunks
+            let total_chunks_count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM chunks WHERE file_id = ?1",
+                params![file_id],
+                |row| row.get(0)
+            )?;
             
             let file_status = match status_str.as_str() {
                 "Pending" => DownloadStatus::Pending,
@@ -319,10 +312,12 @@ impl ManifestDB {
             };
             
             chunks.insert(file_path, FileChunkInfo {
-                chunk_hashes,
+                chunk_hashes: Vec::new(), // Leer lassen um RAM zu sparen (Lazy Loading)
                 status: file_status,
-                downloaded_chunks: downloaded_chunks_list,
+                downloaded_chunks: Vec::new(), // Leer lassen
                 file_size: file_size.map(|s| s as u64),
+                total_chunks: total_chunks_count as usize,
+                downloaded_chunks_count: downloaded_chunks_count as usize,
             });
         }
         
@@ -450,42 +445,8 @@ impl ManifestDB {
         
         tx.commit()?;
         
-        // Validiere Dateien, die gerade als Complete markiert wurden (außerhalb der Transaktion)
-        // Hole alle Dateien, die als Complete markiert wurden
-        let conn = self.conn.lock().unwrap();
-        let files_to_validate: Vec<(i64, String, String)> = conn.prepare(
-            "SELECT f.id, f.file_path, d.game_path FROM files f 
-             JOIN downloads d ON f.game_id = d.game_id 
-             WHERE f.game_id = ?1 AND f.status = 'Complete'"
-        )?
-        .query_map(params![game_id], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
-        
-        drop(conn);
-        
-        // Validiere jede Datei
-        for (file_id, file_path, _game_path) in files_to_validate {
-            if let Ok(manifest_path) = crate::synch::get_manifest_path(game_id) {
-                if let Ok(manifest) = crate::synch::DownloadManifest::load(&manifest_path) {
-                    if let Err(e) = crate::synch::check_and_validate_single_file(game_id, &manifest, &file_path) {
-                        eprintln!("⚠️ Validierung fehlgeschlagen für {}: {} - Status wird auf Downloading zurückgesetzt", file_path, e);
-                        // Setze Status zurück auf Downloading
-                        let conn = self.conn.lock().unwrap();
-                        conn.execute(
-                            "UPDATE files SET status = 'Downloading' WHERE id = ?1",
-                            params![file_id],
-                        )?;
-                        // Setze auch overall_status zurück
-                        conn.execute(
-                            "UPDATE downloads SET overall_status = 'Downloading' WHERE game_id = ?1",
-                            params![game_id],
-                        )?;
-                    }
-                }
-            }
-        }
+        // TODO: Datei-Validierung. Aktuell machen wir das im UI Worker Thread
+        // um den Lock nicht zu lange zu halten.
         
         Ok(())
     }
@@ -622,6 +583,24 @@ impl ManifestDB {
         let conn = self.conn.lock().unwrap();
         conn.execute("DELETE FROM downloads WHERE game_id = ?1", params![game_id])?;
         Ok(())
+    }
+
+    /// Prüft ob ein Chunk in dieser DB existiert (egal ob downloaded oder nicht)
+    pub fn has_chunk(&self, game_id: &str, chunk_hash: &str) -> SqliteResult<bool> {
+        let conn = self.conn.lock().unwrap();
+        
+        // Wir müssen prüfen ob der Chunk in irgendeiner Datei dieses Spiels vorkommt
+        let exists: bool = conn.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM chunks c 
+                JOIN files f ON c.file_id = f.id 
+                WHERE f.game_id = ?1 AND c.chunk_hash = ?2
+            )",
+            params![game_id, chunk_hash],
+            |row| row.get(0)
+        )?;
+        
+        Ok(exists)
     }
     
     /// Migriert von JSON zu SQLite

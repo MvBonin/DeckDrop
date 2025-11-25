@@ -273,6 +273,17 @@ impl NetworkBridge {
                 let config = Config::load();
                 let max_chunks_per_peer = config.max_concurrent_chunks.max(1);
                 
+                // Globales Limit für gleichzeitige Requests (Backpressure-Schutz)
+                // Der Disk-Writer Puffer ist 100. Wir sollten niemals mehr als ~80 Requests gleichzeitig offen haben.
+                // Sonst laufen wir Gefahr, dass der Puffer voll läuft und Chunks verworfen werden (Liveloop).
+                const GLOBAL_MAX_REQUESTS: usize = 80;
+                let current_active_requests = requested_chunks_cache.len();
+                if current_active_requests >= GLOBAL_MAX_REQUESTS {
+                    // Warte, bis Requests abgearbeitet sind
+                    continue;
+                }
+                let available_slots = GLOBAL_MAX_REQUESTS - current_active_requests;
+
                 // Sammle alle aktuell fehlenden Chunks aller aktiven Downloads (memory-effizient)
                 let mut all_currently_missing = HashSet::new();
                 for (game_id, manifest) in &active_downloads {
@@ -387,8 +398,8 @@ impl NetworkBridge {
                                     continue;
                                 }
                                 
-                                // Limit berechnen
-                                let total_max_chunks = max_chunks_per_peer * peers.len().max(1);
+                                // Limit berechnen (Peer-Limit UND Globales Limit beachten)
+                                let total_max_chunks = (max_chunks_per_peer * peers.len().max(1)).min(available_slots);
                                 
                                 // Wähle die nächsten N Chunks
                                 let chunks_to_request: Vec<String> = candidates.iter()

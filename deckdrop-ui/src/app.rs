@@ -6,6 +6,7 @@ use iced::{
 };
 use toml;
 use deckdrop_core::{Config, GameInfo, DownloadManifest, network_cache};
+use crate::file_tree::FileTreeNode;
 use deckdrop_network::network::discovery::DiscoveryEvent;
 use deckdrop_network::network::games::NetworkGameInfo;
 use deckdrop_network::network::peer::PeerInfo;
@@ -20,12 +21,12 @@ use tokio::sync::mpsc;
 const UI_SCALE: f32 = 0.75;
 
 /// Scale a size value based on UI_SCALE
-fn scale(size: f32) -> f32 {
+pub fn scale(size: f32) -> f32 {
     size * UI_SCALE
 }
 
 /// Scale a size value for text (slightly different scaling)
-fn scale_text(size: f32) -> f32 {
+pub fn scale_text(size: f32) -> f32 {
     (size * UI_SCALE).max(10.0) // Minimum 10px for readability
 }
 
@@ -417,6 +418,8 @@ impl Default for DeckDropApp {
 
         // Erstelle Worker Channel (Bounded für Backpressure)
         // Verwende async_channel für MPMC (Multi-Producer Multi-Consumer)
+        // Verwende Puffergröße 100 (ca. 100MB bei 1MB Chunks). 
+        // Das verhindert UI-Blockaden, minimiert aber den "Nachlauf-Effekt", wenn der Peer weg ist.
         let (chunk_writer_tx, chunk_writer_rx) = async_channel::bounded(100);
         
         // Starte Worker Threads (Parallel Writing)
@@ -735,6 +738,8 @@ impl DeckDropApp {
 
         // Erstelle Worker Channel (Bounded für Backpressure)
         // Verwende async_channel für MPMC (Multi-Producer Multi-Consumer)
+        // Verwende Puffergröße 100 (ca. 100MB bei 1MB Chunks). 
+        // Das verhindert UI-Blockaden, minimiert aber den "Nachlauf-Effekt", wenn der Peer weg ist.
         let (chunk_writer_tx, chunk_writer_rx) = async_channel::bounded(100);
         
         // Starte Worker Threads (Parallel Writing)
@@ -2317,18 +2322,11 @@ impl DeckDropApp {
                     starting.remove(&game_id);
                 }
                 
-                // Parse deckdrop_chunks.toml um die Anzahl der Dateien zu bestimmen
-                #[derive(serde::Deserialize)]
-                struct ChunksToml {
-                    file: Vec<serde_json::Value>,
-                }
-                let total_files = toml::from_str::<ChunksToml>(&deckdrop_chunks_toml)
-                    .map(|ct| ct.file.len())
-                    .unwrap_or(0);
-                
                 // Setze initialen Progress (thread-safe)
+                // Wir kennen die genaue Anzahl der Dateien noch nicht (TOML parsing ist teuer), 
+                // setzen daher vorläufig auf 1, bis das Parsing im Thread fertig ist.
                 if let Ok(mut preparing) = self.preparing_downloads.lock() {
-                    preparing.insert(game_id.clone(), (0, total_files));
+                    preparing.insert(game_id.clone(), (0, 1));
                 }
                 
                 // Starte Pre-Allocation in einem separaten Thread
@@ -2340,6 +2338,24 @@ impl DeckDropApp {
                 if let Some(tx) = crate::get_download_prep_tx() {
                     eprintln!("GameMetadataReceived: Starte Pre-Allocation für {}", game_id);
                     std::thread::spawn(move || {
+                        // Parse deckdrop_chunks.toml HIER im Thread, nicht im UI-Thread
+                        #[derive(serde::Deserialize)]
+                        struct ChunksToml {
+                            file: Vec<serde_json::Value>,
+                        }
+                        let total_files = toml::from_str::<ChunksToml>(&deckdrop_chunks_toml_clone)
+                            .map(|ct| ct.file.len())
+                            .unwrap_or(0);
+                            
+                        // Sende erstes Update mit korrekter Gesamtanzahl
+                        if let Err(e) = tx.send(Message::UpdateDownloadPreparationProgress(
+                            game_id_clone.clone(),
+                            0,
+                            total_files,
+                        )) {
+                            eprintln!("Fehler beim Senden von Initial-Progress-Update: {}", e);
+                        }
+
                         let mut last_sent_progress = 0;
                         eprintln!("Pre-Allocation Thread gestartet für {}", game_id_clone);
                         // Führe Pre-Allocation durch
@@ -2530,8 +2546,14 @@ impl DeckDropApp {
                     peer_id: peer_id.clone(),
                 };
                 
-                if let Err(e) = self.chunk_writer_tx.send_blocking(task) {
-                    eprintln!("KRITISCH: Konnte Chunk-Task nicht an Worker senden: {}", e);
+                // Verwende try_send statt send_blocking, um den UI-Thread nicht zu blockieren
+                if let Err(e) = self.chunk_writer_tx.try_send(task) {
+                    if e.is_full() {
+                        eprintln!("WARNUNG: ChunkWriter Queue ist voll - Chunk {} wird später erneut versucht", chunk_hash);
+                    } else {
+                        eprintln!("KRITISCH: Konnte Chunk-Task nicht an Worker senden: {}", e);
+                    }
+                    
                     // Cleanup processing_chunks falls Senden fehlschlägt
                     if let Ok(mut processing) = self.processing_chunks.lock() {
                         processing.remove(&chunk_hash);
@@ -4891,127 +4913,22 @@ impl DeckDropApp {
                                         text(format!("Size: {} / {}", downloaded_size_str, total_size_str)).size(scale_text(13.0)),
                                         Space::with_height(Length::Fixed(scale(4.0))),
                                         text(format!("Chunks: {}/{} | Done: {}", ds.manifest.progress.downloaded_chunks, ds.manifest.progress.total_chunks, ds.manifest.progress.downloaded_chunks)).size(scale_text(13.0)),
-                                        // Einzelne Chunk-Progress-Balken
-                                        if !downloading_chunks.is_empty() {
+                                        
+                                        // Info über aktive Transfers (unter der Dateiliste)
+                                        if !downloading_chunks.is_empty() || !writing_chunks_list.is_empty() {
                                             column![
                                                 Space::with_height(Length::Fixed(scale(16.0))),
-                                                text("Downloading Chunks").size(scale_text(13.0))
+                                                text(format!("Active Transfers: {} downloading, {} writing", downloading_chunks.len(), writing_chunks_list.len()))
+                                                    .size(scale_text(12.0))
                                                     .style(|_theme: &Theme| {
                                                         iced::widget::text::Style {
                                                             color: Some(Color::from_rgba(0.6, 0.6, 0.6, 1.0)),
                                                         }
                                                     }),
-                                                Space::with_height(Length::Fixed(scale(8.0))),
-                                                // Zeige Chunks mit Progress-Balken
-                                                {
-                                                    let mut chunk_column = column![].spacing(scale(8.0)).width(Length::Fill);
-                                                    for (chunk_hash, progress) in &downloading_chunks {
-                                                        // Zeige immer den Chunk-Index (z.B. :1) auch bei abgekürztem Hash
-                                                        let (hash_part, index_suffix) = match chunk_hash.rsplit_once(':') {
-                                                            Some((h, idx)) => (h, Some(idx)),
-                                                            None => (chunk_hash.as_str(), None),
-                                                        };
-                                                        let base_short = if hash_part.len() > 16 {
-                                                            format!("{}...", &hash_part[..16])
-                                                        } else {
-                                                            hash_part.to_string()
-                                                        };
-                                                        let chunk_short = if let Some(idx) = index_suffix {
-                                                            format!("{}:{}", base_short, idx)
-                                                        } else {
-                                                            base_short
-                                                        };
-                                                        let progress_text = format!("{:.1}%", progress);
-                                                        chunk_column = chunk_column.push(
-                                                            column![
-                                                                row![
-                                                                    text(chunk_short).size(scale_text(11.0))
-                                                                        .width(Length::Fill),
-                                                                    text(progress_text).size(scale_text(11.0))
-                                                                        .style(|_theme: &Theme| {
-                                                                            iced::widget::text::Style {
-                                                                                color: Some(Color::from_rgba(0.7, 0.9, 1.0, 1.0)),
-                                                                            }
-                                                                        }),
-                                                                ]
-                                                                .width(Length::Fill)
-                                                                .spacing(scale(8.0)),
-                                                                Space::with_height(Length::Fixed(scale(4.0))),
-                                                                progress_bar(0.0..=100.0, *progress as f32)
-                                                                    .width(Length::Fill)
-                                                                    .height(Length::Fixed(scale(12.0))),
-                                                            ]
-                                                            .spacing(scale(2.0))
-                                                            .width(Length::Fill)
-                                                        );
-                                                    }
-                                                    chunk_column
-                                                },
                                             ]
-                                            .width(Length::Fill)
                                         } else {
                                             column![]
-                                        },
-                                        // Chunks die gerade geschrieben werden
-                                        if !writing_chunks_list.is_empty() {
-                                            column![
-                                                Space::with_height(Length::Fixed(scale(16.0))),
-                                                text("Wird geschrieben").size(scale_text(13.0))
-                                                    .style(|_theme: &Theme| {
-                                                        iced::widget::text::Style {
-                                                            color: Some(Color::from_rgba(0.6, 0.6, 0.6, 1.0)),
-                                                        }
-                                                    }),
-                                                Space::with_height(Length::Fixed(scale(8.0))),
-                                                // Zeige Chunks mit Status "Wird geschrieben" und 100% Progress
-                                                {
-                                                    let mut chunk_column = column![].spacing(scale(8.0)).width(Length::Fill);
-                                                    for chunk_hash in &writing_chunks_list {
-                                                        // Zeige auch hier immer den Chunk-Index (z.B. :1) bei abgekürztem Hash
-                                                        let (hash_part, index_suffix) = match chunk_hash.rsplit_once(':') {
-                                                            Some((h, idx)) => (h, Some(idx)),
-                                                            None => (chunk_hash.as_str(), None),
-                                                        };
-                                                        let base_short = if hash_part.len() > 16 {
-                                                            format!("{}...", &hash_part[..16])
-                                                        } else {
-                                                            hash_part.to_string()
-                                                        };
-                                                        let chunk_short = if let Some(idx) = index_suffix {
-                                                            format!("{}:{}", base_short, idx)
-                                                        } else {
-                                                            base_short
-                                                        };
-                                                        chunk_column = chunk_column.push(
-                                                            column![
-                                                                row![
-                                                                    text(chunk_short).size(scale_text(11.0))
-                                                                        .width(Length::Fill),
-                                                                    text("Wird geschrieben...").size(scale_text(11.0))
-                                                                        .style(|_theme: &Theme| {
-                                                                            iced::widget::text::Style {
-                                                                                color: Some(Color::from_rgba(1.0, 0.8, 0.0, 1.0)),
-                                                                            }
-                                                                        }),
-                                                                ]
-                                                                .width(Length::Fill)
-                                                                .spacing(scale(8.0)),
-                                                                Space::with_height(Length::Fixed(scale(4.0))),
-                                                                progress_bar(0.0..=100.0, 100.0)
-                                                                    .width(Length::Fill)
-                                                                    .height(Length::Fixed(scale(12.0))),
-                                                            ]
-                                                            .spacing(scale(2.0))
-                                                            .width(Length::Fill)
-                                                        );
-                                                    }
-                                                    chunk_column
-                                                },
-                                            ]
-                                            .width(Length::Fill)
-                                        } else {
-                                            column![]
-                                        },
+                                        }
                                     ]
                                     .width(Length::Fill)
                                 } else {
@@ -5038,6 +4955,36 @@ impl DeckDropApp {
                             .width(Length::Fill),
                         ]
                         .width(Length::Fill),
+                        // File Tree (Full Width)
+                        if let Some(ds) = download_state {
+                            column![
+                                Space::with_height(Length::Fixed(scale(30.0))),
+                                text("Files").size(scale_text(20.0))
+                                    .style(|_theme: &Theme| {
+                                        iced::widget::text::Style {
+                                            color: Some(Color::from_rgba(0.9, 0.9, 0.9, 1.0)),
+                                        }
+                                    }),
+                                Space::with_height(Length::Fixed(scale(16.0))),
+                                container(
+                                    scrollable(
+                                        {
+                                            // Erstelle TreeView on-the-fly
+                                            let tree = FileTreeNode::from_manifest(&ds.manifest);
+                                            tree.view(0.0)
+                                        }
+                                    )
+                                    .height(Length::Fixed(scale(400.0))) // Mehr Platz für Full Width
+                                )
+                                .style(container_box_style)
+                                .padding(scale(8.0))
+                                .width(Length::Fill),
+                            ]
+                            .width(Length::Fill)
+                        } else {
+                            column![]
+                        },
+
                         // Description and Instructions - full width (editierbar im Bearbeitungsmodus)
                         if self.editing_game || game_info.description.is_some() || game_info.additional_instructions.is_some() {
                             column![
@@ -5276,10 +5223,13 @@ fn run_chunk_writer(
                                         let _ = deckdrop_core::force_update_active_downloads();
                                         
                                         // Check Single File Integrity (Sequentiell im Worker)
-                                        if let Ok(manifest_reloaded) = deckdrop_core::DownloadManifest::load(&manifest_path) {
-                                             if let Some(file_path) = deckdrop_core::find_file_for_chunk(&manifest_reloaded, &chunk_hash) {
-                                                 let _ = deckdrop_core::check_and_validate_single_file(&game_id, &manifest_reloaded, &file_path);
-                                             }
+                                        // OPTIMIERUNG: Verwende DB-Query statt Manifest-Reload um Datei zu finden
+                                        if let Ok(Some(file_path)) = deckdrop_core::find_file_for_chunk_db(&game_id, &chunk_hash) {
+                                            // Lade Manifest nur wenn wir eine Datei gefunden haben, die potentiell fertig ist
+                                            // Das Manifest ist jetzt "Light" (ohne Chunks), daher ist das Laden schnell.
+                                            if let Ok(manifest_reloaded) = deckdrop_core::DownloadManifest::load(&manifest_path) {
+                                                let _ = deckdrop_core::check_and_validate_single_file(&game_id, &manifest_reloaded, &file_path);
+                                            }
                                         }
                                     }
                                     Err(e) => {
