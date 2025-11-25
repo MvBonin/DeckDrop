@@ -28,6 +28,20 @@ static METADATA_UPDATE_TX: std::sync::OnceLock<tokio::sync::mpsc::UnboundedSende
 /// Dieser Zustand wird vom UI (bei Download-Start/Resume) gesetzt und vom Scheduler-Thread gelesen.
 static SCHEDULER_DOWNLOADS: std::sync::OnceLock<Arc<Mutex<HashMap<String, Vec<String>>>>> = std::sync::OnceLock::new();
 
+/// Globale Set von requested_chunks (für Synchronisation mit Scheduler-Cache)
+/// Wird vom UI-Thread aktualisiert und vom Scheduler-Thread gelesen.
+static REQUESTED_CHUNKS_GLOBAL: std::sync::OnceLock<Arc<Mutex<std::collections::HashSet<String>>>> = std::sync::OnceLock::new();
+
+/// Setzt die globale requested_chunks Set (wird vom UI-Thread aufgerufen)
+pub fn set_requested_chunks_global(requested: Arc<Mutex<std::collections::HashSet<String>>>) {
+    let _ = REQUESTED_CHUNKS_GLOBAL.set(requested);
+}
+
+/// Gibt die globale requested_chunks Set zurück
+pub fn get_requested_chunks_global() -> Option<Arc<Mutex<std::collections::HashSet<String>>>> {
+    REQUESTED_CHUNKS_GLOBAL.get().cloned()
+}
+
 /// Setzt den globalen Network Event Receiver
 pub fn set_network_event_rx(rx: Arc<std::sync::Mutex<mpsc::Receiver<DiscoveryEvent>>>) {
     let _ = NETWORK_EVENT_RX.set(rx);
@@ -285,52 +299,106 @@ impl NetworkBridge {
                 let available_slots = GLOBAL_MAX_REQUESTS - current_active_requests;
 
                 // Sammle alle aktuell fehlenden Chunks aller aktiven Downloads (memory-effizient)
+                // WICHTIG: Kontinuierliches Nachladen - wenn wir unter ein Limit kommen, laden wir nach
+                // Das stellt sicher, dass der Download nicht stoppt, wenn die initialen Kandidaten verarbeitet sind.
+                const CANDIDATE_LIMIT: usize = 200; // Max Kandidaten die wir insgesamt haben wollen
+                const REFILL_THRESHOLD: usize = 50; // Wenn wir unter 50 kommen, füllen wir auf
+                const REFILL_AMOUNT: usize = 100; // Wie viele neue Kandidaten wir nachladen
+                
+                // Prüfe ob wir nachladen müssen (wenn Cache zu klein wird)
+                let needs_refill = current_active_requests < REFILL_THRESHOLD;
+                
+                // Lade fehlende Chunks (kontinuierlich, wenn nötig)
                 let mut all_currently_missing = HashSet::new();
-                for (game_id, manifest) in &active_downloads {
+                let mut candidates_count = 0;
+                
+                // Wenn wir nachladen müssen, laden wir mehr. Sonst nur so viele, wie wir brauchen.
+                let target_limit = if needs_refill { CANDIDATE_LIMIT } else { current_active_requests.max(20) };
+                
+                'outer: for (game_id, manifest) in &active_downloads {
                     if matches!(manifest.overall_status, DownloadStatus::Downloading | DownloadStatus::Pending) {
                         // Verwende SQLite-Datenbank direkt für memory-effizienten Zugriff
-                        // WICHTIG: Verwende get_manifest_db für Connection-Pooling
                         if let Ok(db_arc) = deckdrop_core::manifest_db::get_manifest_db(game_id) {
                             for batch_result in db_arc.stream_missing_chunks(game_id, 100) {
                                 if let Ok(batch) = batch_result {
                                     for chunk_hash in batch {
+                                        // Überspringe Chunks, die bereits im Cache sind (wenn wir nicht nachfüllen)
+                                        if !needs_refill && requested_chunks_cache.contains_key(&chunk_hash) {
+                                            continue;
+                                        }
                                         all_currently_missing.insert(chunk_hash);
+                                        candidates_count += 1;
+                                        if candidates_count >= target_limit {
+                                            break 'outer;
+                                        }
                                     }
+                                } else {
+                                    break; // Fehler beim Streamen
                                 }
                             }
                         } else if let Ok(manifest_path) = deckdrop_core::synch::get_manifest_path(game_id) {
                             if let Ok(db) = deckdrop_core::manifest_db::ManifestDB::open(&manifest_path) {
-                                // Lade Chunks in kleinen Batches (max 100 pro Batch)
                                 for batch_result in db.stream_missing_chunks(game_id, 100) {
                                     if let Ok(batch) = batch_result {
                                         for chunk_hash in batch {
+                                            if !needs_refill && requested_chunks_cache.contains_key(&chunk_hash) {
+                                                continue;
+                                            }
                                             all_currently_missing.insert(chunk_hash);
+                                            candidates_count += 1;
+                                            if candidates_count >= target_limit {
+                                                break 'outer;
+                                            }
                                         }
-                                    }
+                                    } else { break; }
                                 }
                             } else {
-                                // Fallback: Verwende in-memory Manifest (für bestehende Downloads)
+                                // Fallback: Verwende in-memory Manifest
                                 let missing = manifest.get_missing_chunks();
                                 for m in missing {
+                                    if !needs_refill && requested_chunks_cache.contains_key(&m) {
+                                        continue;
+                                    }
                                     all_currently_missing.insert(m);
+                                    candidates_count += 1;
+                                    if candidates_count >= target_limit {
+                                        break 'outer;
+                                    }
                                 }
                             }
                         }
                     }
                 }
                 
-                // WICHTIG: Aufräumen des Caches basierend auf DB-Status UND Timeout
-                // 1. Entferne Chunks, die nicht mehr in der DB als fehlend gelistet sind (fertig heruntergeladen)
-                // 2. Entferne Chunks, die länger als 30 Sekunden im Cache sind (Timeout für hängende Requests)
+                // DEBUG: Scheduler Status
+                if current_active_requests < 10 || needs_refill {
+                   eprintln!("SCHEDULER: Missing={} Cached={} Slots={} Refill={}", 
+                       all_currently_missing.len(), requested_chunks_cache.len(), available_slots, needs_refill);
+                }
+                
+                // WICHTIG: Aufräumen des Caches basierend auf Timeout UND Synchronisation mit requested_chunks
+                // Wir entfernen Chunks, die:
+                // 1. Zu alt sind (Timeout, älter als 30 Sekunden)
+                // 2. Nicht mehr in requested_chunks sind (fertig heruntergeladen)
+                // Das stellt sicher, dass der Cache synchronisiert bleibt und neue Requests gesendet werden können
                 let cache_size_before = requested_chunks_cache.len();
-                requested_chunks_cache.retain(|hash, time| {
-                    // Behalte Chunk nur wenn:
-                    // - Er noch in all_currently_missing ist (noch nicht heruntergeladen)
-                    // - UND noch nicht zu alt ist (weniger als 30 Sekunden im Cache)
-                    let still_missing = all_currently_missing.contains(hash);
-                    let not_timeout = time.elapsed() < Duration::from_secs(30);
-                    still_missing && not_timeout
-                });
+                
+                // Synchronisiere mit requested_chunks (wenn verfügbar)
+                if let Some(requested_global) = get_requested_chunks_global() {
+                    if let Ok(requested) = requested_global.lock() {
+                        // Entferne Chunks, die nicht mehr in requested_chunks sind (fertig) ODER zu alt sind
+                        requested_chunks_cache.retain(|hash, time| {
+                            let still_requested = requested.contains(hash);
+                            let not_timeout = time.elapsed() < Duration::from_secs(30);
+                            still_requested && not_timeout
+                        });
+                    }
+                } else {
+                    // Fallback: Nur Timeouts entfernen, wenn requested_chunks nicht verfügbar ist
+                    requested_chunks_cache.retain(|_hash, time| {
+                        time.elapsed() < Duration::from_secs(30)
+                    });
+                }
                 let cache_size_after = requested_chunks_cache.len();
                 
                 // Logge nur bei signifikanten Änderungen (weniger Spam)

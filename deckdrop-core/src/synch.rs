@@ -1243,15 +1243,35 @@ pub fn check_and_validate_complete_files(
             // Datei ist komplett - validiere sie
             let output_path = PathBuf::from(&manifest.game_path).join(file_path);
             
-            if output_path.exists() {
+            // Prüfe ob .dl Datei existiert
+            let mut dl_path = output_path.clone();
+            if let Some(name) = dl_path.file_name() {
+                let mut dl_name = name.to_os_string();
+                dl_name.push(".dl");
+                dl_path.set_file_name(dl_name);
+            }
+            
+            let target_path = if dl_path.exists() { dl_path } else { output_path.clone() };
+            
+            if target_path.exists() {
                 // Hole file_hash und file_size
                 if let Some((file_hash, file_size)) = file_hashes.get(file_path) {
                     // Validiere Datei (Hash und Größe)
-                    if let Err(e) = validate_complete_file(&output_path, file_hash, *file_size) {
+                    if let Err(e) = validate_complete_file(&target_path, file_hash, *file_size) {
                         eprintln!("Fehler bei Validierung von {}: {}", file_path, e);
                     } else {
                         println!("Datei validiert: {}", file_path);
                         eprintln!("Datei validiert: {}", file_path);
+                        
+                        // Wenn es eine .dl Datei war und validiert wurde, benenne sie um
+                        if target_path.extension().and_then(|e| e.to_str()) == Some("dl") {
+                            remove_file_handle(&target_path);
+                            if let Err(e) = fs::rename(&target_path, &output_path) {
+                                eprintln!("Fehler beim Umbenennen von {:?} zu {:?}: {}", target_path, output_path, e);
+                            } else {
+                                println!("Datei umbenannt: {:?} -> {:?}", target_path, output_path);
+                            }
+                        }
                     }
                 } else {
                     eprintln!("Konnte file_hash für {} nicht finden", file_path);
@@ -1338,12 +1358,34 @@ pub fn check_and_validate_single_file(
     // Datei sollte komplett sein - validiere sie
     let output_path = PathBuf::from(&manifest.game_path).join(file_path);
     
-    if !output_path.exists() {
-        return Err(format!("Datei {} sollte existieren, ist aber nicht vorhanden", file_path).into());
+    // Prüfe ob .dl Datei existiert (bei laufendem Download üblich)
+    let mut dl_path = output_path.clone();
+    if let Some(name) = dl_path.file_name() {
+        let mut dl_name = name.to_os_string();
+        dl_name.push(".dl");
+        dl_path.set_file_name(dl_name);
+    }
+    
+    let target_path = if dl_path.exists() {
+        dl_path
+    } else {
+        output_path.clone()
+    };
+    
+    if !target_path.exists() {
+        return Err(format!("Datei {} (oder .dl) sollte existieren, ist aber nicht vorhanden", file_path).into());
     }
     
     // Validiere Datei (Hash und Größe)
-    validate_complete_file(&output_path, &file_hash, file_size)?;
+    validate_complete_file(&target_path, &file_hash, file_size)?;
+    
+    // Wenn es eine .dl Datei war und validiert wurde, benenne sie um
+    if target_path.extension().and_then(|e| e.to_str()) == Some("dl") {
+        // Schließe File Handle falls offen
+        remove_file_handle(&target_path);
+        fs::rename(&target_path, &output_path)?;
+        println!("Datei umbenannt: {:?} -> {:?}", target_path, output_path);
+    }
     
     Ok(true) // Datei ist komplett und validiert
 }

@@ -914,7 +914,10 @@ pub async fn run_discovery(
                                     println!("✅ Chunk {} abgeschlossen, globale aktive Downloads: {}", chunk_hash, *global_active);
                                     eprintln!("✅ Chunk {} abgeschlossen, globale aktive Downloads: {}", chunk_hash, *global_active);
                                 } else {
-                                    eprintln!("⚠️ WARNUNG: Chunk {} abgeschlossen, aber globale aktive Downloads waren bereits 0", chunk_hash);
+                                    // WARNUNG: Counter war bereits 0 - das kann passieren bei Race Conditions
+                                    // oder wenn Chunks sehr schnell verarbeitet werden. Nicht kritisch, aber loggen.
+                                    // Reduziere nicht weiter (verhindert Unterlauf)
+                                    eprintln!("⚠️ WARNUNG: Chunk {} abgeschlossen, aber globale aktive Downloads waren bereits 0 (Race Condition?)", chunk_hash);
                                 }
                             }
 

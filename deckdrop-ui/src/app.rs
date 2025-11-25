@@ -410,6 +410,8 @@ impl Default for DeckDropApp {
         let preparing_downloads = Arc::new(std::sync::Mutex::new(HashMap::new()));
         let processing_chunks = Arc::new(std::sync::Mutex::new(HashSet::new()));
         let requested_chunks = Arc::new(std::sync::Mutex::new(HashSet::new()));
+        // Setze globale Variable für Scheduler-Synchronisation
+        crate::network_bridge::set_requested_chunks_global(requested_chunks.clone());
         let chunk_peer_requests = Arc::new(std::sync::Mutex::new(HashMap::new()));
         let active_requests_per_peer = Arc::new(std::sync::Mutex::new(HashMap::new()));
         let chunk_download_start_times = Arc::new(std::sync::Mutex::new(HashMap::new()));
@@ -730,6 +732,8 @@ impl DeckDropApp {
         let preparing_downloads = Arc::new(std::sync::Mutex::new(HashMap::new()));
         let processing_chunks = Arc::new(std::sync::Mutex::new(HashSet::new()));
         let requested_chunks = Arc::new(std::sync::Mutex::new(HashSet::new()));
+        // Setze globale Variable für Scheduler-Synchronisation
+        crate::network_bridge::set_requested_chunks_global(requested_chunks.clone());
         let chunk_peer_requests = Arc::new(std::sync::Mutex::new(HashMap::new()));
         let active_requests_per_peer = Arc::new(std::sync::Mutex::new(HashMap::new()));
         let chunk_download_start_times = Arc::new(std::sync::Mutex::new(HashMap::new()));
@@ -2577,10 +2581,16 @@ impl DeckDropApp {
                 if let Ok(mut active_per_peer) = self.active_requests_per_peer.lock() {
                     *active_per_peer.entry(peer_id.clone()).or_insert(0) += 1;
                 }
+                // Logge nur selten (alle 100 mal), um Spam zu vermeiden
+                // "war bereits in requested_chunks" ist normal bei Retries oder mehreren Peers
                 if already_requested {
-                    eprintln!("Chunk {} war bereits in requested_chunks (Bestätigung von {})", chunk_hash, peer_id);
-                } else {
-                    // eprintln!("Chunk {} in requested_chunks eingetragen (Request erfolgreich gesendet an {})", chunk_hash, peer_id);
+                    static mut COUNTER: u64 = 0;
+                    unsafe {
+                        COUNTER += 1;
+                        if COUNTER % 100 == 0 {
+                            eprintln!("[DEBUG] Chunk {} war bereits in requested_chunks (normal bei Retries, {} mal)", chunk_hash, COUNTER);
+                        }
+                    }
                 }
                 if let Ok(mut start_times) = self.chunk_download_start_times.lock() {
                     start_times.insert(chunk_hash.clone(), start_time);
@@ -3200,52 +3210,23 @@ impl DeckDropApp {
                 
                 // Prüfe ob Download Downloading ist, aber keine aktiven Requests hat
                 if matches!(download_state.manifest.overall_status, deckdrop_core::DownloadStatus::Downloading) {
-                    // Prüfe ob es fehlende Chunks gibt (memory-effizient)
-                    let has_missing_chunks = if let Ok(manifest_path) = deckdrop_core::synch::get_manifest_path(_game_id) {
-                        if let Ok(db) = deckdrop_core::manifest_db::ManifestDB::open(&manifest_path) {
-                            // Prüfe nur, ob mindestens ein fehlender Chunk existiert
-                            db.count_missing_chunks(_game_id).unwrap_or(0) > 0
-                        } else {
-                            // Fallback: Verwende in-memory Manifest
-                            !download_state.manifest.get_missing_chunks().is_empty()
+                    // PERFORMANCE FIX: Keine DB-Zugriffe im UI-Thread für Resume-Check!
+                    // Wir prüfen nur ob globale Requests existieren. Wenn ja, läuft der Scheduler eh.
+                    // Wenn nein, und wir sind im "Downloading" Status, dann sollten wir den Scheduler anstupsen.
+                    
+                    if let Ok(requested) = self.requested_chunks.lock() {
+                        if !requested.is_empty() {
+                            // Es gibt aktive Requests (irgendwo), also arbeitet das System.
+                            // Wir gehen davon aus, dass alles läuft.
+                            return false; 
                         }
-                    } else {
-                        !download_state.manifest.get_missing_chunks().is_empty()
-                    };
-
-                    if !has_missing_chunks {
-                        return false; // Keine fehlenden Chunks, nichts zu tun
                     }
-
-                    // Prüfe ob es aktive Chunk-Requests gibt (memory-effizient)
-                    let has_active_requests = if let Ok(requested) = self.requested_chunks.lock() {
-                        if let Ok(manifest_path) = deckdrop_core::synch::get_manifest_path(_game_id) {
-                            if let Ok(db) = deckdrop_core::manifest_db::ManifestDB::open(&manifest_path) {
-                                // Prüfe nur die ersten paar Chunks, ob sie angefordert sind
-                                let mut has_any_active = false;
-                                for batch_result in db.stream_missing_chunks(_game_id, 10) {
-                                    if let Ok(batch) = batch_result {
-                                        if batch.iter().any(|chunk| requested.contains(chunk)) {
-                                            has_any_active = true;
-                                            break;
-                                        }
-                                    }
-                                }
-                                has_any_active
-                            } else {
-                                // Fallback: Verwende in-memory Manifest
-                                let missing_chunks = download_state.manifest.get_missing_chunks();
-                                missing_chunks.iter().any(|chunk| requested.contains(chunk))
-                            }
-                        } else {
-                            false
-                        }
-                    } else {
-                        false
-                    };
-
-                    // Wenn es fehlende Chunks gibt, aber keine aktiven Requests, sollte der Download fortgesetzt werden
-                    return !has_active_requests;
+                    
+                    // Keine aktiven Requests global.
+                    // Wir gehen davon aus, dass wir Chunks brauchen, wenn wir im Status "Downloading" sind.
+                    // (Die genaue Prüfung auf "missing chunks" überlassen wir dem Scheduler/Network-Layer,
+                    // der das effizienter machen kann oder eh schon weiß).
+                    return true;
                 }
                 
                 false
@@ -5219,8 +5200,9 @@ fn run_chunk_writer(
                                         // Cleanup start_times
                                         if let Ok(mut start_times) = chunk_download_start_times.lock() { start_times.remove(&chunk_hash); }
                                         
-                                        // Force Update Active Downloads
-                                        let _ = deckdrop_core::force_update_active_downloads();
+                                        // Force Update Active Downloads - ENTFERNT um UI Freeze zu verhindern
+                                        // Der UI Thread lädt die aktiven Downloads sowieso regelmäßig neu.
+                                        // let _ = deckdrop_core::force_update_active_downloads();
                                         
                                         // Check Single File Integrity (Sequentiell im Worker)
                                         // OPTIMIERUNG: Verwende DB-Query statt Manifest-Reload um Datei zu finden
