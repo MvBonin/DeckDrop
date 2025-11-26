@@ -57,15 +57,18 @@ impl FileTreeNode {
             
             let is_complete = file_info.status == deckdrop_core::synch::DownloadStatus::Complete;
             
+            // Überspringe fertige Dateien (werden nicht angezeigt)
+            if is_complete {
+                continue;
+            }
+            
             // Berechne Fortschritt pro Datei
             let downloaded = file_info.downloaded_chunks_count;
             let total = file_info.total_chunks;
-            let progress = if is_complete {
-                100.0
-            } else if total > 0 {
+            let progress = if total > 0 {
                 (downloaded as f32 / total as f32) * 100.0
             } else {
-                100.0 // Leere Datei gilt als fertig
+                0.0 // Leere Datei hat keinen Fortschritt
             };
 
             root.insert_file(&path, size, progress, is_complete);
@@ -205,19 +208,8 @@ impl FileTreeNode {
         content = content.push(row_content);
 
         // Kinder rendern (wenn Ordner und ausgeklappt)
-        // WICHTIG: Blende fertige Dateien aus (is_complete=true)
         if is_dir && expanded {
-            let mut visible_children = Vec::new();
             for child in children {
-                // Überspringe fertige Dateien (nicht Ordner)
-                if !child.is_dir && child.is_complete {
-                    continue;
-                }
-                visible_children.push(child);
-            }
-            
-            // Rendere nur sichtbare Kinder
-            for child in visible_children {
                 content = content.push(child.view(indent + scale(20.0)));
             }
         }

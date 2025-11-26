@@ -17,10 +17,16 @@ pub struct Config {
     pub game_paths: Vec<PathBuf>,
     #[serde(default = "default_max_concurrent_chunks")]
     pub max_concurrent_chunks: usize,
+    #[serde(default = "default_max_connections")]
+    pub max_connections: usize,
 }
 
 fn default_max_concurrent_chunks() -> usize {
     15  // Erhöht von 5 auf 15 für bessere Parallelisierung mit 10MB Chunks
+}
+
+fn default_max_connections() -> usize {
+    50  // Maximale Anzahl gleichzeitiger Peer-Verbindungen
 }
 
 impl Default for Config {
@@ -31,6 +37,7 @@ impl Default for Config {
             peer_id: None,
             game_paths: Vec::new(),
             max_concurrent_chunks: 15,
+            max_connections: 50,
         }
     }
 }

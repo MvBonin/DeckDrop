@@ -2890,6 +2890,7 @@ impl DeckDropApp {
     /// Sammelt und aktualisiert Performance-Metriken
     fn update_performance_metrics(&mut self) {
         // Sammle Download-Statistiken
+        let mut total_download_speed = 0.0;
         let mut active_downloads_count = 0;
         let mut total_chunks_downloaded = 0;
         
@@ -2898,39 +2899,10 @@ impl DeckDropApp {
                 deckdrop_core::DownloadStatus::Complete | 
                 deckdrop_core::DownloadStatus::Cancelled) {
                 active_downloads_count += 1;
+                total_download_speed += download_state.download_speed_bytes_per_sec;
             }
             total_chunks_downloaded += download_state.manifest.progress.downloaded_chunks;
         }
-        
-        // Sammle Peer-Performance-Daten und berechne Download-Geschwindigkeit daraus
-        // (konsistent mit Peer-Performance-Anzeige)
-        let (peer_performance_list, total_download_speed) = {
-            if let Ok(perf_map) = self.peer_performance.lock() {
-                let mut total_speed = 0.0;
-                let list: Vec<(String, PeerPerformance)> = perf_map.iter()
-                    .map(|(peer_id, perf)| {
-                        total_speed += perf.download_speed_bytes_per_sec;
-                        (peer_id.clone(), perf.clone())
-                    })
-                    .collect();
-                (list, total_speed)
-            } else {
-                (Vec::new(), 0.0)
-            }
-        };
-        
-        // Fallback: Wenn keine Peer-Performance-Daten vorhanden, verwende Download-State-Geschwindigkeiten
-        let total_download_speed_final = if total_download_speed > 0.0 {
-            total_download_speed
-        } else {
-            // Fallback: Summiere aus Download-States
-            self.active_downloads.values()
-                .filter(|ds| !matches!(ds.manifest.overall_status, 
-                    deckdrop_core::DownloadStatus::Complete | 
-                    deckdrop_core::DownloadStatus::Cancelled))
-                .map(|ds| ds.download_speed_bytes_per_sec)
-                .sum()
-        };
         
         // Sammle Upload-Statistiken
         let (total_upload_speed, active_uploads_count, total_chunks_uploaded) = {
@@ -2941,20 +2913,23 @@ impl DeckDropApp {
             }
         };
         
-        // Berechne aktive Verbindungen: Verwende max_concurrent_chunks als Limit
-        // Die tatsächliche Anzahl der aktiven Chunk-Downloads wird durch max_concurrent_chunks begrenzt
-        // requested_chunks.len() zählt alle angeforderten Chunks, nicht nur die aktiven
-        let active_connections = self.config.max_concurrent_chunks.min(
-            if let Ok(requested) = self.requested_chunks.lock() {
-                requested.len()
+        // Sammle Peer-Performance-Daten
+        let peer_performance_list: Vec<(String, PeerPerformance)> = {
+            if let Ok(perf_map) = self.peer_performance.lock() {
+                perf_map.iter()
+                    .map(|(peer_id, perf)| (peer_id.clone(), perf.clone()))
+                    .collect()
             } else {
-                0
+                Vec::new()
             }
-        );
+        };
+        
+        // Berechne aktive Verbindungen (tatsächliche Peer-Verbindungen, nicht Chunk-Requests)
+        let active_connections = self.peers.len();
         
         // Schätze Bandbreiten-Nutzung (basierend auf Gigabit Ethernet = 125 MB/s)
         const GIGABIT_BANDWIDTH_MBPS: f64 = 125.0 * 1024.0 * 1024.0; // 125 MB/s in Bytes/s
-        let total_bandwidth_usage = total_download_speed_final + total_upload_speed;
+        let total_bandwidth_usage = total_download_speed + total_upload_speed;
         let bandwidth_utilization = if GIGABIT_BANDWIDTH_MBPS > 0.0 {
             (total_bandwidth_usage / GIGABIT_BANDWIDTH_MBPS * 100.0).min(100.0)
         } else {
@@ -2963,7 +2938,7 @@ impl DeckDropApp {
         
         // Aktualisiere Performance-Metriken
         self.performance_metrics = PerformanceMetrics {
-            total_download_speed_bytes_per_sec: total_download_speed_final,
+            total_download_speed_bytes_per_sec: total_download_speed,
             total_upload_speed_bytes_per_sec: total_upload_speed,
             active_downloads: active_downloads_count,
             active_uploads: active_uploads_count,
@@ -4066,6 +4041,8 @@ impl DeckDropApp {
                             }),
                         text(format!("{} aktive Verbindungen", metrics.active_connections))
                             .size(scale_text(14.0)),
+                        text(format!("Max: {} Verbindungen", self.config.max_connections))
+                            .size(scale_text(12.0)),
                         text(format!("Max: {} Chunks", self.config.max_concurrent_chunks))
                             .size(scale_text(12.0)),
                     ]
